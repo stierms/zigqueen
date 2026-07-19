@@ -462,10 +462,14 @@ fn negamax(
             break :blk fresh;
         };
         raw_static_eval = raw;
+        // Rule-50 decay applies to the retrieved value (caches hold undecayed
+        // evals; the clock is not part of the position key). Corrections and
+        // every search decision downstream see the decayed value.
+        const decayed = score_mod.rule50Decay(raw, pos.halfmove_clock);
         // Correction history: search decisions (pruning margins, improving,
         // null-move gates) use the corrected eval; the corrhist update at the
-        // node's end measures the search result against the RAW eval.
-        const evaluated = resources.history.correctedEval(pos, raw);
+        // node's end measures the search result against the decayed eval.
+        const evaluated = resources.history.correctedEval(pos, decayed);
         stack_entry.static_eval = evaluated;
         static_eval = evaluated;
         improving = isImproving(ctx, ply, evaluated);
@@ -801,7 +805,8 @@ fn negamax(
         // static eval and the search result, when the result actually bounds it
         // (skip mate scores, capture best-moves, and bound-inconsistent pairs:
         // a fail-high below raw / fail-low above raw says nothing about eval error).
-        if (raw_static_eval) |raw| {
+        if (raw_static_eval) |raw_val| {
+            const raw = score_mod.rule50Decay(raw_val, pos.halfmove_clock);
             const best_is_capture = if (best_move) |bm| bm.isCapture() else false;
             if (!score_mod.isMateLike(best_score) and !best_is_capture and
                 !(best_score >= beta_in and best_score <= raw) and

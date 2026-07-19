@@ -63,6 +63,7 @@ fn searchDepth(
     const beta_local = probe.beta;
 
     var stand_pat: ?types.Score = null;
+    var stand_pat_use: ?types.Score = null;
     if (!in_check) {
         // RAW stand-pat: applying corrhist here measured negative (stand-pat fires
         // at every leaf — too sensitive for half-trained corrections); corrhist is
@@ -85,7 +86,10 @@ fn searchDepth(
             break :blk fresh;
         };
         stand_pat = eval_score;
-        if (eval_score >= beta_local) {
+        // Decayed view for all in-node decisions; stores keep the undecayed
+        // value (clock is not in the position key — see score.rule50Decay).
+        stand_pat_use = score_mod.rule50Decay(eval_score, pos.halfmove_clock);
+        if (stand_pat_use.? >= beta_local) {
             ctx.noteQsearchStandPatCutoff();
             tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, null, tt_store.evalToTt(stand_pat));
             return beta_local;
@@ -101,7 +105,7 @@ fn searchDepth(
     }
     if (moves.count == 0) {
         if (in_check) return -MATE_SCORE + @as(types.Score, @intCast(ply));
-        if (stand_pat) |static_eval| {
+        if (stand_pat_use) |static_eval| {
             const best_static = @max(alpha, static_eval);
             tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best_static, null, tt_store.evalToTt(stand_pat));
             return best_static;
@@ -109,10 +113,10 @@ fn searchDepth(
         return alpha;
     }
 
-    if (shouldDeltaPruneNode(pos, stand_pat, alpha, in_check, &moves)) {
+    if (shouldDeltaPruneNode(pos, stand_pat_use, alpha, in_check, &moves)) {
         return alpha;
     }
-    if (stand_pat) |static_eval| {
+    if (stand_pat_use) |static_eval| {
         if (static_eval > alpha) alpha = static_eval;
     }
 
