@@ -1,0 +1,16 @@
+.{
+    .name = .zigqueen,
+    .version = "0.0.0",
+    .fingerprint = 0x37a2274222e7c507,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "ARCHITECTURE.md",
+        "CLEAN_ROOM_RULES.md",
+        ".gitignore",
+    },
+}

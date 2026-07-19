@@ -1,0 +1,3 @@
+# Keep `git archive` exports source-only: local build/test output accumulates
+# under artifacts/ (untracked) and must never land in archive-based exports.
+artifacts/ export-ignore

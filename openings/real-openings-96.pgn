@@ -1,0 +1,575 @@
+[Event "Ruy Lopez A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 *
+
+[Event "Ruy Lopez B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 Nf6 4. O-O Nxe4 *
+
+[Event "Ruy Lopez C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Bxc6 dxc6 *
+
+[Event "Ruy Lopez D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 g6 4. O-O Bg7 *
+
+[Event "Italian Game A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 Nf6 *
+
+[Event "Italian Game B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. b4 Bxb4 *
+
+[Event "Italian Game C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6 4. d3 Bc5 *
+
+[Event "Italian Game D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 d6 *
+
+[Event "Scotch Game A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. d4 exd4 4. Nxd4 Nf6 *
+
+[Event "Scotch Game B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. d4 exd4 4. Nxd4 Bc5 *
+
+[Event "Scotch Game C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. d4 exd4 4. Nxd4 Qh4 *
+
+[Event "Scotch Game D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. d4 exd4 4. Nxd4 Nge7 *
+
+[Event "Four Knights A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bb5 Bb4 *
+
+[Event "Four Knights B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. d4 exd4 *
+
+[Event "Four Knights C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. Bc4 Bc5 *
+
+[Event "Four Knights D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nc6 3. Nc3 Nf6 4. g3 d5 *
+
+[Event "Petroff A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nf6 3. Nxe5 d6 4. Nf3 Nxe4 *
+
+[Event "Petroff B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nf6 3. Nxe5 d6 4. Nd3 Nxe4 *
+
+[Event "Petroff C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nf6 3. d4 Nxe4 4. Bd3 d5 *
+
+[Event "Petroff D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nf3 Nf6 3. Nc3 Nc6 4. Bb5 *
+
+[Event "Sicilian Najdorf Setup A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 *
+
+[Event "Sicilian Najdorf Setup B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 a6 *
+
+[Event "Sicilian Najdorf Setup C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 g6 *
+
+[Event "Sicilian Najdorf Setup D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nc6 *
+
+[Event "Closed Sicilian A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nc3 Nc6 3. g3 g6 4. Bg2 Bg7 *
+
+[Event "Closed Sicilian B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nc3 Nc6 3. f4 g6 4. Nf3 Bg7 *
+
+[Event "Closed Sicilian C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nc3 Nc6 3. Nf3 e5 4. Bb5 *
+
+[Event "Closed Sicilian D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c5 2. Nc3 Nc6 3. g3 e6 4. Bg2 Nge7 *
+
+[Event "French Advance A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e6 2. d4 d5 3. e5 c5 4. c3 Nc6 *
+
+[Event "French Advance B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e6 2. d4 d5 3. e5 c5 4. c3 Qb6 *
+
+[Event "French Advance C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e6 2. d4 d5 3. e5 c5 4. Nf3 Nc6 *
+
+[Event "French Advance D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e6 2. d4 d5 3. e5 c5 4. a3 Nc6 *
+
+[Event "Caro-Kann A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c6 2. d4 d5 3. Nc3 dxe4 4. Nxe4 Bf5 *
+
+[Event "Caro-Kann B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c6 2. d4 d5 3. Nc3 dxe4 4. Nxe4 Nd7 *
+
+[Event "Caro-Kann C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c6 2. d4 d5 3. Nc3 g6 4. Nf3 *
+
+[Event "Caro-Kann D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 c6 2. d4 d5 3. Nd2 dxe4 4. Nxe4 Nd7 *
+
+[Event "Pirc A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d6 2. d4 Nf6 3. Nc3 g6 4. f4 Bg7 *
+
+[Event "Pirc B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d6 2. d4 Nf6 3. Nc3 g6 4. Be3 Bg7 *
+
+[Event "Pirc C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d6 2. d4 Nf6 3. Nc3 g6 4. Nf3 Bg7 *
+
+[Event "Pirc D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d6 2. d4 Nf6 3. Nc3 g6 4. f3 Bg7 *
+
+[Event "Scandinavian A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d5 2. exd5 Qxd5 3. Nc3 Qa5 4. d4 Nf6 *
+
+[Event "Scandinavian B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d5 2. exd5 Qxd5 3. Nc3 Qd6 4. d4 Nf6 *
+
+[Event "Scandinavian C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d5 2. exd5 Nf6 3. d4 Bg4 *
+
+[Event "Scandinavian D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 d5 2. exd5 Qxd5 3. Nc3 Qd8 4. d4 *
+
+[Event "Alekhine A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 Nf6 2. e5 Nd5 3. d4 d6 4. Nf3 Bg4 *
+
+[Event "Alekhine B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 Nf6 2. e5 Nd5 3. d4 d6 4. c4 Nb6 *
+
+[Event "Alekhine C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 Nf6 2. e5 Nd5 3. d4 d6 4. Nc3 Nxc3 *
+
+[Event "Alekhine D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 Nf6 2. e5 Nd5 3. d4 d6 4. Bc4 Nb6 *
+
+[Event "QGD A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. Bg5 Be7 *
+
+[Event "QGD B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 e6 3. Nf3 Nf6 4. Nc3 Be7 *
+
+[Event "QGD C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 e6 3. Nc3 Be7 4. Nf3 Nf6 *
+
+[Event "QGD D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 e6 3. Nc3 c6 4. Nf3 Nf6 *
+
+[Event "Slav A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 c6 3. Nc3 Nf6 4. Nf3 dxc4 *
+
+[Event "Slav B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 c6 3. Nf3 Nf6 4. Nc3 e6 *
+
+[Event "Slav C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 c6 3. Nc3 Nf6 4. e3 dxc4 *
+
+[Event "Slav D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. c4 c6 3. Nf3 Nf6 4. Nc3 a6 *
+
+[Event "King's Indian A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nc3 Bg7 4. e4 d6 *
+
+[Event "King's Indian B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nc3 Bg7 4. Nf3 d6 *
+
+[Event "King's Indian C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nc3 Bg7 4. e4 O-O *
+
+[Event "King's Indian D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nf3 Bg7 4. g3 O-O *
+
+[Event "Nimzo-Indian A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. Nc3 Bb4 4. e3 O-O *
+
+[Event "Nimzo-Indian B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. Nc3 Bb4 4. Qc2 O-O *
+
+[Event "Nimzo-Indian C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. Nf3 Bb4+ 4. Bd2 Qe7 *
+
+[Event "Nimzo-Indian D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. Nc3 Bb4 4. Nf3 O-O *
+
+[Event "Grunfeld A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nc3 d5 4. Nf3 Bg7 *
+
+[Event "Grunfeld B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nc3 d5 4. cxd5 Nxd5 *
+
+[Event "Grunfeld C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nc3 d5 4. Bf4 Bg7 *
+
+[Event "Grunfeld D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 g6 3. Nf3 d5 4. Nc3 Bg7 *
+
+[Event "Benoni A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 c5 3. d5 e6 4. Nc3 exd5 *
+
+[Event "Benoni B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 c5 3. d5 e6 4. Nc3 d6 *
+
+[Event "Benoni C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 c5 3. d5 b5 4. cxb5 a6 *
+
+[Event "Benoni D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 c5 3. d5 e5 4. Nc3 d6 *
+
+[Event "Catalan A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. g3 d5 4. Bg2 Be7 *
+
+[Event "Catalan B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. g3 d5 4. Nf3 Be7 *
+
+[Event "Catalan C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. g3 d5 4. Bg2 dxc4 *
+
+[Event "Catalan D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 Nf6 2. c4 e6 3. Nf3 d5 4. g3 Be7 *
+
+[Event "London A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. Nf3 Nf6 3. Bf4 e6 4. e3 Bd6 *
+
+[Event "London B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. Nf3 Nf6 3. Bf4 c5 4. e3 Nc6 *
+
+[Event "London C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. Nf3 Nf6 3. Bf4 Bf5 4. e3 e6 *
+
+[Event "London D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 d5 2. Bf4 Nf6 3. e3 e6 4. Nd2 c5 *
+
+[Event "Dutch A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 f5 2. g3 Nf6 3. Bg2 g6 4. Nf3 Bg7 *
+
+[Event "Dutch B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 f5 2. c4 Nf6 3. Nc3 e6 4. g3 Be7 *
+
+[Event "Dutch C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 f5 2. Nf3 Nf6 3. g3 e6 4. Bg2 Be7 *
+
+[Event "Dutch D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. d4 f5 2. g3 d5 3. Bg2 Nf6 4. Nf3 *
+
+[Event "English A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. c4 e5 2. Nc3 Nf6 3. g3 d5 4. cxd5 Nxd5 *
+
+[Event "English B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. c4 e5 2. Nc3 Nc6 3. g3 g6 4. Bg2 Bg7 *
+
+[Event "English C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. c4 e5 2. Nc3 Nf6 3. Nf3 Nc6 4. g3 d5 *
+
+[Event "English D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. c4 c5 2. Nc3 Nc6 3. g3 g6 4. Bg2 Bg7 *
+
+[Event "King's Gambit A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. f4 exf4 3. Nf3 g5 4. h4 g4 *
+
+[Event "King's Gambit B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. f4 exf4 3. Nf3 d6 4. d4 g5 *
+
+[Event "King's Gambit C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. f4 exf4 3. Bc4 Qh4+ 4. Kf1 *
+
+[Event "King's Gambit D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. f4 exf4 3. Nf3 Be7 4. Bc4 *
+
+[Event "Vienna A"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nc3 Nf6 3. f4 d5 4. fxe5 Nxe4 *
+
+[Event "Vienna B"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nc3 Nc6 3. f4 exf4 4. Nf3 g5 *
+
+[Event "Vienna C"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nc3 Nf6 3. Bc4 Nxe4 4. Qh5 *
+
+[Event "Vienna D"]
+[Site "zigqueen"]
+[Result "*"]
+
+1. e4 e5 2. Nc3 Nf6 3. g3 d5 4. exd5 *

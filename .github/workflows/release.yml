@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      # Builds all 4 variants (linux/windows x avx2/avx512; windows via zig
+      # cross-compile) and zips each with LICENSE + README into release/.
+      - name: Package release binaries
+        run: scripts/package-release.sh
+
+      - name: Attach zips to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip

@@ -1,0 +1,25 @@
+.zig-cache/
+zig-out/
+release/
+artifacts/
+logs/
+config.json
+*.log
+*.lock
+perf.data
+perf.data.*
+perf-*.data
+*.perf.data
+__pycache__/
+*.pyc
+.claude/
+
+# Local scratch/editor/patch leftovers.
+tmp/
+*.tmp
+*~
+*.bak
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
