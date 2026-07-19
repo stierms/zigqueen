@@ -17,7 +17,7 @@ against CCRL-rated opposition. The current estimate for **zigqueen 5.8.0** is
 - **Estimate:** games-weighted anchored estimate — each opponent's result is
   converted to an implied rating against its CCRL anchor, then combined
   weighted by games played
-- **Hardware:** single thread per engine on a Zen 5 box
+- **Hardware:** single thread per engine on an AMD Ryzen 9 9950X3D
 
 **Result:** 255 wins, 1,125 draws, 240 losses — 50.46% overall.
 
