@@ -1258,7 +1258,7 @@ test "reverse futility does not publish a heuristic tt bound" {
     ctx.repetition.push(pos.zobrist_key);
     ctx.stack.entry(1).acc.refresh(evaluator.net.?, &pos);
 
-    const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null);
+    const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null, null);
     try std.testing.expectEqual(@as(types.Score, 50), score);
     try std.testing.expect(table.lookup(pos.zobrist_key) == null);
     try std.testing.expect(hint_table.lookup(pos.zobrist_key, 2) != null);
@@ -1288,12 +1288,12 @@ test "reverse futility hint reuses on second probe without evaluating" {
     ctx.repetition.push(pos.zobrist_key);
     ctx.stack.entry(1).acc.refresh(evaluator.net.?, &pos);
 
-    _ = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null);
+    _ = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null, null);
     const evals_after_first = ctx.stats.main_static_evals;
     const rf_prunes_after_first = ctx.stats.reverse_futility_prunes;
     table.clear();
 
-    const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null);
+    const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null, null);
     try std.testing.expectEqual(@as(types.Score, 50), score);
     try std.testing.expectEqual(evals_after_first, ctx.stats.main_static_evals);
     try std.testing.expectEqual(rf_prunes_after_first, ctx.stats.reverse_futility_prunes);
