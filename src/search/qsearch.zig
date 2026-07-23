@@ -28,8 +28,9 @@ pub fn search(
     alpha_in: types.Score,
     beta: types.Score,
     ply: usize,
+    in_check_hint: ?bool,
 ) types.Score {
-    return searchDepth(ctx, resources, pos, alpha_in, beta, ply, 0);
+    return searchDepth(ctx, resources, pos, alpha_in, beta, ply, 0, in_check_hint);
 }
 
 fn searchDepth(
@@ -40,6 +41,7 @@ fn searchDepth(
     beta: types.Score,
     ply: usize,
     qs_depth: u8,
+    in_check_hint: ?bool,
 ) types.Score {
     if (ctx.noteQNode()) return 0;
     ctx.observePly(ply);
@@ -58,7 +60,7 @@ fn searchDepth(
     // AFTER the TT cutoff: a cutoff returns without ever consulting in_check,
     // so computing it first wasted a full attack query on every TT-cutoff
     // qnode (probe + isInCheck were the two entry-path hot spots).
-    const in_check = legal.isInCheck(pos, pos.side_to_move);
+    const in_check = in_check_hint orelse legal.isInCheck(pos, pos.side_to_move);
     var alpha = probe.alpha;
     const beta_local = probe.beta;
 
@@ -154,7 +156,7 @@ fn searchDepth(
         // Lazy accumulator: record the move only — boards/undo-state are
         // reconstructed at materialization time from the live position.
         resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
-        const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1);
+        const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null);
         ctx.repetition.pop();
         make_unmake.unmakeMove(pos, mv, &entry.state);
 
@@ -184,7 +186,7 @@ fn searchDepth(
             resources.tt.prefetch(child_key);
             ctx.repetition.push(child_key);
             resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
-            const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1);
+            const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null);
             ctx.repetition.pop();
             make_unmake.unmakeMove(pos, mv, &entry.state);
             if (ctx.stopped) return 0;
@@ -269,7 +271,7 @@ test "qsearch handles in-check nodes by generating evasions" {
     var pos = try fen.parse("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1");
     context.repetition.push(pos.zobrist_key);
 
-    const score = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, 0);
+    const score = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, 0, null);
     try std.testing.expect(score > -MATE_SCORE / 2);
 }
 
@@ -299,6 +301,6 @@ test "qsearch stores shallow tt best move when tactical move exists" {
     context.repetition.push(pos.zobrist_key);
     evaluator.prepareRoot(&context.stack, &pos, &context.finny);
 
-    _ = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, 0);
+    _ = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, 0, null);
     try std.testing.expect(table.bestMove(pos.zobrist_key) != null);
 }

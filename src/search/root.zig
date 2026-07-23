@@ -240,13 +240,13 @@ pub fn searchDepthWindow(
 
         var score: types.Score = undefined;
         if (index == 0) {
-            score = -negamax(ctx, resources, pos, depth - 1, -beta, -alpha, 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null);
+            score = -negamax(ctx, resources, pos, depth - 1, -beta, -alpha, 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null, null);
         } else {
             ctx.notePvsScout();
-            score = -negamax(ctx, resources, pos, depth - 1, -alpha - 1, -alpha, 1, true, node_context.NodeContext.fromWindow(-alpha - 1, -alpha, true), null);
+            score = -negamax(ctx, resources, pos, depth - 1, -alpha - 1, -alpha, 1, true, node_context.NodeContext.fromWindow(-alpha - 1, -alpha, true), null, null);
             if (!ctx.stopped and score > alpha and score < beta) {
                 ctx.notePvsResearch();
-                score = -negamax(ctx, resources, pos, depth - 1, -beta, -alpha, 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null);
+                score = -negamax(ctx, resources, pos, depth - 1, -beta, -alpha, 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null, null);
             }
         }
 
@@ -370,11 +370,16 @@ fn negamax(
     allow_null: bool,
     node_ctx: node_context.NodeContext,
     excluded_move: ?move_mod.Move,
+    // The parent's gives_check for the move that reached this node — provably
+    // equal to the entry isInCheck recompute (null falls back to computing).
+    // Kills the second-per-node isInCheck: every node paid it once as the
+    // parent's gives_check and again here.
+    in_check_hint: ?bool,
 ) types.Score {
     if (ctx.noteNode()) return 0;
     ctx.observePly(ply);
     if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
-    if (depth == 0) return qsearch.search(ctx, resources, pos, alpha_in, beta_in, ply);
+    if (depth == 0) return qsearch.search(ctx, resources, pos, alpha_in, beta_in, ply, in_check_hint);
 
     const alpha_orig = alpha_in;
     const stack_entry = ctx.stack.entry(ply);
@@ -430,7 +435,7 @@ fn negamax(
         }
     }
 
-    const in_check = legal.isInCheck(pos, pos.side_to_move);
+    const in_check = in_check_hint orelse legal.isInCheck(pos, pos.side_to_move);
     if (!in_check and canTrySingular(search_depth, node_ctx, tt_entry, tt_move, excluded_move)) {
         ctx.noteSingularCandidate(search_depth, node_ctx.cut_node);
     }
@@ -477,7 +482,7 @@ fn negamax(
             return beta;
         }
         if (pruning.shouldRazor(search_depth, alpha, beta, in_check, evaluated)) {
-            const razor_score = qsearch.search(ctx, resources, pos, alpha, beta, ply);
+            const razor_score = qsearch.search(ctx, resources, pos, alpha, beta, ply, in_check);
             if (ctx.stopped) return 0;
             if (razor_score <= alpha) {
                 if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, razor_score, alpha_orig, beta, outcome_flags);
@@ -494,7 +499,7 @@ fn negamax(
         ctx.stack.entry(ply + 1).prev_piece_type = null;
         ctx.stack.entry(ply + 1).prev_cont_piece = null;
         const null_child_ctx = node_context.NodeContext.fromWindow(-beta, -beta + 1, true);
-        const null_score = -negamax(ctx, resources, pos, search_depth - 1 - reduction, -beta, -beta + 1, ply + 1, false, null_child_ctx, null);
+        const null_score = -negamax(ctx, resources, pos, search_depth - 1 - reduction, -beta, -beta + 1, ply + 1, false, null_child_ctx, null, false);
         make_unmake.unmakeNullMove(pos, &stack_entry.state);
 
         if (ctx.stopped) return 0;
@@ -511,7 +516,7 @@ fn negamax(
                 const verify_depth = search_depth - reduction;
                 ctx.nmp_min_ply = ply + 3 * @as(usize, verify_depth) / 4;
                 const verify_ctx = node_context.NodeContext.fromWindow(beta - 1, beta, false);
-                const verify_score = negamax(ctx, resources, pos, verify_depth, beta - 1, beta, ply, false, verify_ctx, null);
+                const verify_score = negamax(ctx, resources, pos, verify_depth, beta - 1, beta, ply, false, verify_ctx, null, in_check);
                 ctx.nmp_min_ply = 0;
                 if (ctx.stopped) return 0;
                 if (verify_score < beta) {
@@ -565,6 +570,7 @@ fn negamax(
         ctx.noteCountermoveTableProbe(countermove, containsMove(&moves, countermove));
     }
     const cont = continuationContext(ctx, ply, pos.side_to_move);
+    const moved_side = pos.side_to_move; // loop-invariant; child stm = .other()
     // Per-node conthist rows for the loop's LMR history evidence (same hoist
     // as inside scoreMoves — value-identical, reads stay live).
     const cont_rows = resources.history.contRows(&cont);
@@ -686,7 +692,9 @@ fn negamax(
         // positions this beats the mask-op predicate (measured ~5% slower
         // endgames with the predicate here); the predicate stays at the
         // PRUNING sites where it eliminates whole make/unmake round trips.
-        const gives_check = gives_check_hint orelse legal.isInCheck(pos, pos.side_to_move);
+        // The checked side comes from the pre-move register value (mover's
+        // opponent), not a reload of the byte makeMove just stored.
+        const gives_check = gives_check_hint orelse legal.isInCheck(pos, moved_side.other());
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
         resources.rfp_hint.prefetch(child_key); // and the RFP-hint cluster (probed per negamax node)
         ctx.repetition.push(child_key);
@@ -724,7 +732,7 @@ fn negamax(
         var reduction: u16 = 0;
         var score: types.Score = undefined;
         if (index == 0) {
-            score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, node_ctx.firstChild(), null);
+            score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, node_ctx.firstChild(), null, gives_check);
         } else {
             reduction = reductions.lateMoveReduction(search_depth, index, mv, in_check, improving, node_ctx.cut_node, tt_move != null, quiet_history_score, stack_entry.killer_a, stack_entry.killer_b);
             if (reduction > 0) {
@@ -733,12 +741,12 @@ fn negamax(
             }
             ctx.notePvsScout();
             const reduced = if (reduction >= child_base_depth) 0 else child_base_depth - reduction;
-            score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null);
+            score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null, gives_check);
             if (!ctx.stopped and reduction > 0 and score > alpha) {
                 ctx.noteLmrResearch(index, reduction, score, alpha, quiet_history_score, node_ctx.pv_node, node_ctx.cut_node);
                 if (move_order_sample) |sample| ctx.noteMoveOrderLmrResearch(sample);
                 outcome_flags.lmr_research = true;
-                score = -negamax(ctx, resources, pos, child_base_depth, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null);
+                score = -negamax(ctx, resources, pos, child_base_depth, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null, gives_check);
                 if (!ctx.stopped) {
                     if (score <= alpha) {
                         outcome_flags.lmr_verification_fail_low = true;
@@ -749,7 +757,7 @@ fn negamax(
             }
             if (!ctx.stopped and score > alpha and score < beta) {
                 ctx.notePvsResearch();
-                score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null);
+                score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null, gives_check);
             }
         }
 
@@ -915,10 +923,10 @@ fn tryProbCut(
         ctx.repetition.push(child_key);
         resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
         // cheap qsearch pre-verification, then the reduced-depth confirmation
-        var score = -qsearch.search(ctx, resources, pos, -probcut_beta, -probcut_beta + 1, ply + 1);
+        var score = -qsearch.search(ctx, resources, pos, -probcut_beta, -probcut_beta + 1, ply + 1, null);
         if (!ctx.stopped and score >= probcut_beta) {
             const verify_ctx = node_context.NodeContext.fromWindow(-probcut_beta, -probcut_beta + 1, true);
-            score = -negamax(ctx, resources, pos, search_depth - PROBCUT_DEPTH_REDUCTION, -probcut_beta, -probcut_beta + 1, ply + 1, true, verify_ctx, null);
+            score = -negamax(ctx, resources, pos, search_depth - PROBCUT_DEPTH_REDUCTION, -probcut_beta, -probcut_beta + 1, ply + 1, true, verify_ctx, null, null);
         }
         ctx.repetition.pop();
         make_unmake.unmakeMove(pos, mv, &entry.state);
@@ -985,6 +993,7 @@ fn trySingularPlan(
         true,
         node_context.NodeContext.fromWindow(verification_alpha, singular_beta, false),
         candidate,
+        false,
     );
     if (ctx.stopped) return null;
     if (verification_score < singular_beta) {
