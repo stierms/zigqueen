@@ -1,5 +1,10 @@
 # zigqueen clean-room rules
 
+This document records the rules zigqueen was developed under, published for
+provenance transparency: originality questions matter in the chess-engine
+community, and this is our answer in advance. The same rules apply to
+contributions.
+
 ## Purpose
 
 `zigqueen` is a genuine clean-room engine: every line of engine code was
@@ -12,8 +17,8 @@ The goal is to avoid carrying forward:
 
 ## Forbidden implementation sources
 
-Do **not** copy engine code from the author's earlier engines (previous Zig
-and Go engines that predate this project) or from any other engine's source.
+Do **not** copy engine code from earlier private engines by the author or
+from any other engine's source.
 
 This includes:
 - source files
