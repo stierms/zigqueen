@@ -1,5 +1,7 @@
 # zigqueen
 
+<p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
+
 zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
 NNUE evaluation and a single-threaded alpha-beta search. Engine code is a
 clean-room implementation (see `CLEAN_ROOM_RULES.md`); the network is trained
