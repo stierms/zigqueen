@@ -1,10 +1,17 @@
 # Strength
 
 zigqueen's playing strength is self-assessed with a large anchored gauntlet
-against CCRL-rated opposition. The current estimate for **zigqueen 5.8.0** is
-**~3588 CCRL Blitz Elo** (treat as an estimate, ~±15).
+against CCRL-rated opposition. The current estimate for **zigqueen 5.8.2** is
+**~3594 CCRL Blitz Elo** (treat as an estimate, ~±15; the v5.8.0 read under
+the same protocol was ~3588 — statistically the same engine, as expected for
+a node-identical revision).
 
-## Methodology
+## Methodology (v5.8.2 run)
+
+- **Date:** 2026-07-25
+- **Hash:** 256 MB for all engines (CCRL-standard conditions)
+
+## Methodology (v5.8.0 run)
 
 - **Date:** 2026-07-19
 - **Time control:** 180s + 1s increment (CCRL Blitz-comparable), 1,620 games

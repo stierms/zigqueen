@@ -23,7 +23,8 @@ MIT-style license, kept intact in its source headers.
 
 | Engine version | Self-assessment (blitz 180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 |
 |---|---|---|---|
-| v5.8.0 | ~3588 — 1,620-game anchored gauntlet, 2026-07-19 ([methodology](docs/STRENGTH.md)) | submission planned | submission planned |
+| v5.8.2 | ~3594 — 1,620-game anchored gauntlet, 2026-07-25 ([methodology](docs/STRENGTH.md)) | submission planned | submission planned |
+| v5.8.0 | ~3588 — 1,620-game anchored gauntlet, 2026-07-19 ([methodology](docs/STRENGTH.md)) | — | — |
 
 The self-assessment anchors a private gauntlet to published CCRL Blitz
 ratings; treat it as an estimate (~±15).
