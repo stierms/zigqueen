@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1040" viewBox="0 0 1560 1040" font-family="'JetBrains Mono','Cascadia Code','Consolas',monospace">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#F7A41D"/>
+    </marker>
+  </defs>
+  <rect width="1560" height="1040" fill="#1a1b26"/>
+
+  <!-- title -->
+  <text x="60" y="72" fill="#f5efe0" font-size="30" font-weight="bold">zigqueen &#183; ZQB8 network</text>
+  <path d="M60 92 h330" stroke="#F7A41D" stroke-width="3"/>
+  <path d="M390 92 l14 -10 l-6 10 l14 -10" stroke="#F7A41D" stroke-width="3" fill="none"/>
+  <text x="1500" y="72" fill="#8a8fa3" font-size="18" text-anchor="end">one board &#8594; one centipawn score</text>
+
+  <!-- input boxes -->
+  <g>
+    <rect x="60" y="150" width="300" height="120" rx="10" fill="none" stroke="#F7A41D" stroke-width="3"/>
+    <text x="210" y="196" fill="#f5efe0" font-size="22" text-anchor="middle">HalfKA-8 features</text>
+    <text x="210" y="228" fill="#F7A41D" font-size="22" text-anchor="middle">6,144 / persp</text>
+    <text x="210" y="252" fill="#8a8fa3" font-size="16" text-anchor="middle">768 &#215; 8 king buckets, mirrored</text>
+
+    <rect x="60" y="310" width="300" height="120" rx="10" fill="none" stroke="#F7A41D" stroke-width="3"/>
+    <text x="210" y="356" fill="#f5efe0" font-size="22" text-anchor="middle">threat features</text>
+    <text x="210" y="388" fill="#F7A41D" font-size="22" text-anchor="middle">7,680 / persp</text>
+    <text x="210" y="412" fill="#8a8fa3" font-size="16" text-anchor="middle">attacker &#8594; target relations, i8 rows</text>
+  </g>
+
+  <!-- accumulator -->
+  <path d="M360 210 H430" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+  <path d="M360 370 H430" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+  <g>
+    <rect x="440" y="150" width="300" height="280" rx="10" fill="#F7A41D"/>
+    <text x="590" y="230" fill="#1a1b26" font-size="26" font-weight="bold" text-anchor="middle">accumulator</text>
+    <text x="590" y="266" fill="#1a1b26" font-size="24" text-anchor="middle">1536 &#215; i16</text>
+    <text x="590" y="300" fill="#1a1b26" font-size="18" text-anchor="middle">two perspectives (stm / ntm)</text>
+    <text x="590" y="350" fill="#5c3d00" font-size="16" text-anchor="middle">incremental: applyMove edits,</text>
+    <text x="590" y="374" fill="#5c3d00" font-size="16" text-anchor="middle">lazy materialization, finny refresh</text>
+  </g>
+
+  <!-- activation -->
+  <path d="M740 290 H810" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+  <g>
+    <rect x="820" y="220" width="290" height="140" rx="10" fill="none" stroke="#F7A41D" stroke-width="3"/>
+    <text x="965" y="268" fill="#f5efe0" font-size="22" text-anchor="middle">CReLU + pairwise mul</text>
+    <text x="965" y="300" fill="#F7A41D" font-size="22" text-anchor="middle">768 &#215; u8 / persp</text>
+    <text x="965" y="330" fill="#8a8fa3" font-size="16" text-anchor="middle">concat stm|ntm &#8594; 1536 &#215; u8</text>
+  </g>
+
+  <!-- layerstack -->
+  <path d="M1110 290 H1180" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+  <g>
+    <rect x="1190" y="150" width="310" height="360" rx="10" fill="none" stroke="#F7A41D" stroke-width="3" stroke-dasharray="7 5"/>
+    <text x="1345" y="188" fill="#8a8fa3" font-size="16" text-anchor="middle">&#215; 8 material buckets (piece count)</text>
+
+    <rect x="1240" y="210" width="210" height="64" rx="8" fill="#F7A41D"/>
+    <text x="1345" y="250" fill="#1a1b26" font-size="21" font-weight="bold" text-anchor="middle">L1: 1536 &#8594; 16 (i8)</text>
+
+    <path d="M1345 274 V300" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="1240" y="306" width="210" height="64" rx="8" fill="#F7A41D"/>
+    <text x="1345" y="346" fill="#1a1b26" font-size="21" font-weight="bold" text-anchor="middle">L2: 16 &#8594; 32 (f32)</text>
+
+    <path d="M1345 370 V396" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+    <rect x="1240" y="402" width="210" height="64" rx="8" fill="#F7A41D"/>
+    <text x="1345" y="442" fill="#1a1b26" font-size="21" font-weight="bold" text-anchor="middle">L3: 32 &#8594; 1</text>
+
+    <text x="1345" y="492" fill="#8a8fa3" font-size="16" text-anchor="middle">squared-CReLU between layers</text>
+  </g>
+
+  <!-- psqt path -->
+  <g>
+    <rect x="420" y="560" width="340" height="120" rx="10" fill="none" stroke="#F7A41D" stroke-width="3"/>
+    <text x="590" y="606" fill="#f5efe0" font-size="22" text-anchor="middle">PSQT head</text>
+    <text x="590" y="638" fill="#F7A41D" font-size="20" text-anchor="middle">per-feature scalar &#215; 8 buckets</text>
+    <text x="590" y="662" fill="#8a8fa3" font-size="16" text-anchor="middle">maintained incrementally, linear path</text>
+  </g>
+  <path d="M360 430 L360 620 L430 620" stroke="#F7A41D" stroke-width="3" fill="none" marker-end="url(#arr)"/>
+
+  <!-- combine -->
+  <circle cx="1345" cy="640" r="66" fill="#F7A41D"/>
+  <text x="1345" y="633" fill="#1a1b26" font-size="24" font-weight="bold" text-anchor="middle">eval</text>
+  <text x="1345" y="661" fill="#5c3d00" font-size="16" text-anchor="middle">centipawns</text>
+  <path d="M1345 510 V564" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+  <path d="M740 620 H1269" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
+
+  <!-- footer facts -->
+  <path d="M60 760 h1440" stroke="#2e3040" stroke-width="2"/>
+  <text x="60" y="810" fill="#f5efe0" font-size="20" font-weight="bold">why it is fast</text>
+  <text x="60" y="848" fill="#8a8fa3" font-size="18">&#8226; a move changes few features &#8594; the accumulator updates by row add/sub, never a full forward pass</text>
+  <text x="60" y="880" fill="#8a8fa3" font-size="18">&#8226; threat deltas are computed by an incremental algorithm (attacks are non-local; no piece-list diff suffices)</text>
+  <text x="60" y="912" fill="#8a8fa3" font-size="18">&#8226; nodes that never evaluate (TT cutoffs) skip accumulator work entirely; a raw-eval cache skips repeat evals</text>
+  <text x="60" y="944" fill="#8a8fa3" font-size="18">&#8226; integer SIMD (@Vector &#8594; AVX-512/AVX2/NEON) is bit-exact: identical eval on every target</text>
+  <text x="1500" y="990" fill="#3d3f52" font-size="15" text-anchor="end">net: ~31 MB embedded (ZQB8) &#183; trained with bullet on published Stockfish datasets</text>
+</svg>

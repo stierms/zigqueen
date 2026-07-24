@@ -5,7 +5,7 @@
 zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
 NNUE evaluation and a single-threaded alpha-beta search. Engine code is a
 clean-room implementation (see `CLEAN_ROOM_RULES.md`); the network is trained
-from publicly available Stockfish fishtest data.
+from the publicly published Stockfish NNUE training datasets.
 
 **zigqueen is a human/AI collaboration**: developed by
 [stierms](https://github.com/stierms) (project direction, engineering
@@ -40,7 +40,7 @@ ratings; treat it as an estimate (~±15).
 - incremental accumulators with lazy materialization and a finny-style
   refresh cache
 - trained with the [bullet](https://github.com/jw1912/bullet) trainer on
-  public Stockfish fishtest data
+  the publicly published Stockfish NNUE training datasets
 
 **Search** — negamax + iterative deepening, aspiration windows:
 
@@ -79,7 +79,7 @@ builds and zips all four release variants into `release/`.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `Hash` | spin | 64 | Transposition table size in MB (1-65536); also sizes the eval cache. |
+| `Hash` | spin | 256 | Transposition table size in MB (1-65536); also sizes the eval cache. |
 | `Threads` | spin | 1 | Search threads. The engine is single-threaded; fixed at 1. |
 | `Move Overhead` | spin | 20 | Per-move time reserve in ms for GUI/connection latency (0-1000). |
 | `NNUE Scale Percent` | spin | 66 | Eval scaling in percent (0-400). The default is the calibrated value; changing it is not recommended. |
@@ -105,8 +105,8 @@ builds and zips all four release variants into `release/`.
 
 ## Acknowledgments
 
-- The [Stockfish](https://stockfishchess.org/) project and the fishtest
-  community, whose public training data made the network possible.
+- The [Stockfish](https://stockfishchess.org/) project and its community,
+  whose openly published NNUE training datasets made the network possible.
 - [bullet](https://github.com/jw1912/bullet), the NNUE trainer.
 - [Fathom](https://github.com/jdart1/Fathom) for Syzygy probing.
 - The engine-testing ecosystem, especially

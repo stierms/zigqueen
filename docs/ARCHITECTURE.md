@@ -41,6 +41,11 @@ Structural rules:
 
 ## NNUE evaluation
 
+![ZQB8 network dataflow](diagrams/net-architecture.png)
+
+*(An annotated, editable SVG variant with the incremental-update details lives
+at [diagrams/net-architecture-annotated.svg](diagrams/net-architecture-annotated.svg).)*
+
 The evaluator is a pure NNUE (no hand-crafted evaluation) in the engine's own
 `ZQB` family of net formats, loaded from an embedded ~30 MB net
 (`src/eval/default_net.zqb`) or an external file via the `EvalFile` UCI
@@ -84,10 +89,13 @@ across targets.
   only the piece diff against the cached snapshot instead of a full refresh.
 
 The net is trained with the [bullet](https://github.com/jw1912/bullet)
-trainer on publicly available Stockfish fishtest data; the engine-side
+trainer on the publicly published Stockfish NNUE training datasets
+(relabeled played-out game positions); the engine-side
 mapping is validated bit-for-bit against a trainer-faithful reference.
 
 ## Search
+
+![Search pipeline](diagrams/search-pipeline.png)
 
 Iterative deepening with aspiration windows around a PVS/negamax core.
 
