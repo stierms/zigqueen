@@ -6,7 +6,7 @@ const tunables = @import("../search/tunables.zig");
 const max_string_option_len = 512;
 
 pub const Options = struct {
-    hash_mb: u32 = 64,
+    hash_mb: u32 = 256,
     threads: u8 = 1,
     move_overhead_ms: u32 = 20,
     // Out-of-the-box default: the embedded bullet pure NNUE at its calibrated
@@ -233,7 +233,7 @@ test "setoption rejects unsupported thread counts" {
 test "unknown setoption names are ignored" {
     var options = Options{};
     try std.testing.expectEqual(ApplyOptionResult.ignored, try options.applySetOptionLine("setoption name Clear Hash"));
-    try std.testing.expectEqual(@as(u32, 64), options.hash_mb);
+    try std.testing.expectEqual(@as(u32, 256), options.hash_mb);
 }
 
 test "setoption updates move overhead" {
