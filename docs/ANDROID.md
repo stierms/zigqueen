@@ -22,6 +22,25 @@ with an illegal-instruction error, your SoC is older — use `armv8`.
 Expect very roughly a third of a modern desktop core's speed on a current
 flagship, with thermal throttling in long sessions.
 
+## Verifying an APK is really ours
+
+Official zigqueen APKs are published **only** on this repository's GitHub
+releases. Third-party mirror sites sometimes repackage APKs with unwanted
+extras; a repackaged APK cannot carry our signature. To verify:
+
+```sh
+apksigner verify --print-certs zigqueen-*.apk
+```
+
+The signer certificate must be
+`CN=Matthias Stier, OU=zigqueen, O=stierms, C=DE` with SHA-256 digest:
+
+```
+c919e613db93d244216fe02288dfb1ab9af47ef43035d71b8676b6dc7cfa987e
+```
+
+Anything else claiming to be zigqueen is not from us.
+
 ## Building it yourself
 
 The cross-compile needs no Android NDK — Zig carries everything:
