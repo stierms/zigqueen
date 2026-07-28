@@ -1,0 +1,50 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'org.stierms.zigqueen.oex'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "org.stierms.zigqueen"
+        minSdk 21
+        targetSdk 35
+        versionCode 583
+        versionName "5.8.3"
+    }
+
+    flavorDimensions = ["variant"]
+    productFlavors {
+        generic {
+            dimension "variant"
+            applicationIdSuffix ".generic"
+            manifestPlaceholders = [appLabel: "zigqueen 5.8.3"]
+        }
+        dotprod {
+            dimension "variant"
+            applicationIdSuffix ".dotprod"
+            manifestPlaceholders = [appLabel: "zigqueen 5.8.3 dotprod"]
+        }
+    }
+
+    signingConfigs {
+        release {
+            storeFile file(RELEASE_STORE_FILE)
+            storePassword RELEASE_STORE_PASSWORD
+            keyAlias "zigqueen"
+            keyPassword RELEASE_STORE_PASSWORD
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    // engine binaries are prebuilt static executables shipped as native libs;
+    // they are not linkable ELF shared objects, so keep the packager honest
+    packagingOptions {
+        jniLibs { useLegacyPackaging = true }
+    }
+}

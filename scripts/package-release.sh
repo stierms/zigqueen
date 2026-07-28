@@ -6,7 +6,12 @@
 #   zigqueen-<version>-linux-x86_64-avx512.zip
 #   zigqueen-<version>-windows-x86_64-avx2.zip
 #   zigqueen-<version>-windows-x86_64-avx512.zip
+#   zigqueen-<version>-android-armv8.zip
+#   zigqueen-<version>-android-armv8-dotprod.zip
 # Each zip contains the engine binary (NNUE net embedded), LICENSE and README.md.
+# The android binaries are static aarch64-linux-musl executables (usable in
+# Termux, Chess for Android "install from SD" where allowed, and as the input
+# for the OEX APK packaging under android/oex — see docs/ANDROID.md).
 #
 # Variants:
 #   avx2   = x86-64-v3 baseline (AVX2, no AVX-512) — runs on Haswell/Zen1+.
@@ -74,6 +79,20 @@ for os_name in linux windows; do
         make_zip "$OUT_DIR/${name}.zip" "$staged" "$ROOT/LICENSE" "$ROOT/README.md"
         echo "packaged $OUT_DIR/${name}.zip" >&2
     done
+done
+
+for variant in armv8 armv8-dotprod; do
+    echo "== building android $variant" >&2
+    zig build -Doptimize=ReleaseFast "-Dcpu-baseline=$variant" -Dtarget=aarch64-linux-musl
+
+    built="zig-out/bin/zigqueen-aarch64-${variant}"
+    [[ -f "$built" ]] || { echo "ERROR: expected artifact $built missing" >&2; exit 1; }
+
+    name="zigqueen-${VERSION}-android-${variant}"
+    staged="$STAGE_DIR/${name}"
+    cp "$built" "$staged"
+    make_zip "$OUT_DIR/${name}.zip" "$staged" "$ROOT/LICENSE" "$ROOT/README.md"
+    echo "packaged $OUT_DIR/${name}.zip" >&2
 done
 
 rm -rf "$STAGE_DIR"

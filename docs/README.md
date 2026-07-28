@@ -11,6 +11,8 @@
 - [`QUALITY_GATES.md`](QUALITY_GATES.md) — correctness and promotion gates.
 - [`PERFORMANCE_PRINCIPLES.md`](PERFORMANCE_PRINCIPLES.md) — hot-path
   constraints and performance discipline.
+- [`ANDROID.md`](ANDROID.md) — running and building zigqueen on Android
+  (release APKs/binaries, the NDK-free cross-compile, OEX packaging).
 - [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md) — building native Windows binaries
   (including from WSL) and the Windows large-pages note.
 - [`../CLEAN_ROOM_RULES.md`](../CLEAN_ROOM_RULES.md) — the clean-room policy

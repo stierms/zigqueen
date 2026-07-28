@@ -137,6 +137,10 @@ builds and zips all four release variants into `release/`.
 
 ## Platform notes
 
+**Android**: each release ships OEX engine APKs (auto-discovered by Chess for
+Android, DroidFish and other OEX-compatible GUIs) plus raw aarch64 binaries;
+the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDROID.md).
+
 - **Linux/WSL2:** the engine transparently enables 2 MB huge pages for its
   large tables (THP `madvise`), no setup needed.
 - **Windows:** large pages need `SeLockMemoryPrivilege` — grant "Lock pages

@@ -1,0 +1,4 @@
+build/
+.gradle/
+gradle.properties
+app/src/*/jniLibs/arm64-v8a/*.so

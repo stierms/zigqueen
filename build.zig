@@ -19,23 +19,36 @@ pub fn build(b: *std.Build) void {
     // The NNUE eval is bit-exact across SIMD widths by design (@Vector
     // elementwise ops + overflow-free integer dots), so all variants produce
     // identical node counts; only speed differs.
-    const CpuBaseline = enum { avx2, avx512 };
+    //   -Dcpu-baseline=armv8         aarch64 baseline NEON (any 64-bit ARM,
+    //                                 incl. Android phones via the musl target).
+    //   -Dcpu-baseline=armv8-dotprod  + dotprod/i8mm (the udot/usdot l1 matmul
+    //                                 kernels) — most SoCs from ~2018 on.
+    const CpuBaseline = enum { avx2, avx512, armv8, @"armv8-dotprod" };
     const cpu_baseline = b.option(
         CpuBaseline,
         "cpu-baseline",
-        "Portable x86_64 CPU baseline for release binaries (default: native).",
+        "Portable CPU baseline for release binaries (default: native).",
     );
     if (cpu_baseline) |baseline| {
         var query = target.query;
-        query.cpu_arch = .x86_64;
         switch (baseline) {
             .avx2 => {
+                query.cpu_arch = .x86_64;
                 query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
                 query.cpu_features_add = .empty;
             },
             .avx512 => {
+                query.cpu_arch = .x86_64;
                 query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v4 };
                 query.cpu_features_add = std.Target.x86.featureSet(&.{.avx512vnni});
+            },
+            .armv8, .@"armv8-dotprod" => {
+                query.cpu_arch = .aarch64;
+                query.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic };
+                query.cpu_features_add = if (baseline == .@"armv8-dotprod")
+                    std.Target.aarch64.featureSet(&.{ .dotprod, .i8mm })
+                else
+                    .empty;
             },
         }
         query.cpu_features_sub = .empty;
@@ -46,6 +59,8 @@ pub fn build(b: *std.Build) void {
     const name_suffix: []const u8 = if (cpu_baseline) |baseline| switch (baseline) {
         .avx2 => "-x86_64-avx2",
         .avx512 => "-x86_64-avx512",
+        .armv8 => "-aarch64-armv8",
+        .@"armv8-dotprod" => "-aarch64-armv8-dotprod",
     } else "";
 
     // Semantic version `zigqueen X.Y.Z`, surfaced via UCI `id name`.
