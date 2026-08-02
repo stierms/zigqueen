@@ -1,10 +1,23 @@
 # Strength
 
-zigqueen's playing strength is self-assessed with a large anchored gauntlet
-against CCRL-rated opposition. The current estimate for **zigqueen 5.8.3** is
-**~3590 CCRL Blitz Elo** (treat as an estimate, ~±15; the v5.8.0/v5.8.2
-reads under the same protocol were ~3588/~3594 — three anchors inside one
-noise band, i.e. a stable rating).
+## Official CCRL rating
+
+**zigqueen 5.8.3: CCRL Blitz (2'+1") 3569 ±16, rank #76–77** — 951 games,
+first listed 2026-08-01
+([engine details](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)).
+The tested field was entirely engines rated 3563–3635 (nothing below
+zigqueen's own level), with positive performances against Black Marlin 9.0,
+Peacekeeper 3.01 and Koivisto 9.0. This is the authoritative public number.
+
+## Self-assessment (pre-listing)
+
+Before the CCRL listing, strength was self-assessed with a large anchored
+gauntlet against CCRL-rated opposition: **~3590 CCRL Blitz Elo** for v5.8.3
+(the v5.8.0/v5.8.2 reads under the same protocol were ~3588/~3594 — three
+anchors inside one noise band). The official result landed ~20 Elo below
+the self-assessment — within the combined error of the two methods, on
+different hardware and field composition. Calibration honesty: treat the
+gauntlet protocol below as accurate to roughly ±20 vs CCRL.
 
 ## Methodology (v5.8.3 run)
 

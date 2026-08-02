@@ -50,12 +50,14 @@ developed under — no code was copied or translated from other engines.
 
 | Engine version | Self-assessment (blitz 180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 |
 |---|---|---|---|
-| v5.8.3 | ~3590 — 1,620-game anchored gauntlet, 2026-07-26 ([methodology](docs/STRENGTH.md)) | submission planned | submission planned |
+| v5.8.3 | ~3590 — 1,620-game anchored gauntlet, 2026-07-26 ([methodology](docs/STRENGTH.md)) | **3569 ±16** (#76–77, [official listing](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — |
 | v5.8.2 | ~3594 — 1,620-game anchored gauntlet, 2026-07-25 ([methodology](docs/STRENGTH.md)) | — | — |
 | v5.8.0 | ~3588 — 1,620-game anchored gauntlet, 2026-07-19 ([methodology](docs/STRENGTH.md)) | — | — |
 
-The self-assessment anchors a private gauntlet to published CCRL Blitz
-ratings; treat it as an estimate (~±15).
+The official CCRL Blitz rating (951 games, first listed 2026-08-01) is the
+authoritative number. The self-assessment anchors a private gauntlet to
+published CCRL Blitz ratings; it landed within ~20 Elo of the official
+result — treat it as an estimate (~±20).
 
 ## Development hardware
 
