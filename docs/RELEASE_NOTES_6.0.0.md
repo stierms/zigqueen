@@ -13,7 +13,7 @@ substantially faster inference path.
   fine-tuned from, or distilled from another engine's network weights. See
   [NETWORK.md](NETWORK.md).
 - External check: 52.3% over a 1,620-game gauntlet against 27 CCRL-listed
-  engines, ~3602 CCRL Blitz on that instrument. Details and caveats in
+  engines (~3602 on the project's anchored gauntlet scale). Details and caveats in
   [STRENGTH.md](STRENGTH.md).
 
 ## Performance
