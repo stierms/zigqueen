@@ -1,19 +1,20 @@
-//! Dedicated raw-eval cache: a position-keyed memo of the RAW static
+//! Dedicated raw-eval cache (perf-r11): a position-keyed memo of the RAW static
 //! eval — the exact value `resources.evaluator.evaluate` would return.
 //!
 //! Motivation: post-LTO profiles put the NNUE eval family at 63-66% of
 //! opening/middle cycles with per-eval cost at its measured floor; the
 //! remaining lever is evaluating FEWER positions. The TT already caches the
-//! raw eval (Entry.static_eval), but TT capacity is
+//! raw eval (v5.1.0 "Lever 1", Entry.static_eval), but TT capacity is
 //! contended by depth-preferred replacement — a TT-evicted position pays a
 //! full NNUE forward on revisit. This table is a cheap second chance keyed
 //! ONLY by position, with no depth competition.
 //!
 //! Design:
-//!   - 2-way set-associative, 1-bit-LRU. Sets are 2 adjacent 16-byte
-//!     entries (32B, in-line — 4 entries per 64B line); the victim is the
-//!     slot NOT hit last. Measured at depth 18, 2-way is worth about a full
-//!     size doubling over direct-mapped (+2.5-3.1pp hit rate at equal size).
+//!   - 2-way set-associative, 1-bit-LRU (shipped default since perf-r12; was
+//!     direct-mapped in v5.7.0). Sets are 2 adjacent 16-byte entries (32B,
+//!     in-line — 4 entries per 64B line); the victim is the slot NOT hit
+//!     last. The r12 sweep measured 2-way ≈ a full size doubling: at d18 it
+//!     buys +2.5-3.1pp hit rate at equal size (16MB 2-way == 32MB direct).
 //!   - Verifier = the FULL 64-bit zobrist key, matching the TT's verifier
 //!     width exactly: a hit returns the raw eval of that exact position up to
 //!     a full zobrist collision — the identical risk class the TT already
@@ -27,14 +28,15 @@
 //!     exactly 0 (p ~ 2^-64, same class as a zobrist collision) is simply
 //!     never cached (probe misses, store skips).
 //!   - Sized off UCI Hash: Hash/4 clamped to [4, 64] MB (64MB default Hash
-//!     -> 16MB cache; halving that measured 90-97% full at depth 18,
-//!     thrashing against a ~1.1M-entry working set). No UCI option
+//!     -> 16MB cache; was Hash/8 [4,32] in v5.7.0 — the d18 sweep showed the
+//!     8MB table 90-97% full and thrashing against a ~1.1M-entry working
+//!     set; 8->16MB 2-way is +7.7pp hit-after-TT-miss at d18). No UCI option
 //!     of its own; ucinewgame clears it (via Engine.reset), Hash resize
 //!     re-sizes it.
 //!   - Allocation routed through util/hugealloc like the TT/rfp-hint tables
 //!     (zobrist-indexed random access over MBs -> same dTLB story).
 //!
-//! Experiment scaffolding (compiled into -Dsearch-stats builds ONLY;
+//! perf-r12 experiment scaffolding (compiled into -Dsearch-stats builds ONLY;
 //! release builds comptime-fold every policy check to the shipped default):
 //!   - ZQ_EVAL_CACHE_MB: override the table size (clamped [4, 256] MB) for
 //!     sizing sweeps at fixed Hash.

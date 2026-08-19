@@ -3,6 +3,14 @@ const square_mod = @import("square.zig");
 
 pub const Bitboard = u64;
 pub const EMPTY: Bitboard = 0;
+pub const FULL: Bitboard = std.math.maxInt(Bitboard);
+pub const FILE_A_MASK: Bitboard = 0x0101_0101_0101_0101;
+pub const DARK_SQUARES: Bitboard = 0xAA55_AA55_AA55_AA55;
+pub const LIGHT_SQUARES: Bitboard = 0x55AA_55AA_55AA_55AA;
+
+pub inline fn fileMask(file: u3) Bitboard {
+    return FILE_A_MASK << file;
+}
 
 pub inline fn bit(square: square_mod.Square) Bitboard {
     return @as(Bitboard, 1) << square.index();

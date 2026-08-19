@@ -84,9 +84,9 @@ pub const MoveList = struct {
 
     pub inline fn init() MoveList {
         // NOT `return .{};`: the aggregate literal materializes the `undefined`
-        // moves array as a 512-byte zero-store per call (8 zmm stores in
-        // negamax/qsearch, visible in perf annotate). Only `count` needs
-        // initializing; entries past `count` are never read.
+        // moves array as a 512-byte zero-store per call (8x zmm in negamax/qsearch,
+        // seen in v5.2.0 perf annotate). Only `count` needs initializing; entries
+        // past `count` are never read.
         var list: MoveList = undefined;
         list.count = 0;
         return list;

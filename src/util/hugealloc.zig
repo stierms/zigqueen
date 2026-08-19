@@ -1,9 +1,8 @@
 //! 2MB-huge-page backing for the large random-access hash tables (TT, rfp-hint,
 //! continuation history). With 4KB pages a 64MB TT needs 16384 dTLB entries --
-//! effectively every probe is a TLB miss even when the line is in L2/L3
-//! (profiles flagged ~5% of endgame negamax samples as TLB-walk skid after the
-//! paired TT/rfp-hint prefetches). 2MB pages cover the same table with 32
-//! entries.
+//! effectively every probe is a TLB miss even when the line is in L2/L3 (R3a's
+//! annotate flagged ~5.4% of endgame negamax samples as skid after the paired
+//! TT/rfp-hint prefetches). 2MB pages cover the same table with 32 entries.
 //!
 //! Allocation ladder (Linux, size >= 2MB):
 //!   1. mmap(MAP_HUGETLB)          -- pre-reserved huge pages (vm.nr_hugepages);

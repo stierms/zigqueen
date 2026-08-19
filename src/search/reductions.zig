@@ -3,14 +3,15 @@ const move_mod = @import("../core/move.zig");
 
 const MAX_LMR_DEPTH: usize = 64;
 const MAX_LMR_MOVES: usize = 64;
-// SPSA-tuned values, kept runtime-tunable: the LMR shape is the most
-// eval-coupled reduction parameter (a new net changes the eval's error
-// distribution the reductions were fit to), so it must stay re-tunable
-// without recompiling. Fixed-point centi-units so the SPSA driver perturbs
-// integers.
+// SPSA campaign #2 (2026-06-01) tuned values; runtime-tunable since 2026-07-16
+// (lever 5: the LMR shape is the most eval-coupled reduction parameter, and the
+// v5.0.0 relabel net changed the eval's error distribution the margins were fit
+// to). Fixed-point centi-units so the SPSA driver perturbs integers.
 pub const LMR_BASE_100_DEFAULT: i32 = 50; // 0.50 base offset
 pub const LMR_DIVISOR_100_DEFAULT: i32 = 228; // 2.28 log-product divisor
 const LMR_NON_IMPROVING: i32 = 0; // extra LMR reduction when not improving
+const NULL_REDUCTION_BASE: u16 = 5; // null-move R at depth >= NULL_REDUCTION_DEPTH
+const NULL_REDUCTION_DEPTH: u16 = 7;
 
 // Built at runtime (startup + on setoption) so the default table and any SPSA
 // perturbation go through the SAME libm — a comptime-built default could differ
@@ -32,10 +33,10 @@ pub fn applyLmrShape(base_100: i32, divisor_100: i32) void {
             }
             const ln_d = @log(@as(f64, @floatFromInt(d)));
             const ln_m = @log(@as(f64, @floatFromInt(m)));
-            // Shape: BASE OFFSET + log-product, ROUNDED. An offset-free,
-            // truncated formula reduces 1-2 plies less across the mid-tree and
-            // inflates the effective branching factor well above SF-class
-            // engines.
+            // Modern shape: BASE OFFSET + log-product, ROUNDED. The offset-free,
+            // truncated formula reduced 1-2 plies less than SF-class engines across
+            // the mid-tree — a top contributor to EBF 2.13 vs the field's ~1.5-1.8
+            // (depth-efficiency v2, gauntlet forensics 2026-07-08).
             const r = base + ln_d * ln_m / divisor;
             if (r <= 0.0) {
                 cell.* = 0;
@@ -68,7 +69,8 @@ pub fn lateMoveReduction(
     if (in_check) return 0;
     if (move_index < 2) return 0;
     if (mv.isPromotion()) return 0;
-    if (mv.isCapture()) return 0;
+    const is_capture = mv.isCapture();
+    if (!ENABLE_CAPTURE_LMR and is_capture) return 0;
     if (killer_a) |killer| {
         if (killer == mv) return 0;
     }
@@ -82,15 +84,23 @@ pub fn lateMoveReduction(
     // No TT move at this node = never resolved by prior search; its late quiets are
     // the least-vetted moves in the tree — reduce them more (TT-quality rung).
     if (!has_tt_move) reduction_signed += 1;
+    // Captures reduce too (modern practice), 2 less than quiets — late bad captures
+    // were fully exempt, burning full-depth searches deep in the move list.
+    if (ENABLE_CAPTURE_LMR and is_capture) reduction_signed -= 2;
     if (!improving) reduction_signed += LMR_NON_IMPROVING;
-    // History-conditioned scaling over the summed (main + continuation) history
-    // signal: hot-evidence quiets reduce up to 3 less, cold ones up to 3 more.
-    // Conditioning the aggression on move-quality evidence is what lets the base
-    // reductions stay large without tactical blind spots.
+    // Continuous-ish history scaling: reduce hot-history quiets less and
+    // cold-history quiets more. Widened from +/-1 to +/-2 (divisor 8192) so the
+    // reduction tracks history more like SF's statScore term -> deeper on the
+    // late, cold quiets that dominate the tree. (Depth-efficiency campaign.)
+    // Rung 2: continuous-er scaling over the RICHER (main+cont) signal, wider clamp.
+    // Hot-evidence quiets reduce up to 3 less, cold ones up to 3 more — evidence-
+    // conditioned aggression is what lets the base reductions grow safely.
     const history_shift = std.math.clamp(@divTrunc(history_score, 5461), -3, 3);
     reduction_signed -= history_shift;
-    // Deep, late, cold quiets at expected-ALL nodes get one extra reduction.
-    if (!cut_node and depth >= 8 and move_index >= 8 and !improving and history_score <= 0 and reduction_signed > 1) {
+    if (ENABLE_CUT_BONUS) {
+        // Expected-cut nodes reduce more across the board (modern node-type asymmetry).
+        if (cut_node) reduction_signed += 1;
+    } else if (!cut_node and depth >= 8 and move_index >= 8 and !improving and history_score <= 0 and reduction_signed > 1) {
         reduction_signed += 1;
     }
     if (reduction_signed < 0) return 0;
@@ -99,12 +109,19 @@ pub fn lateMoveReduction(
     return reduction;
 }
 
+const ENABLE_CAPTURE_LMR = false;
+const ENABLE_CUT_BONUS = false;
+const ENABLE_DYNAMIC_NULL_R = true;
+
 pub fn nullMoveReduction(depth: u16) u16 {
-    // Dynamic R = 4 + depth/6: a moderate depth-scaled dose. More aggressive
-    // scaling (e.g. 3 + depth/3) destabilized deep scout trees for this
-    // engine's move-ordering quality.
-    const r = 4 + depth / 6;
-    return @min(r, depth -| 1);
+    if (ENABLE_DYNAMIC_NULL_R) {
+        // Dynamic R = 4 + depth/6 (field-median dose; SF's 3+d/3 destabilized deep
+        // scout trees for our ordering quality — titrated down after the +7.3@20s /
+        // −14.6@60s split). Still far above the old flat R (2 below d7, 5 above).
+        const r = 4 + depth / 6;
+        return @min(r, depth -| 1);
+    }
+    return if (depth >= NULL_REDUCTION_DEPTH) NULL_REDUCTION_BASE else 2;
 }
 
 test "lmr shape rebuild changes reductions and restores defaults exactly" {
@@ -136,7 +153,8 @@ test "late move reduction respects in-check and killer guards" {
 }
 
 test "late move reduction never reduces less when not improving" {
-    // The improving-asymmetry lives in LMR_NON_IMPROVING (currently 0).
+    // The improving-asymmetry lives in LMR_NON_IMPROVING (currently 0) — the old
+    // narrow all-node bonus was replaced by the broad cut-node bonus (v2 bundle).
     const q = move_mod.Move.init(.a2, .a3, .quiet);
     const improving = lateMoveReduction(8, 10, q, false, true, false, true, 0, null, null);
     const not_improving = lateMoveReduction(8, 10, q, false, false, false, true, 0, null, null);
@@ -150,12 +168,16 @@ test "late move reduction shrinks when quiet history is strongly positive" {
     try std.testing.expect(hot_quiet < unknown);
 }
 
-test "all-node cold-quiet bonus and hot history shape reductions" {
+test "cut-node bonus (when enabled) and hot history shape reductions" {
     const q = move_mod.Move.init(.a2, .a3, .quiet);
     const all_node = lateMoveReduction(8, 20, q, false, false, false, true, 0, null, null);
     const cut_node = lateMoveReduction(8, 20, q, false, false, true, true, 0, null, null);
     const positive_history = lateMoveReduction(8, 20, q, false, false, false, true, 20_000, null, null);
-    // Deep late cold quiets at ALL-nodes get the +1, so cut nodes never reduce more.
-    try std.testing.expect(all_node >= cut_node);
+    if (ENABLE_CUT_BONUS) {
+        try std.testing.expect(cut_node > all_node);
+    } else {
+        // legacy rule: deep late cold quiets at ALL-nodes get the +1 instead
+        try std.testing.expect(all_node >= cut_node);
+    }
     try std.testing.expect(positive_history < all_node);
 }

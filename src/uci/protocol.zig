@@ -120,7 +120,7 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
 
     if (std.mem.eql(u8, command, "uci")) {
         try state.worker.output.print("id name zigqueen {s}\n", .{build_options.version});
-        try state.worker.output.writeAll("id author stierms\n");
+        try state.worker.output.writeAll("id author OpenAI + mstie\n");
         try state.options.writeUciOptions(state.worker.output);
         try state.worker.output.writeAll("uciok\n");
         return false;
@@ -345,7 +345,29 @@ fn moveMatchesUci(mv: move_mod.Move, move_text: []const u8) bool {
     return std.mem.eql(u8, mv.toUci(&buffer), move_text);
 }
 
-const TestOutput = worker_mod.TestOutput;
+const TestOutput = struct {
+    mutex: std.Thread.Mutex = .{},
+    buffer: [8192]u8 = [_]u8{0} ** 8192,
+    len: usize = 0,
+
+    fn sink(self: *TestOutput) worker_mod.OutputSink {
+        return .{ .ctx = self, .write_fn = write };
+    }
+
+    fn write(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *TestOutput = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.len + bytes.len > self.buffer.len) return error.NoSpaceLeft;
+        @memcpy(self.buffer[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn contents(self: *const TestOutput) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
 
 test "handleCommand recognizes quit" {
     var output = TestOutput{};

@@ -173,7 +173,7 @@ pub const Worker = struct {
 
     fn runSearch(self: *Worker, request: SearchRequest) void {
         var timer = std.time.Timer.start() catch null;
-        const controller_limits = request.limits.toControllerLimits(request.position.side_to_move, request.move_overhead_ms);
+        const controller_limits = request.limits.toControllerLimits(request.position.side_to_move, request.move_overhead_ms, request.position.fullmove_number);
 
         // Install the per-iteration info sink for this search; the engine streams
         // `info depth ...` lines through it as each depth (or aspiration fail) lands.
@@ -219,13 +219,12 @@ pub const Worker = struct {
     }
 };
 
-/// In-memory OutputSink for unit tests (shared with protocol.zig's tests).
-pub const TestOutput = struct {
+const TestOutput = struct {
     mutex: std.Thread.Mutex = .{},
     buffer: [8192]u8 = [_]u8{0} ** 8192,
     len: usize = 0,
 
-    pub fn sink(self: *TestOutput) OutputSink {
+    fn sink(self: *TestOutput) OutputSink {
         return .{ .ctx = self, .write_fn = write };
     }
 
@@ -239,7 +238,7 @@ pub const TestOutput = struct {
         self.len += bytes.len;
     }
 
-    pub fn contents(self: *const TestOutput) []const u8 {
+    fn contents(self: *const TestOutput) []const u8 {
         return self.buffer[0..self.len];
     }
 };

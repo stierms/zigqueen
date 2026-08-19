@@ -96,12 +96,13 @@ const SINGULAR_MARGIN_BASE: i32 = 8;
 const SINGULAR_MARGIN_PER_PLY: i32 = 4;
 const SINGULAR_EXTENSION_MARGIN: i32 = 16;
 const SINGULAR_CAPTURE_SEE_THRESHOLD: i32 = 96;
-// ProbCut: shallow preemptive verification that a good capture beats beta by
-// a margin, skipping the full-depth search when it does. Cuts ~10% of nodes at
-// fixed depth; its strength value concentrates at deep searches / long time
-// controls and is neutral at fast ones. Multicut stays enabled but fires at
-// noise level under the narrow singular eligibility (~445 per 1.5M nodes);
-// widening that eligibility was tested and washed.
+// ProbCut: REVIVED 2026-07-12 (v4.10.0) — the v4.0.6 parking note predicted its
+// value concentrates at depth/long TC, and the revival measured exactly that:
+// 0.00 +/- 11.1 @20+0.2, +13.2 +/- 10.3 @60+0.6 (LOS 99.4) vs v4.9.0, with
+// -10.5% nodes at fixed depth; 200-game field veto-check clean (52.0%/3577 vs
+// ref 53.2%/3587, all tiers within noise). Multicut stays enabled but fires at
+// noise level under the narrow singular eligibility (~445/1.5M nodes); widening
+// that eligibility was tested and washed (see the singular-family closure).
 const PROBCUT_ENABLED = true;
 const MULTICUT_ENABLED = true;
 const PROBCUT_MIN_DEPTH: u16 = 5;
@@ -171,7 +172,7 @@ pub fn searchDepthWindow(
     entry.prev_move = null;
     entry.prev_piece_type = null;
     entry.prev_cont_piece = null;
-    entry.static_eval = if (in_check) null else resources.history.correctedEval(pos, resources.evaluator.evaluate(&ctx.stack, 0, pos, &ctx.finny));
+    entry.static_eval = if (in_check) null else resources.history.correctedEval(pos, resources.evaluator.evaluate(&ctx.stack, 0, pos, &ctx.finny, &ctx.ft));
 
     var moves = move_mod.MoveList.init();
     legal.generateHinted(pos, &moves, in_check);
@@ -444,10 +445,10 @@ fn negamax(
     var improving = false;
     if (!in_check) {
         ctx.noteMainStaticEval();
-        // Reuse the raw static eval cached in the TT entry (position-
+        // Lever 1: reuse the raw static eval cached in the TT entry (position-
         // invariant, so identical to recomputing) — skips the NNUE forward on
         // TT hits that didn't cut; every downstream decision is unchanged.
-        // On a TT static-eval miss, try the dedicated raw-eval cache
+        // perf-r11: on a TT static-eval miss, try the dedicated raw-eval cache
         // (full-64-bit-key verified, same collision class as the TT) before
         // paying the NNUE forward. Like the TT-eval path, a cache hit never
         // calls evaluate(), so the lazy-accumulator materialization is skipped
@@ -462,7 +463,7 @@ fn negamax(
                 break :blk @as(types.Score, cached);
             }
             ctx.noteEvalCacheProbe(false);
-            const fresh = resources.evaluator.evaluate(&ctx.stack, ply, pos, &ctx.finny);
+            const fresh = resources.evaluator.evaluate(&ctx.stack, ply, pos, &ctx.finny, &ctx.ft);
             if (std.math.cast(i16, fresh)) |memo| resources.eval_cache.store(pos.zobrist_key, memo);
             break :blk fresh;
         };
@@ -616,17 +617,26 @@ fn negamax(
         const is_capture = mv.isCapture();
         const is_promotion = mv.isPromotion();
         const is_quiet = !is_capture and !is_promotion;
-        const cont_piece = pos.pieceAt(mv.from).pieceType();
+        const moving_piece = pos.pieceAt(mv.from);
+        const cont_piece = moving_piece.pieceType();
         const moved_piece_type = if (is_quiet) cont_piece else null;
         // LMR history evidence = main history + CONTINUATION history (rung 2 of the
         // EBF ladder): the ordering already ranks by the combined signal, but LMR only
         // saw main history — cont-hist is the stronger of the two for "this quiet is
         // known-good in this line" and lets reductions track evidence, not blindness.
-        const quiet_history_score = if (moved_piece_type) |quiet_piece_type|
-            resources.history.score(pos.side_to_move, quiet_piece_type, mv.to) +
-                cont_rows.total(history_mod.contKey(pos.side_to_move, quiet_piece_type, mv.to))
-        else
-            0;
+        // Both tables are keyed by the mover's mailbox piece rather than by
+        // (side, piece_type): identical entries (Piece == side*6 + piece_type,
+        // and every generated move is by the side to move), one dependent L1
+        // load fewer in front of the continuation-history read. `cont_piece` is
+        // still needed for the child's conthist context, but off this chain.
+        const quiet_history_score: i32 = if (is_quiet) blk: {
+            // Explicit row pointer: a runtime piece index through the returned
+            // pointer materialises a 128-byte stack copy of the row first (the
+            // store-to-load-forwarding defect class HistoryTable.score documents).
+            const quiet_row: *const [64]i16 = &resources.history.quietPieceRows()[@intFromEnum(moving_piece)];
+            break :blk @as(i32, quiet_row[mv.to.index()]) +
+                cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
+        } else 0;
         const move_order_sample: ?stats_mod.MoveOrderSample = if (ctx.recordMoveOrder()) .{
             .bucket = classifyMoveOrderBucket(mv, tt_move, stack_entry.killer_a, stack_entry.killer_b, countermove, capture_see_score, quiet_history_score),
             .node_type = stats_mod.moveOrderNodeType(node_ctx.pv_node, node_ctx.cut_node),
@@ -689,11 +699,11 @@ fn negamax(
         // instead of a load waiting on makeMove's own zobrist store.
         const child_key = make_unmake.makeMove(pos, mv, &stack_entry.state);
         // gives_check: post-make isInCheck when no hint exists — in sparse
-        // positions this beats the mask-op predicate (measured ~5% slower
-        // endgames with the predicate here); the predicate stays at the
-        // PRUNING sites where it eliminates whole make/unmake round trips.
-        // The checked side comes from the pre-move register value (mover's
-        // opponent), not a reload of the byte makeMove just stored.
+        // positions this beats the mask-op predicate (R7 timing: predicate
+        // here cost +5% endgame); the predicate stays at the PRUNING sites
+        // where it eliminates whole make/unmake round trips. The checked side
+        // comes from the pre-move register value (mover's opponent), not a
+        // reload of the byte makeMove just stored.
         const gives_check = gives_check_hint orelse legal.isInCheck(pos, moved_side.other());
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
         resources.rfp_hint.prefetch(child_key); // and the RFP-hint cluster (probed per negamax node)
@@ -702,13 +712,14 @@ fn negamax(
         child_entry.prev_piece_type = moved_piece_type;
         child_entry.prev_cont_piece = cont_piece;
 
-        // Check-extension policy: extend a checking move ONLY when the checker is
-        // failing low (static_eval <= alpha) — that is where the extension's value
-        // lives (perpetual/fortress rescue lines for the side in trouble), while
-        // unconditional check extensions bloat the tree with checks given from
-        // comfortable positions and make the branching factor position-blind in
-        // check-rich endgames. The shallow-depth "always extend" leg is compiled
-        // out (CHECK_EXTENSION_MAX_DEPTH = 0).
+        // Check-extension policy (EBF v2 forensics 2026-07-10/11): unconditional
+        // +1 made EBF position-blind (290k extensions at d20 in a K+R+P endgame;
+        // we plateaued at d20 where SF hits d47). Full removal converted weak-tier
+        // endgames but collapsed our defensive holds vs stronger opponents — the
+        // extension's defensive value (perpetual/fortress hunting) lives on the
+        // side that is FAILING, while the bloat is checks given comfortably ahead.
+        // So: extend at shallow depth always (tactical net) and at ANY depth when
+        // the checker is failing low (this line needs a rescue); never otherwise.
         const checker_desperate = (static_eval orelse alpha) <= alpha;
         var extension: u16 = if (gives_check and (search_depth <= CHECK_EXTENSION_MAX_DEPTH or checker_desperate)) 1 else 0;
         if (extension > 0) ctx.noteCheckExtension();
@@ -722,9 +733,9 @@ fn negamax(
         }
         const child_base_depth = search_depth - 1 + extension;
 
-        // Lazy accumulator: record the move only (a couple of byte stores).
-        // An eager ~210B Position snapshot here is a store-forward-stall
-        // family costing ~12% of endgame negamax samples; instead boards are
+        // Lazy accumulator: record the move only (a couple of byte stores). The
+        // old ~210B Position snapshot — the store-forward-stall family in the
+        // endgame annotate (~12% of negamax samples pre-R4) — is gone: boards are
         // reconstructed at materialization time from the live position, and the
         // undo-state is `stack_entry.state`, live until this make's own unmake.
         resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
@@ -827,8 +838,8 @@ fn quietMoveGivesCheck(pos: *position.Position, mv: move_mod.Move) bool {
     // Both branches are EXACT (equivalence-tested), so dispatching by board
     // density is behavior-free. Dense boards: the attack-geometry predicate
     // wins (eliminates the make/unmake round trip). Sparse boards: the live
-    // make round trip is cheaper than the predicate's mask assembly (measured
-    // ~2.5% slower endgames with the predicate everywhere).
+    // make round trip is cheaper than the predicate's mask assembly (R7
+    // timing: predicate-everywhere cost +2.5% endgame).
     if (@popCount(pos.occupancy()) >= 14) return legal.givesCheck(pos, mv);
     const mover = pos.side_to_move;
     var state = make_unmake.StateInfo{};

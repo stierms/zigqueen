@@ -1,21 +1,24 @@
 //! Runtime-tunable search parameters (SPSA scaffold).
 //!
-//! These default to the shipped values, so the engine plays IDENTICALLY out of
-//! the box (verified by an exact-output bench signature) -- they only diverge
-//! when set via `setoption`, and only -Dtunables builds expose them as UCI
-//! options. This exists so an external SPSA tuning driver
-//! can perturb the search calibration without recompiling. Once a campaign
-//! finds a better point, the winning values are baked back as the defaults
-//! here and the engine ships with them (no hot-path cost beyond a cached
+//! These default to the shipped (v3.1.0) values, so the engine plays IDENTICALLY
+//! out of the box (verified by an exact-output bench signature) -- they only
+//! diverge when set via `setoption`. This exists so an external SPSA driver
+//! (`scripts/spsa-tune.py`) can perturb the search calibration without recompiling.
+//! Once a campaign finds a better point, the winning values are baked back as the
+//! defaults here and the engine ships with them (no hot-path cost beyond a cached
 //! global read).
 //!
 //! Single-threaded only (Threads=1), so a process-global `active` is safe.
+//!
+//! Restored + extended 2026-06-06: the original 19 margins/reductions + the 7
+//! v3.1.0 depth-efficiency knobs (the +44 bundle), which had never been SPSA'd.
 
 const std = @import("std");
 const types = @import("../core/types.zig");
 
 pub const Tunables = struct {
-    // Pruning margins (centipawns); defaults = the shipped calibration.
+    // --- original 19 (SPSA campaigns #1-#3); defaults = current shipped consts ---
+    // Pruning margins (centipawns).
     null_static_margin: types.Score = 10,
     rfp_margin_per_ply: types.Score = 30,
     rfp_non_improving_bonus: types.Score = 28,
@@ -27,19 +30,23 @@ pub const Tunables = struct {
     bad_capture_non_improving_bonus: types.Score = 37,
     razor_base: types.Score = 5,
     razor_per_ply: types.Score = 80,
-    // Late-move pruning.
+    // Reductions + LMP. (LMR divisor feeds a comptime table -> left const for now.)
+    lmr_non_improving: types.Score = 0, // extra LMR reduction when not improving
+    null_reduction_base: types.Score = 5, // null-move R at depth >= null_reduction_depth
+    null_reduction_depth: types.Score = 7, // depth threshold for the larger null R
     lmp_base: types.Score = 6, // late-move-prune onset base (threshold = lmp_base + d*d)
+    lmr_history_divisor: types.Score = 8192, // LMR history shift = clamp(hist/this, -2, 2)
 
-    // Mid-tree forward-pruning depths/margins.
-    rfp_max_depth: types.Score = 6, // reverse-futility extends to this depth
+    // --- v3.1.0 depth-efficiency knobs (the +44 bundle), never tuned ---
+    rfp_max_depth: types.Score = 6, // reverse-futility extends to this depth (was 3)
     rfp_deep_margin_per_ply: types.Score = 75, // per-ply margin in the deepened RFP range (depths 4-6)
-    quiet_futility_max_depth: types.Score = 4, // quiet futility extends to this depth
+    quiet_futility_max_depth: types.Score = 4, // quiet futility extends to this depth (was 2)
     history_prune_max_depth: types.Score = 6, // history-prune late quiets up to this depth
     history_prune_margin_per_ply: types.Score = -2048, // history threshold per ply (negative)
     see_quiet_max_depth: types.Score = 7, // SEE-prune late quiets up to this depth
     see_quiet_margin_per_ply: types.Score = -50, // SEE-quiet margin per ply (negative)
 
-    // LMR shape in fixed-point centi-units (0.50 / 2.28).
+    // --- lever 5 (2026-07-16): LMR shape, centi-units (0.50 / 2.28) ---
     lmr_base_100: types.Score = @import("reductions.zig").LMR_BASE_100_DEFAULT,
     lmr_divisor_100: types.Score = @import("reductions.zig").LMR_DIVISOR_100_DEFAULT,
 };
@@ -69,8 +76,12 @@ pub const specs = [_]Spec{
     .{ .uci_name = "BadCaptureNonImprovingBonus", .field = "bad_capture_non_improving_bonus", .default = 37, .min = 0, .max = 300 },
     .{ .uci_name = "RazorBase", .field = "razor_base", .default = 5, .min = 0, .max = 500 },
     .{ .uci_name = "RazorPerPly", .field = "razor_per_ply", .default = 80, .min = 10, .max = 500 },
+    .{ .uci_name = "LmrNonImproving", .field = "lmr_non_improving", .default = 0, .min = 0, .max = 3 },
+    .{ .uci_name = "NullReductionBase", .field = "null_reduction_base", .default = 5, .min = 1, .max = 7 },
+    .{ .uci_name = "NullReductionDepth", .field = "null_reduction_depth", .default = 7, .min = 3, .max = 12 },
     .{ .uci_name = "LmpBase", .field = "lmp_base", .default = 6, .min = 0, .max = 12 },
-    // Mid-tree forward-pruning depths/margins.
+    .{ .uci_name = "LmrHistoryDivisor", .field = "lmr_history_divisor", .default = 8192, .min = 2048, .max = 32760 },
+    // v3.1.0 depth-efficiency knobs.
     .{ .uci_name = "RfpMaxDepth", .field = "rfp_max_depth", .default = 6, .min = 3, .max = 10 },
     .{ .uci_name = "RfpDeepMarginPerPly", .field = "rfp_deep_margin_per_ply", .default = 75, .min = 30, .max = 160 },
     .{ .uci_name = "QuietFutilityMaxDepth", .field = "quiet_futility_max_depth", .default = 4, .min = 1, .max = 8 },
@@ -78,7 +89,7 @@ pub const specs = [_]Spec{
     .{ .uci_name = "HistoryPruneMarginPerPly", .field = "history_prune_margin_per_ply", .default = -2048, .min = -8192, .max = -256 },
     .{ .uci_name = "SeeQuietMaxDepth", .field = "see_quiet_max_depth", .default = 7, .min = 3, .max = 12 },
     .{ .uci_name = "SeeQuietMarginPerPly", .field = "see_quiet_margin_per_ply", .default = -50, .min = -200, .max = -10 },
-    // LMR shape (centi-units; rebuilds the reduction table on set).
+    // lever 5: LMR shape (centi-units; rebuilds the reduction table on set).
     .{ .uci_name = "LmrBase100", .field = "lmr_base_100", .default = 50, .min = 0, .max = 150 },
     .{ .uci_name = "LmrDivisor100", .field = "lmr_divisor_100", .default = 228, .min = 120, .max = 400 },
 };

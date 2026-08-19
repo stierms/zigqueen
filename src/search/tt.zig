@@ -22,8 +22,8 @@ pub const Entry = struct {
     depth: i16 = -1,
     generation: u8 = 0,
     bound: Bound = .exact,
-    // Raw (uncorrected) static eval of the position — saves the NNUE forward
-    // on TT hits without a cutoff. Fits in the struct's
+    // Raw (uncorrected) static eval of the position — lever 1 (2026-07-16):
+    // saves the NNUE forward on TT hits without a cutoff. Fits in the struct's
     // existing padding (18 -> 20 bytes, layout stays 24), so zero size cost.
     static_eval: i16 = STATIC_EVAL_NONE,
 };

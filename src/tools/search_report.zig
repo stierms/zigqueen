@@ -38,7 +38,7 @@ pub fn write(writer: anytype, result: *const search_engine.SearchResult, elapsed
     try writer.print("rfp_hint_cutoffs_depth_3 {d}\n", .{stats.rfp_hint_cutoffs_depth_3});
     try writer.print("rfp_hint_alpha_raises {d}\n", .{stats.rfp_hint_alpha_raises});
     try writer.print("rfp_hint_cutoff_rate_permille {d}\n", .{ratioPermille(stats.rfp_hint_cutoffs, stats.rfp_hint_probes)});
-    // Raw-eval cache: probes fire only after a TT static-eval miss,
+    // Raw-eval cache (perf-r11): probes fire only after a TT static-eval miss,
     // so the hit rates below ARE the hit-after-TT-miss rates per phase.
     try writer.print("eval_cache_probes {d}\n", .{stats.eval_cache_probes});
     try writer.print("eval_cache_hits {d}\n", .{stats.eval_cache_hits});

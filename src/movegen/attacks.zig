@@ -18,63 +18,88 @@ const FILE_H: bitboard.Bitboard = 0x8080_8080_8080_8080;
 const NOT_FILE_A: bitboard.Bitboard = ~FILE_A;
 const NOT_FILE_H: bitboard.Bitboard = ~FILE_H;
 
-pub fn knightAttacks(sq: square.Square) bitboard.Bitboard {
+pub inline fn knightAttacksDirect(sq: square.Square) bitboard.Bitboard {
     return KNIGHT_ATTACKS[sq.index()];
 }
 
-pub fn kingAttacks(sq: square.Square) bitboard.Bitboard {
+pub fn knightAttacksFrom(sq: square.Square) bitboard.Bitboard {
+    return knightAttacksDirect(sq);
+}
+
+pub inline fn kingAttacksDirect(sq: square.Square) bitboard.Bitboard {
     return KING_ATTACKS[sq.index()];
 }
 
-pub fn pawnAttacksFrom(color: types.Color, sq: square.Square) bitboard.Bitboard {
+pub fn kingAttacksFrom(sq: square.Square) bitboard.Bitboard {
+    return kingAttacksDirect(sq);
+}
+
+pub inline fn pawnAttacksFromDirect(color: types.Color, sq: square.Square) bitboard.Bitboard {
     return switch (color) {
         .white => WHITE_PAWN_ATTACKS[sq.index()],
         .black => BLACK_PAWN_ATTACKS[sq.index()],
     };
 }
 
-/// Set-wise pawn attacks for a whole pawn bitboard (two shifts, no per-square loop).
-pub fn pawnAttacks(color: types.Color, pawns: bitboard.Bitboard) bitboard.Bitboard {
+pub fn pawnAttacksFrom(color: types.Color, sq: square.Square) bitboard.Bitboard {
+    return pawnAttacksFromDirect(color, sq);
+}
+
+pub inline fn pawnAttacksDirect(color: types.Color, pawns: bitboard.Bitboard) bitboard.Bitboard {
     return switch (color) {
         .white => ((pawns & NOT_FILE_A) << 7) | ((pawns & NOT_FILE_H) << 9),
         .black => ((pawns & NOT_FILE_A) >> 9) | ((pawns & NOT_FILE_H) >> 7),
     };
 }
 
-/// Magic-bitboard lookup (movegen/magics.zig).
-pub fn bishopAttacks(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
+pub fn pawnAttacks(color: types.Color, pawns: bitboard.Bitboard) bitboard.Bitboard {
+    return pawnAttacksDirect(color, pawns);
+}
+
+pub inline fn bishopAttacksDirect(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
     return magics.bishopAttacks(sq, occupied);
 }
 
-/// Magic-bitboard lookup (movegen/magics.zig).
-pub fn rookAttacks(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
+pub fn bishopAttacksOnTheFly(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
+    return bishopAttacksDirect(sq, occupied);
+}
+
+pub inline fn rookAttacksDirect(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
     return magics.rookAttacks(sq, occupied);
 }
 
-pub fn queenAttacks(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
-    return bishopAttacks(sq, occupied) | rookAttacks(sq, occupied);
+pub fn rookAttacksOnTheFly(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
+    return rookAttacksDirect(sq, occupied);
+}
+
+pub inline fn queenAttacksDirect(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
+    return bishopAttacksDirect(sq, occupied) | rookAttacksDirect(sq, occupied);
+}
+
+pub fn queenAttacksOnTheFly(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
+    return queenAttacksDirect(sq, occupied);
 }
 
 pub fn attackedSquares(pos: *const position.Position, by: types.Color) bitboard.Bitboard {
     const occupied = pos.occupancy();
     var attacked: bitboard.Bitboard = 0;
 
-    attacked |= pawnAttacks(by, pos.pieceBitboard(by, .pawn));
+    attacked |= pawnAttacksDirect(by, pos.pieceBitboard(by, .pawn));
 
     var knights = pos.pieceBitboard(by, .knight);
-    while (bitboard.popLsb(&knights)) |sq| attacked |= knightAttacks(sq);
+    while (bitboard.popLsb(&knights)) |sq| attacked |= knightAttacksDirect(sq);
 
     var bishops = pos.pieceBitboard(by, .bishop);
-    while (bitboard.popLsb(&bishops)) |sq| attacked |= bishopAttacks(sq, occupied);
+    while (bitboard.popLsb(&bishops)) |sq| attacked |= bishopAttacksDirect(sq, occupied);
 
     var rooks = pos.pieceBitboard(by, .rook);
-    while (bitboard.popLsb(&rooks)) |sq| attacked |= rookAttacks(sq, occupied);
+    while (bitboard.popLsb(&rooks)) |sq| attacked |= rookAttacksDirect(sq, occupied);
 
     var queens = pos.pieceBitboard(by, .queen);
-    while (bitboard.popLsb(&queens)) |sq| attacked |= queenAttacks(sq, occupied);
+    while (bitboard.popLsb(&queens)) |sq| attacked |= queenAttacksDirect(sq, occupied);
 
     var kings = pos.pieceBitboard(by, .king);
-    while (bitboard.popLsb(&kings)) |sq| attacked |= kingAttacks(sq);
+    while (bitboard.popLsb(&kings)) |sq| attacked |= kingAttacksDirect(sq);
 
     return attacked;
 }
@@ -100,10 +125,10 @@ pub inline fn isSquareAttackedByBitboards(
     if ((king & KING_ATTACKS[target_index]) != 0) return true;
 
     const bishop_like = bishops | queens;
-    if ((bishop_like & BISHOP_RAYS[target_index]) != 0 and (bishop_like & bishopAttacks(target, occupied)) != 0) return true;
+    if ((bishop_like & BISHOP_RAYS[target_index]) != 0 and (bishop_like & bishopAttacksDirect(target, occupied)) != 0) return true;
 
     const rook_like = rooks | queens;
-    if ((rook_like & ROOK_RAYS[target_index]) != 0 and (rook_like & rookAttacks(target, occupied)) != 0) return true;
+    if ((rook_like & ROOK_RAYS[target_index]) != 0 and (rook_like & rookAttacksDirect(target, occupied)) != 0) return true;
 
     return false;
 }
@@ -261,12 +286,12 @@ fn squaresMask(comptime squares: []const square.Square) bitboard.Bitboard {
 
 test "knight attacks from corner match expected mask" {
     const expected = squaresMask(&.{ .b3, .c2 });
-    try std.testing.expectEqual(expected, knightAttacks(.a1));
+    try std.testing.expectEqual(expected, knightAttacksFrom(.a1));
 }
 
 test "king attacks from center match expected mask" {
     const expected = squaresMask(&.{ .d3, .e3, .f3, .d4, .f4, .d5, .e5, .f5 });
-    try std.testing.expectEqual(expected, kingAttacks(.e4));
+    try std.testing.expectEqual(expected, kingAttacksFrom(.e4));
 }
 
 test "pawn attacks depend on side" {
@@ -292,7 +317,7 @@ test "bishop attacks stop at blockers and include capture square" {
     occupied |= bitboard.bit(.b2);
 
     const expected = squaresMask(&.{ .e5, .f6, .c5, .b6, .a7, .e3, .f2, .g1, .c3, .b2 });
-    try std.testing.expectEqual(expected, bishopAttacks(.d4, occupied));
+    try std.testing.expectEqual(expected, bishopAttacksOnTheFly(.d4, occupied));
 }
 
 test "rook attacks stop at blockers and include capture square" {
@@ -302,7 +327,7 @@ test "rook attacks stop at blockers and include capture square" {
     occupied |= bitboard.bit(.d2);
 
     const expected = squaresMask(&.{ .d5, .d6, .e4, .f4, .c4, .b4, .a4, .d3, .d2 });
-    try std.testing.expectEqual(expected, rookAttacks(.d4, occupied));
+    try std.testing.expectEqual(expected, rookAttacksOnTheFly(.d4, occupied));
 }
 
 test "attacked squares map matches per-square attack detection" {
@@ -337,14 +362,14 @@ test "magic sliding attacks match step reference" {
                     rayAttacksReference(sq, occupied, -1, 1) |
                     rayAttacksReference(sq, occupied, 1, -1) |
                     rayAttacksReference(sq, occupied, -1, -1),
-                bishopAttacks(sq, occupied),
+                bishopAttacksOnTheFly(sq, occupied),
             );
             try std.testing.expectEqual(
                 rayAttacksReference(sq, occupied, 1, 0) |
                     rayAttacksReference(sq, occupied, -1, 0) |
                     rayAttacksReference(sq, occupied, 0, 1) |
                     rayAttacksReference(sq, occupied, 0, -1),
-                rookAttacks(sq, occupied),
+                rookAttacksOnTheFly(sq, occupied),
             );
         }
     }

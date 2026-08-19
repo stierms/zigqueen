@@ -1,93 +1,84 @@
 # The network: data, training, and provenance
 
-This page documents how zigqueen's evaluation network was produced, in enough
-detail that a reader can judge it for themselves.
+zigqueen 6.0.0 ships the `zqHalfKA9` full-threats network in the engine's
+`ZQB9` container. This page records what the network is, how it was trained,
+and what was not used to produce its weights.
 
 | | |
 |---|---|
-| **Training data** | Publicly published Stockfish training datasets (details below) |
-| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended by the author for this feature set |
-| **Architecture** | King-bucketed HalfKA inputs + threat features + PSQT head + bucketed layer stack; dimensions and feature set are the author's |
+| **Training data** | Publicly published Stockfish NNUE training datasets |
+| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set |
+| **Architecture** | 8-bucket mirrored HalfKA + 60,144 full-threat inputs; width 1024; `1024 -> 16 -> 32 -> 1` layer stack in each of 8 output buckets |
 | **Weights** | Trained from random initialisation |
-| **Training run** | 2,200 superbatches of 100M samples — about 2.2 passes over the data — on one RTX 4090, ~30 hours |
-| **Engine inference** | Written from scratch in Zig; validated bit-for-bit against an independent reference |
+| **Engine format** | `ZQB9`, 74.6 MB embedded net, default scale 48 |
+| **Engine inference** | Written from scratch in Zig and checked against independent reference calculations |
 
 ## Training data
 
-The Stockfish project and its contributors publish their NNUE training data
-openly. zigqueen's network is trained on a 27-component selection of those
-sets — about 280 GiB and roughly 108 billion positions, of which around 10%
-(tablebase- and mate-scored entries) are skipped by the standard filter,
-leaving ~98 billion usable — drawn from:
+The Stockfish project and its contributors publish NNUE training datasets.
+zigqueen trains on selections from those published corpora, including:
 
 - [`official-stockfish/master-binpacks`](https://huggingface.co/official-stockfish/master-binpacks)
-  — the data used for Stockfish's own master networks
-- [`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023),
-  [`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024),
-  and the corresponding test78 / test79 / test60 collections
+- [`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023)
+- [`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024)
+- the corresponding published test78, test79, and test60 collections
 
-The data consists of played-out self-play games; each position carries a
-search-derived evaluation and the game's result. Components were checked for
-unit consistency before use (the evaluation scale differs between dataset
-vintages) and interleaved so that no single vintage dominates any part of the
-schedule.
+The rows are played-out self-play positions carrying a search evaluation and
+game result. Components are checked for unit consistency and interleaved so
+that one dataset vintage does not dominate a section of the schedule.
 
-Using published data is a deliberate choice: generating a comparable corpus
-on one PC is not realistic, and it leaves the project's compute for
-architecture and method instead.
+## Trainer and training origin
 
-## Trainer
+Stockfish trains its own networks with `nnue-pytorch`. zigqueen uses bullet,
+an independent open-source NNUE trainer, plus a project-specific extension
+that teaches bullet the 60,144-input full-threat mapping.
 
-Stockfish trains with `nnue-pytorch`. zigqueen uses **bullet**, an independent
-open-source NNUE trainer, with:
+The 6.0.0 network was trained **from scratch**, starting from random weights.
+Its weights were never:
 
-- an extension written for this project that teaches bullet zigqueen's threat
-  feature set (which it did not support)
-- a training recipe written for this project: 100M positions per superbatch,
-  cosine learning-rate decay from 1e-3, a 0.4 win-draw-loss blend between
-  game results and search evaluations, and an evaluation scale chosen to
-  match the engine's internal units
+- initialized from a Stockfish or other third-party network;
+- fine-tuned from third-party network weights; or
+- distilled logit-wise from Stockfish network outputs.
+
+Stockfish's contribution here is the openly published training data. The
+network weights, feature mapping, trainer extension, quantization, and Zig
+inference path are zigqueen work.
 
 ## Architecture
 
-zigqueen belongs to the same family as most modern NNUE engines —
-king-bucketed HalfKA-style inputs, a PSQT head, a bucketed layer stack. The
-specific configuration is:
+The `zqHalfKA9` network combines two sparse input families per perspective:
 
-- 1536-wide accumulator, 8 king buckets with horizontal mirroring
-- a self-designed threat feature set of 7,680 features
-  (10 attacker keys x 64 squares x 12 target relations)
-- 8 material output buckets, each with a 16 / 32 layer stack
-- the engine's own quantisation scheme and file format (`ZQB8`), ~29.5 MB
+- **Mirrored HalfKA.** Eight king buckets; files e-h mirror onto a-d. Each
+  side selects a bucket in its own oriented frame.
+- **Full threats.** 60,144 sparse attacker/target relation inputs, retaining
+  the richer relation set used by the v6 architecture rather than the 7,680
+  lean-threat inputs shipped in the 5.x network.
 
-[ARCHITECTURE.md](ARCHITECTURE.md) covers the inference side in detail.
+Those inputs feed a width-1024 feature transformer. The readout is a
+material-bucketed layer stack with eight buckets, each
+`1024 -> 16 -> 32 -> 1`, plus the network's PSQT head. Integer weights and
+activations are quantized in the `ZQB9` file format.
 
-## The training run
+The engine maintains HalfKA and full-threat accumulator state incrementally.
+Threat relationships are non-local—a move may create or remove attacks away
+from its source and destination—so the runtime uses a dedicated threat-delta
+engine, lazy materialization, and refresh barriers for king-orientation
+changes. Integer inference is designed to be bit-exact across supported
+x86-64 and AArch64 release targets.
 
-The shipped network was trained from random initialisation for 2,200
-superbatches of 100M samples each. That is ~220 billion training samples
-drawn, which over a corpus of ~98 billion usable positions means the network
-saw the data about 2.2 times, not 220 billion distinct positions. The run took
-about 30 hours on one RTX 4090.
+## Validation
 
-Before any network is allowed to cost testing time it must pass a sanity gate:
-colour-mirrored positions must evaluate to ~0, and material must be ordered
-correctly (queen > rook > bishop ≈ knight > pawn). Networks that fail are
-discarded without playing a single game. Candidate networks that pass are then
-judged by SPRT matches against the current best; several have been trained,
-gated, and rejected.
+The feature mapping and incremental path are tested against full refreshes,
+including castling, en passant, promotions, king-bucket changes, and mirrored
+positions. Release builds must also agree on fixed-depth search node counts
+and on the standard evaluation probe suite.
 
-## What the weights are not
+Candidate networks are screened for color symmetry and material ordering,
+then judged by match play; training loss alone does not decide promotion.
 
-The network was not initialised from another engine's network, not fine-tuned
-from one, and not distilled by querying a running engine. The engine's source
-code contains no code from Stockfish or any other engine — no copied
-functions, no mechanical translations, no lifted tuning constants.
-[CLEAN_ROOM_RULES.md](../CLEAN_ROOM_RULES.md) states the rules the project was
-developed under.
+## Clean-room boundary
 
-## Reproducibility
-
-Every input to this process is public: the datasets, the trainer, and the
-recipe described above. Anyone willing to spend the GPU time can train an
-equivalent network from the same ingredients.
+The engine source contains no copied functions or mechanical translations
+from Stockfish or another engine. The network's weights likewise do not come
+from another engine's weights or logits. [`CLEAN_ROOM_RULES.md`](../CLEAN_ROOM_RULES.md)
+states the repository's implementation boundary.

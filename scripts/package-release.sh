@@ -62,7 +62,7 @@ PYEOF
 for os_name in linux windows; do
     for variant in avx2 avx512; do
         echo "== building $os_name $variant" >&2
-        build_args=(-Doptimize=ReleaseFast "-Dcpu-baseline=$variant")
+        build_args=(-Doptimize=ReleaseFast "-Dcpu-baseline=$variant" "-Dversion=$VERSION")
         ext=""
         if [[ "$os_name" == windows ]]; then
             build_args+=(-Dtarget=x86_64-windows-gnu)
@@ -83,7 +83,7 @@ done
 
 for variant in armv8 armv8-dotprod; do
     echo "== building android $variant" >&2
-    zig build -Doptimize=ReleaseFast "-Dcpu-baseline=$variant" -Dtarget=aarch64-linux-musl
+    zig build -Doptimize=ReleaseFast "-Dcpu-baseline=$variant" -Dtarget=aarch64-linux-musl "-Dversion=$VERSION"
 
     built="zig-out/bin/zigqueen-aarch64-${variant}"
     [[ -f "$built" ]] || { echo "ERROR: expected artifact $built missing" >&2; exit 1; }

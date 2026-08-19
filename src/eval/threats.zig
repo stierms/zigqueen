@@ -50,10 +50,10 @@ inline fn setBit(bits: *PerspBits, idx: usize) void {
 inline fn attackSet(pt: piece.PieceType, color: types.Color, from: square.Square, occ: bitboard.Bitboard) bitboard.Bitboard {
     return switch (pt) {
         .pawn => attacks.pawnAttacksFrom(color, from),
-        .knight => attacks.knightAttacks(from),
-        .bishop => attacks.bishopAttacks(from, occ),
-        .rook => attacks.rookAttacks(from, occ),
-        .queen => attacks.queenAttacks(from, occ),
+        .knight => attacks.knightAttacksFrom(from),
+        .bishop => attacks.bishopAttacksDirect(from, occ),
+        .rook => attacks.rookAttacksDirect(from, occ),
+        .queen => attacks.queenAttacksDirect(from, occ),
         else => unreachable, // king is not a threat source
     };
 }

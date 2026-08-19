@@ -106,6 +106,11 @@ pub const Square = enum(u6) {
             @as(u8, '1') + @as(u8, self.rank()),
         };
     }
+
+    pub fn writeAlgebraic(self: Square, writer: anytype) !void {
+        const text = self.chars();
+        try writer.writeAll(&text);
+    }
 };
 
 test "square parse and format work on board corners" {

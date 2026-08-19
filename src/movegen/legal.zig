@@ -57,34 +57,72 @@ pub fn generate(pos: *const position.Position, list: *move_mod.MoveList) void {
 /// `isInCheck(pos, pos.side_to_move)` when non-null — the context then skips
 /// recomputing the same attack query. Behavior-identical either way.
 pub fn generateHinted(pos: *const position.Position, list: *move_mod.MoveList, known_in_check: ?bool) void {
+    // FUSED fast path (perf-r8). When there is no en-passant square and no
+    // castling rights left, the legality context alone decides everything, and
+    // if additionally nothing is pinned and we are not in check the only
+    // illegal pseudo-legal moves are king steps onto attacked squares. Handing
+    // the two masks to the generator deletes those at the source, so the whole
+    // generate-then-re-pack pass disappears (it was 54% of this function's
+    // samples). The context is built FIRST here; the general path below builds
+    // exactly the same one, so nothing is computed twice.
+    if (canFuseLegality(pos)) {
+        var ctx: LegalityContext = undefined;
+        initLegalityContext(pos, known_in_check, &ctx);
+        if (!ctx.in_check and ctx.pinned == 0) {
+            pseudo.generateLegalNoPins(pos, list, ctx.opponent_king, opponentAttacksKingRemoved(&ctx));
+            return;
+        }
+        pseudo.generate(pos, list);
+        filterGeneral(pos, list, &ctx, false);
+        return;
+    }
+
     pseudo.generate(pos, list);
     if (list.count == 0) return;
     var ctx: LegalityContext = undefined;
     initLegalityContext(pos, known_in_check, &ctx);
     if (!ctx.in_check and ctx.pinned == 0) {
-        if (pos.en_passant == null and !pos.castling_rights.hasAny()) {
-            filterGeneratedNoPinsNoSpecial(pos, list, &ctx, false);
-        } else {
-            filterGeneratedNoPins(pos, list, &ctx, false);
-        }
+        filterGeneratedNoPins(pos, list, &ctx, false);
         return;
     }
+    filterGeneral(pos, list, &ctx, false);
+}
 
+/// True when `initLegalityContext` may be built BEFORE generating: it needs a
+/// king on the board (it unwraps `kingSquare`), and the fused generator only
+/// covers positions with no en-passant square and no castling rights.
+inline fn canFuseLegality(pos: *const position.Position) bool {
+    return pos.en_passant == null and
+        !pos.castling_rights.hasAny() and
+        pos.kingSquare(pos.side_to_move) != null;
+}
+
+/// The fully general legality filter: in check, or pinned pieces present, or
+/// special moves in the list.
+fn filterGeneral(pos: *const position.Position, list: *move_mod.MoveList, ctx: *const LegalityContext, comptime tactical_only: bool) void {
+    // `generated` is hoisted: `list.moves` and `list.count` live in the SAME
+    // struct, so a store to `moves[write_index]` forces LLVM to reload
+    // `list.count` on every iteration (`mov (%rbx),%rsi` in the r8 profile).
+    // That put a store-to-load round trip on the loop-carried compare chain and
+    // was the top cost of `generateHinted`. The bound cannot change inside the
+    // loop, so reading it once is behavior-identical.
+    const generated = list.count;
     var write_index: usize = 0;
     var read_index: usize = 0;
-    while (read_index < list.count) : (read_index += 1) {
+    while (read_index < generated) : (read_index += 1) {
         const mv = list.moves[read_index];
         if (std.debug.runtime_safety) {
             const moving_piece = pos.pieceAt(mv.from);
             std.debug.assert(moving_piece != .none);
             std.debug.assert(moving_piece.color().? == pos.side_to_move);
+            if (tactical_only) std.debug.assert(mv.isCapture() or mv.isPromotion());
         }
-        switch (legalityDispositionGenerated(mv, &ctx)) {
+        switch (legalityDispositionGenerated(mv, ctx)) {
             .accept => {},
             .reject => continue,
             .needs_full_check => {
                 const moving_type = pos.pieceAt(mv.from).pieceType();
-                if (!isLegalPseudoMove(pos, mv, moving_type, &ctx)) continue;
+                if (!isLegalPseudoMove(pos, mv, moving_type, ctx)) continue;
             },
         }
         list.moves[write_index] = mv;
@@ -98,6 +136,13 @@ pub fn generateCapturesAndPromotions(pos: *const position.Position, list: *move_
 }
 
 /// See `generateHinted` for the `known_in_check` contract.
+///
+/// NOT fused, deliberately. The fused form needs the opponent's attack map up
+/// front, but the TACTICAL generator only ever emits king CAPTURES — a rare
+/// move — so the lazy filter below builds that map at a small fraction of nodes
+/// while a fused version would build it at EVERY qsearch node. Measured: fusing
+/// this one costs ~0.5%, whether the map is taken eagerly or the king block is
+/// split off and filtered lazily.
 pub fn generateCapturesAndPromotionsHinted(pos: *const position.Position, list: *move_mod.MoveList, known_in_check: ?bool) void {
     pseudo.generateTactical(pos, list);
     if (list.count == 0) return;
@@ -111,24 +156,36 @@ pub fn generateCapturesAndPromotionsHinted(pos: *const position.Position, list: 
         }
         return;
     }
+    filterGeneral(pos, list, &ctx, true);
+}
 
+/// No ep, no castling, no pins, not in check: the ONLY moves that can be
+/// illegal are king steps into an attacked square. Batch those: build the
+/// opponent's attack map (with our king removed from occupancy, once, LAZILY)
+/// and test each king destination with one AND. Exact: occupancy AT a
+/// destination never blocks attacks TO it and a captured piece never attacks
+/// its own square, so per-move occupancy fixups cannot change the verdict.
+fn filterGeneratedNoPinsNoSpecial(pos: *const position.Position, list: *move_mod.MoveList, ctx: *const LegalityContext, comptime tactical_only: bool) void {
+    var king_unsafe: bitboard.Bitboard = 0;
+    var king_unsafe_ready = false;
+    const generated = list.count; // hoisted; see generateHinted
     var write_index: usize = 0;
     var read_index: usize = 0;
-    while (read_index < list.count) : (read_index += 1) {
+    while (read_index < generated) : (read_index += 1) {
         const mv = list.moves[read_index];
         if (std.debug.runtime_safety) {
             const moving_piece = pos.pieceAt(mv.from);
             std.debug.assert(moving_piece != .none);
             std.debug.assert(moving_piece.color().? == pos.side_to_move);
-            std.debug.assert(mv.isCapture() or mv.isPromotion());
+            if (tactical_only) std.debug.assert(mv.isCapture() or mv.isPromotion());
         }
-        switch (legalityDispositionGenerated(mv, &ctx)) {
-            .accept => {},
-            .reject => continue,
-            .needs_full_check => {
-                const moving_type = pos.pieceAt(mv.from).pieceType();
-                if (!isLegalPseudoMove(pos, mv, moving_type, &ctx)) continue;
-            },
+        if (capturesOpponentKing(mv, ctx)) continue;
+        if (mv.from == ctx.king_square) {
+            if (!king_unsafe_ready) {
+                king_unsafe = opponentAttacksKingRemoved(ctx);
+                king_unsafe_ready = true;
+            }
+            if ((bitboard.bit(mv.to) & king_unsafe) != 0) continue;
         }
         list.moves[write_index] = mv;
         write_index += 1;
@@ -147,9 +204,11 @@ pub fn generateQuietChecksHinted(pos: *const position.Position, list: *move_mod.
     if (list.count == 0) return;
     var ctx: LegalityContext = undefined;
     initLegalityContext(pos, known_in_check, &ctx);
+    const generated = list.count; // hoisted; see generateHinted
+
     var write_index: usize = 0;
     var read_index: usize = 0;
-    while (read_index < list.count) : (read_index += 1) {
+    while (read_index < generated) : (read_index += 1) {
         const mv = list.moves[read_index];
         switch (legalityDispositionGenerated(mv, &ctx)) {
             .accept => {},
@@ -256,9 +315,11 @@ pub fn givesCheck(pos: *const position.Position, mv: move_mod.Move) bool {
 }
 
 fn filterGeneratedNoPins(pos: *const position.Position, list: *move_mod.MoveList, ctx: *const LegalityContext, comptime tactical_only: bool) void {
+    const generated = list.count; // hoisted; see generateHinted
+
     var write_index: usize = 0;
     var read_index: usize = 0;
-    while (read_index < list.count) : (read_index += 1) {
+    while (read_index < generated) : (read_index += 1) {
         const mv = list.moves[read_index];
         if (std.debug.runtime_safety) {
             const moving_piece = pos.pieceAt(mv.from);
@@ -277,56 +338,21 @@ fn filterGeneratedNoPins(pos: *const position.Position, list: *move_mod.MoveList
     list.count = write_index;
 }
 
-fn filterGeneratedNoPinsNoSpecial(pos: *const position.Position, list: *move_mod.MoveList, ctx: *const LegalityContext, comptime tactical_only: bool) void {
-    // No ep, no castling, no pins, not in check: the ONLY moves that can be
-    // illegal are king steps into an attacked square. Batch those: build the
-    // opponent's attack map (with our king removed from occupancy, once,
-    // lazily) and test each king destination with one AND — replaces a full
-    // isSquareAttackedByBitboards per king move, which was ~3.9% of endgame
-    // samples. Exact: occupancy AT a destination never blocks attacks TO it
-    // and a captured piece never attacks its own square, so per-move occupancy
-    // fixups (to-bit set, captured piece removed) cannot change the verdict.
-    var king_unsafe: bitboard.Bitboard = 0;
-    var king_unsafe_ready = false;
-    var write_index: usize = 0;
-    var read_index: usize = 0;
-    while (read_index < list.count) : (read_index += 1) {
-        const mv = list.moves[read_index];
-        if (std.debug.runtime_safety) {
-            const moving_piece = pos.pieceAt(mv.from);
-            std.debug.assert(moving_piece != .none);
-            std.debug.assert(moving_piece.color().? == pos.side_to_move);
-            if (tactical_only) std.debug.assert(mv.isCapture() or mv.isPromotion());
-        }
-        if (capturesOpponentKing(mv, ctx)) continue;
-        if (mv.from == ctx.king_square) {
-            if (!king_unsafe_ready) {
-                king_unsafe = opponentAttacksKingRemoved(ctx);
-                king_unsafe_ready = true;
-            }
-            if ((bitboard.bit(mv.to) & king_unsafe) != 0) continue;
-        }
-        list.moves[write_index] = mv;
-        write_index += 1;
-    }
-    list.count = write_index;
-}
-
 /// Every square attacked by the opponent with OUR king removed from occupancy
 /// (x-ray through the king counts, exactly like the per-move query's
 /// `occupied & ~from_mask` for king moves). Built from the context's cached
 /// bitboards only.
 fn opponentAttacksKingRemoved(ctx: *const LegalityContext) bitboard.Bitboard {
     const occ = ctx.occupied & ~ctx.king_mask;
-    var attacked = attacks.pawnAttacks(ctx.opponent, ctx.opponent_pawns);
+    var attacked = attacks.pawnAttacksDirect(ctx.opponent, ctx.opponent_pawns);
     var knights = ctx.opponent_knights;
-    while (bitboard.popLsb(&knights)) |sq| attacked |= attacks.knightAttacks(sq);
+    while (bitboard.popLsb(&knights)) |sq| attacked |= attacks.knightAttacksDirect(sq);
     var bishop_like = ctx.opponent_bishops | ctx.opponent_queens;
-    while (bitboard.popLsb(&bishop_like)) |sq| attacked |= attacks.bishopAttacks(sq, occ);
+    while (bitboard.popLsb(&bishop_like)) |sq| attacked |= attacks.bishopAttacksDirect(sq, occ);
     var rook_like = ctx.opponent_rooks | ctx.opponent_queens;
-    while (bitboard.popLsb(&rook_like)) |sq| attacked |= attacks.rookAttacks(sq, occ);
+    while (bitboard.popLsb(&rook_like)) |sq| attacked |= attacks.rookAttacksDirect(sq, occ);
     var opp_king = ctx.opponent_king;
-    while (bitboard.popLsb(&opp_king)) |sq| attacked |= attacks.kingAttacks(sq);
+    while (bitboard.popLsb(&opp_king)) |sq| attacked |= attacks.kingAttacksDirect(sq);
     return attacked;
 }
 

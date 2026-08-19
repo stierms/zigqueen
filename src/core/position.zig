@@ -42,8 +42,8 @@ pub const Position = struct {
     // pieces array per call (LLVM lowers the runtime index on the array VALUE,
     // and the following load stalls on failed store-to-load forwarding). Same
     // defect class as HistoryTable.score's row copy; `&arr[i]` forces in-place
-    // addressing. Seen live in endgame profiles: hasNonPawnMaterial ~2% /
-    // kingSquare ~5% of cycles.
+    // addressing. Seen live: hasNonPawnMaterial 1.8% / kingSquare 4.7% of
+    // endgame cycles in the v5.5.0 profile.
 
     pub inline fn pieceRow(self: *const Position, color: types.Color) *const [PIECE_TYPE_COUNT]bitboard.Bitboard {
         return &self.pieces[colorIndex(color)];

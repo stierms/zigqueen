@@ -18,7 +18,7 @@ pub fn runWithOptions(writer: anytype, pos: *const position.Position, depth: u16
     var stop_flag = std.atomic.Value(bool).init(false);
 
     var timer = std.time.Timer.start() catch null;
-    const result = engine.search(pos, &history, .{ .depth = depth }, &stop_flag);
+    const result = engine.searchRawNoBook(pos, &history, .{ .depth = depth }, &stop_flag);
     const elapsed_ns: u64 = if (timer) |*search_timer| search_timer.read() else 0;
     const elapsed_ms: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_ms));
 

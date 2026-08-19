@@ -17,9 +17,9 @@ Two product flavors build two independently installable APKs:
 1. Build the engine binaries (from the repository root; no NDK required):
 
    ```sh
-   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8 -Dtarget=aarch64-linux-musl
+   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8 -Dtarget=aarch64-linux-musl -Dversion=6.0.0
    cp zig-out/bin/zigqueen-aarch64-armv8 android/oex/app/src/generic/jniLibs/arm64-v8a/libzigqueen.so
-   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8-dotprod -Dtarget=aarch64-linux-musl
+   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8-dotprod -Dtarget=aarch64-linux-musl -Dversion=6.0.0
    cp zig-out/bin/zigqueen-aarch64-armv8-dotprod android/oex/app/src/dotprod/jniLibs/arm64-v8a/libzigqueen.so
    ```
 
@@ -38,8 +38,12 @@ Two product flavors build two independently installable APKs:
 3. Build both APKs (needs an Android SDK; `ANDROID_HOME` set):
 
    ```sh
-   ./gradlew assembleGenericRelease assembleDotprodRelease
+   ./gradlew assembleGenericRelease
+   ./gradlew assembleDotprodRelease
    ```
+
+   Build the two large APKs sequentially; concurrent packaging can contend
+   for the Android packager's temporary state.
 
    Outputs land in `app/build/outputs/apk/<flavor>/release/`.
 

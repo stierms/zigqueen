@@ -69,10 +69,10 @@ fn searchDepth(
         // RAW stand-pat: applying corrhist here measured negative (stand-pat fires
         // at every leaf — too sensitive for half-trained corrections); corrhist is
         // a main-search device (RFP/futility/null/improving) for now.
-        // Reuse the TT-cached raw static eval (identical to recomputing), then
-        // the dedicated raw-eval cache (full-key verified; a hit skips the NNUE
-        // forward AND the lazy-accumulator materialization, exactly like the
-        // TT-eval path). See root.zig's twin block.
+        // Lever 1: reuse the TT-cached raw static eval (identical to recomputing).
+        // perf-r11: then the dedicated raw-eval cache (full-key verified; a hit
+        // skips the NNUE forward AND the lazy-accumulator materialization,
+        // exactly like the TT-eval path). See root.zig's twin block.
         const eval_score = blk: {
             if (tt_entry) |entry| {
                 if (entry.static_eval != tt_mod.STATIC_EVAL_NONE) break :blk @as(types.Score, entry.static_eval);
@@ -82,7 +82,7 @@ fn searchDepth(
                 break :blk @as(types.Score, cached);
             }
             ctx.noteQsearchEvalCacheProbe(false);
-            const fresh = resources.evaluator.evaluate(&ctx.stack, ply, pos, &ctx.finny);
+            const fresh = resources.evaluator.evaluate(&ctx.stack, ply, pos, &ctx.finny, &ctx.ft);
             if (std.math.cast(i16, fresh)) |memo| resources.eval_cache.store(pos.zobrist_key, memo);
             break :blk fresh;
         };
@@ -299,7 +299,7 @@ test "qsearch stores shallow tt best move when tactical move exists" {
     // for any eval net, so qsearch always stores a best move here.
     var pos = try fen.parse("4k3/8/8/3q4/4P3/8/4K3/8 w - - 0 1");
     context.repetition.push(pos.zobrist_key);
-    evaluator.prepareRoot(&context.stack, &pos, &context.finny);
+    evaluator.prepareRoot(&context.stack, &pos, &context.finny, &context.ft);
 
     _ = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, 0, null);
     try std.testing.expect(table.bestMove(pos.zobrist_key) != null);

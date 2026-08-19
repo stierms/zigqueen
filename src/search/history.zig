@@ -24,16 +24,37 @@ pub inline fn contKey(side: types.Color, moved_piece: piece.PieceType, to: squar
     return pc * 64 + to.index();
 }
 
+/// The same key straight from the MOVER's mailbox piece. `Piece` is encoded as
+/// `side * 6 + piece_type`, so the `(side, piece_type)` half of the flat key IS
+/// the piece index: for any move by the side that owns the piece this returns
+/// exactly `contKey(moved.color().?, moved.pieceType(), to)`.
+///
+/// The point is what it removes: `pieceType()` is a PIECE_TYPES table load, and
+/// it sat in the middle of the per-move `mailbox load -> piece type -> row
+/// address -> history load` chain, i.e. one extra dependent L1 access in front
+/// of the continuation-history miss that dominates scoreMoves.
+pub inline fn contKeyOfPiece(moved: piece.Piece, to: square.Square) u16 {
+    std.debug.assert(@intFromEnum(moved) < 12);
+    return @as(u16, @intFromEnum(moved)) * 64 + to.index();
+}
+
+/// Stand-in row for a continuation ply with no usable predecessor. Reading it
+/// contributes exactly the 0 the absent ply contributed before, so `ContRows`
+/// can hold two plain pointers instead of two optionals: the per-move scoring
+/// loop then does two unconditional loads rather than re-testing two
+/// node-invariant conditions (and keeping the pair spilled) on every move.
+const ZERO_CONT_ROW: [CONT_KEYS]i16 = [_]i16{0} ** CONT_KEYS;
+
 /// Per-node pre-resolved conthist rows (see HistoryTable.contRows).
 pub const ContRows = struct {
-    rows: [CONT_PLIES]?*const [CONT_KEYS]i16 = .{ null, null },
+    rows: [CONT_PLIES]*const [CONT_KEYS]i16 = .{ &ZERO_CONT_ROW, &ZERO_CONT_ROW },
 
     /// Summed continuation-history score for `cur_key` — same result as
     /// HistoryTable.contTotal with the ContContext the rows were resolved from.
     pub inline fn total(self: *const ContRows, cur_key: u16) i32 {
         var sum: i32 = 0;
         inline for (0..CONT_PLIES) |off| {
-            if (self.rows[off]) |row| sum += row[cur_key];
+            sum += self.rows[off][cur_key];
         }
         return sum;
     }
@@ -212,8 +233,9 @@ pub const HistoryTable = struct {
         const npw_row: *const [CORR_SIZE]i32 = &tables.nonpawn[0][stm];
         const npb_row: *const [CORR_SIZE]i32 = &tables.nonpawn[1][stm];
         // Pawn structure weighted double (the strongest signal in reference
-        // implementations); total applied correction capped at ~+/-32 cp — a
-        // looser ceiling lets half-trained tables poison pruning decisions.
+        // implementations); total applied correction capped at ~+/-32 cp — v1's
+        // +/-72 cp ceiling let half-trained tables poison pruning decisions
+        // (self-SPRT -17.4).
         const v = 2 * pawn_row[pawnCorrKey(pos)] +
             npw_row[nonPawnCorrKey(pos, 0)] +
             npb_row[nonPawnCorrKey(pos, 1)];
@@ -259,6 +281,16 @@ pub const HistoryTable = struct {
         return &self.quiet[@intFromEnum(side)];
     }
 
+    /// The same table viewed as one flat `[12][64]` plane keyed by the mover's
+    /// mailbox piece — `quietPieceRows()[@intFromEnum(p)][to]` is exactly
+    /// `score(p.color().?, p.pieceType(), to)`, because `quiet` is
+    /// `[side][piece_type][to]` in that order and `Piece` is `side * 6 +
+    /// piece_type`. Same reindexing (and same reason) as `contKeyOfPiece`: it
+    /// drops the PIECE_TYPES load from the per-move address chain.
+    pub inline fn quietPieceRows(self: *const HistoryTable) *const [12][64]i16 {
+        return @ptrCast(&self.quiet);
+    }
+
     pub fn counterMove(self: *const HistoryTable, previous_side: types.Color, previous_piece: piece.PieceType, to: square.Square) ?move_mod.Move {
         // Row pointer for the same reason as `score` (the [64]?Move row copy is
         // 256 bytes; it dominated previousQuietCountermove's self time).
@@ -294,8 +326,6 @@ pub const HistoryTable = struct {
 
     /// Summed continuation-history score for a candidate move (`cur_key`) given
     /// the node's previous-move context. Zero when conthist is disabled.
-    /// The search reads via the hoisted contRows path; this per-move form is the
-    /// value-identical reference the unit tests exercise. // test seam
     pub fn contTotal(self: *const HistoryTable, cont: *const ContContext, cur_key: u16) i32 {
         const table = self.continuation orelse return 0;
         var total: i32 = 0;
@@ -501,6 +531,70 @@ test "continuation history is a no-op until allocated, then bonuses/penalties mo
     history.clear();
     try std.testing.expectEqual(@as(i32, 0), history.contTotal(&cont, cur));
     try std.testing.expect(history.continuation != null); // clear keeps the allocation
+}
+
+test "piece-keyed history views match the side/piece-type keyed ones exactly" {
+    // Exhaustive over the 12 x 64 key space: the reindexing that lets the hot
+    // paths skip PIECE_TYPES is only sound if `Piece == side * 6 + piece_type`
+    // and `quiet` is laid out [side][piece_type][to]. Assert both, for every key.
+    var history = HistoryTable{};
+    var seed: i16 = 0;
+    for (0..2) |side_index| {
+        for (0..6) |piece_index| {
+            for (0..64) |sq_index| {
+                seed +%= 37;
+                history.quiet[side_index][piece_index][sq_index] = seed;
+            }
+        }
+    }
+
+    const rows = history.quietPieceRows();
+    for (0..2) |side_index| {
+        const side: types.Color = @enumFromInt(side_index);
+        for (0..6) |piece_index| {
+            const pt: piece.PieceType = @enumFromInt(piece_index);
+            const p = piece.Piece.make(side, pt);
+            for (0..64) |sq_index| {
+                const sq: square.Square = @enumFromInt(sq_index);
+                try std.testing.expectEqual(
+                    history.score(side, pt, sq),
+                    @as(i32, rows[@intFromEnum(p)][sq.index()]),
+                );
+                try std.testing.expectEqual(contKey(side, pt, sq), contKeyOfPiece(p, sq));
+            }
+        }
+    }
+}
+
+test "resolved conthist rows total the same as the direct table read" {
+    var history = HistoryTable{};
+    try history.initContinuation(std.testing.allocator);
+    defer history.deinitContinuation(std.testing.allocator);
+
+    const contexts = [_]ContContext{
+        .{ .prev = .{ CONT_NONE, CONT_NONE } },
+        .{ .prev = .{ contKey(.black, .pawn, .e5), CONT_NONE } },
+        .{ .prev = .{ CONT_NONE, contKey(.white, .knight, .f3) } },
+        .{ .prev = .{ contKey(.black, .rook, .d8), contKey(.white, .queen, .h5) } },
+    };
+    for (contexts) |cont| {
+        history.contBonus(&cont, contKey(.white, .bishop, .c4), 9);
+        history.contPenalize(&cont, contKey(.white, .knight, .g5), 7);
+    }
+    for (contexts) |cont| {
+        const rows = history.contRows(&cont);
+        var key: u16 = 0;
+        while (key < CONT_KEYS) : (key += 1) {
+            try std.testing.expectEqual(history.contTotal(&cont, key), rows.total(key));
+        }
+    }
+
+    // Disabled table: both plies fall back to the zero stand-in row.
+    const empty = HistoryTable{};
+    for (contexts) |cont| {
+        const rows = empty.contRows(&cont);
+        try std.testing.expectEqual(@as(i32, 0), rows.total(contKey(.white, .bishop, .c4)));
+    }
 }
 
 test "history table stores piece-to countermoves" {

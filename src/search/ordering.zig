@@ -62,8 +62,8 @@ pub fn scoreMoves(
     // and redid the row address chain for every scored move. Row addresses are
     // fixed for the node; per-move reads still see the live table values.
     const cont_rows = history.contRows(cont);
-    // Further loop-invariant hoists (profile-driven — scoreMoves was ~11% of
-    // endgame cycles, almost all in the quiet path):
+    // Further loop-invariant hoists (annotate-driven, v5.5.0 endgame profile —
+    // scoreMoves was 10.9% of cycles, almost all in the quiet path):
     // - tt/killer/countermove candidates as raw u16 move patterns with an
     //   out-of-u16 sentinel: one register compare per move instead of an
     //   optional-tag reload + compare (the by-ref optionals were re-read every
@@ -80,9 +80,9 @@ pub fn scoreMoves(
     const killer_b_raw: u32 = if (killers.b) |m| @as(u16, @bitCast(m)) else NO_MOVE_SENTINEL;
     const counter_raw: u32 = if (countermove) |m| @as(u16, @bitCast(m)) else NO_MOVE_SENTINEL;
     const stm = pos.side_to_move;
-    const quiet_plane = history.quietPlane(stm);
+    const quiet_rows = history.quietPieceRows();
     for (list.slice(), 0..) |mv, idx| {
-        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_plane, &cont_rows);
+        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows);
         scores[idx] = scored.score;
         if (capture_see_scores) |see_scores| see_scores[idx] = scored.capture_see;
     }
@@ -124,6 +124,62 @@ pub fn scoreTacticalMoves(
     }
 }
 
+/// Index of the highest score in `scores[start..count)`, ties broken by the
+/// LOWEST index — bit-identical to the scalar scan it replaces (which only
+/// updates on `>`, so the first maximum wins and stays).
+///
+/// This scan is the hottest single block in negamax (17.4% of its cycles in the
+/// r7 profile = 5.2% of all cycles): the picker runs once per searched move over
+/// a ~30-move list, and LLVM's 8-way-unrolled compare chain pays a
+/// data-dependent branch per element. The vector form is branch-free — one
+/// max/select per 8 lanes plus one horizontal reduction — and touches exactly
+/// the same scores in the same order.
+///
+/// Identity argument. Lane `j` sees the sub-sequence `start + j, start + j + W,
+/// ...` in increasing order and, seeded with `(scores[start], start)`, keeps the
+/// first element that strictly exceeds its running max. So `vbest[j]` is the max
+/// over lane `j` and `scores[start]`, and their overall max is exactly the
+/// scalar `M`. Every lane holding `M` holds the first index in that lane at
+/// which `M` occurs (or `start`, when no lane element beats `scores[start]` —
+/// which can only happen when `scores[start] == M`), so the minimum index among
+/// those lanes is `min{ i : scores[i] == M }`, the scalar answer. The scalar
+/// remainder loop then only accepts strictly greater scores at higher indices,
+/// exactly as before.
+inline fn bestScoredIndex(scores: *const [move_mod.MAX_MOVES]i32, start: usize, count: usize) usize {
+    const W = 8;
+    const V = @Vector(W, i32);
+    const LANE: V = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+
+    var index = start;
+    var best_index = start;
+    var best_score = scores[start];
+
+    if (count - start >= W) {
+        var vbest: V = @splat(best_score);
+        var vindex: V = @splat(@as(i32, @intCast(start)));
+        while (index + W <= count) : (index += W) {
+            const chunk: V = scores[index..][0..W].*;
+            const lanes: V = @as(V, @splat(@as(i32, @intCast(index)))) + LANE;
+            const better = chunk > vbest;
+            vbest = @select(i32, better, chunk, vbest);
+            vindex = @select(i32, better, lanes, vindex);
+        }
+        best_score = @reduce(.Max, vbest);
+        const at_best = vbest == @as(V, @splat(best_score));
+        const candidates = @select(i32, at_best, vindex, @as(V, @splat(std.math.maxInt(i32))));
+        best_index = @intCast(@reduce(.Min, candidates));
+    }
+
+    while (index < count) : (index += 1) {
+        const candidate = scores[index];
+        if (candidate > best_score) {
+            best_score = candidate;
+            best_index = index;
+        }
+    }
+    return best_index;
+}
+
 pub fn pickNext(
     list: *move_mod.MoveList,
     scores: *[move_mod.MAX_MOVES]i32,
@@ -132,15 +188,7 @@ pub fn pickNext(
 ) move_mod.Move {
     if (start_index + 1 >= list.count) return list.moves[start_index];
 
-    var best_index = start_index;
-    var best_score = scores[start_index];
-    var i = start_index + 1;
-    while (i < list.count) : (i += 1) {
-        if (scores[i] > best_score) {
-            best_score = scores[i];
-            best_index = i;
-        }
-    }
+    const best_index = bestScoredIndex(scores, start_index, list.count);
 
     if (best_index != start_index) {
         const best_move = list.moves[best_index];
@@ -174,7 +222,7 @@ inline fn scoreMove(
     killer_b_raw: u32,
     counter_raw: u32,
     stm: types.Color,
-    quiet_plane: *const [6][64]i16,
+    quiet_rows: *const [12][64]i16,
     cont_rows: *const history_mod.ContRows,
 ) ScoredMove {
     // Move equality on the packed(u16) Move is bit equality, so the raw-vs-raw
@@ -204,23 +252,69 @@ inline fn scoreMove(
     if (mv_raw == killer_b_raw) return .{ .score = 249_000 };
 
     // Quiet path: the mover's color is the side to move for every generated
-    // move, so `stm` replaces the old mailbox color().? lookup value-exactly.
-    const moving_type = pos.pieceAt(mv.from).pieceType();
-    // Explicit row pointer — `quiet_plane[piece][to]` with a runtime piece
-    // index materialises a 128-byte stack copy of the row (the defect class
+    // move, so the mailbox piece is `stm * 6 + piece_type` — which is already
+    // the leading half of both history keys. Indexing the tables by the piece
+    // itself (quietPieceRows / contKeyOfPiece) is value-identical to the old
+    // `pieceType()`-keyed form and takes the PIECE_TYPES load out of the
+    // mailbox -> row-address -> history-load dependency chain.
+    const moving_piece = pos.pieceAt(mv.from);
+    std.debug.assert(moving_piece.color().? == stm);
+    // Explicit row pointer — `quiet_rows[piece][to]` with a runtime piece index
+    // materialises a 128-byte stack copy of the row (the defect class
     // HistoryTable.score already documents).
-    const quiet_row: *const [64]i16 = &quiet_plane[@intFromEnum(moving_type)];
+    const quiet_row: *const [64]i16 = &quiet_rows[@intFromEnum(moving_piece)];
     const history_score: i32 = quiet_row[mv.to.index()];
     if (mv_raw == counter_raw) return .{ .score = COUNTERMOVE_SCORE + @divTrunc(@max(history_score, 0), 4) };
     // Plain quiet: main history + continuation history. The combined magnitude
     // stays well under the bad-capture floor, so quiets keep their ordering tier.
-    const cont_score = cont_rows.total(history_mod.contKey(stm, moving_type, mv.to));
+    const cont_score = cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
     return .{ .score = history_score + cont_score };
 }
 
 inline fn capturedPiece(pos: *const position.Position, mv: move_mod.Move, moving_piece: piece.Piece) piece.Piece {
     if (mv.flag == .en_passant) return piece.Piece.make(moving_piece.color().?.other(), .pawn);
     return pos.pieceAt(mv.to);
+}
+
+test "vector best-score scan matches the scalar first-maximum scan" {
+    // Differential test against the scalar reference the vector scan replaced,
+    // over lengths that exercise every lane/tail split and score distributions
+    // dense in ties (the only case where the two could disagree).
+    const reference = struct {
+        fn scan(scores: *const [move_mod.MAX_MOVES]i32, start: usize, count: usize) usize {
+            var best_index = start;
+            var best_score = scores[start];
+            var i = start + 1;
+            while (i < count) : (i += 1) {
+                if (scores[i] > best_score) {
+                    best_score = scores[i];
+                    best_index = i;
+                }
+            }
+            return best_index;
+        }
+    }.scan;
+
+    var prng = std.Random.DefaultPrng.init(0x5eed_1234);
+    const rand = prng.random();
+    var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
+    for (0..400) |trial| {
+        // Narrow ranges force ties; wide ones cover the ordinary case.
+        const span: i32 = switch (trial % 4) {
+            0 => 1, // all equal
+            1 => 3,
+            2 => 64,
+            else => 1_000_000,
+        };
+        for (&scores) |*slot| slot.* = rand.intRangeAtMost(i32, -span, span);
+        const count = rand.intRangeAtMost(usize, 1, move_mod.MAX_MOVES);
+        for (0..count) |start| {
+            try std.testing.expectEqual(
+                reference(&scores, start, count),
+                bestScoredIndex(&scores, start, count),
+            );
+        }
+    }
 }
 
 test "tt move outranks other ordering terms" {

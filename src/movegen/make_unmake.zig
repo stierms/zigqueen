@@ -370,7 +370,8 @@ fn movePiece(pos: *position.Position, p: piece.Piece, from: square.Square, to: s
     const ci = @as(usize, piece_index) / 6;
     const pti = @as(usize, piece_index) % 6;
 
-    pos.zobrist_key ^= zobrist.PIECE_SQUARE_KEYS[piece_index][from_index] ^ zobrist.PIECE_SQUARE_KEYS[piece_index][to_index];
+    const key_row = zobrist.pieceSquareRow(piece_index);
+    pos.zobrist_key ^= key_row[from_index] ^ key_row[to_index];
     pos.pieces[ci][pti] ^= delta;
     pos.occupancies[ci] ^= delta;
     pos.occupied ^= delta;
@@ -465,7 +466,7 @@ inline fn pieceTypeIndex(p: piece.Piece) usize {
 }
 
 fn pieceKey(p: piece.Piece, sq: square.Square) u64 {
-    return zobrist.PIECE_SQUARE_KEYS[@intFromEnum(p)][sq.index()];
+    return zobrist.pieceSquareRow(@intFromEnum(p))[sq.index()];
 }
 
 fn expectRoundTrip(fen_text: []const u8, mv: move_mod.Move) !void {

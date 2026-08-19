@@ -16,13 +16,53 @@ pub fn generate(pos: *const position.Position, list: *move_mod.MoveList) void {
 }
 
 fn generateFor(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generatePawnMoves(side, pos, list);
-    generateKnightMoves(side, pos, list);
-    generateBishopMoves(side, pos, list);
-    generateRookMoves(side, pos, list);
-    generateQueenMoves(side, pos, list);
-    generateKingMoves(side, pos, list);
+    generatePawnMoves(side, pos, list, false, 0);
+    generateLeaperMoves(side, pos, .knight, attacks.knightAttacksFrom, list, false, 0);
+    generateSliderMoves(side, pos, .bishop, attacks.bishopAttacksOnTheFly, list, false, 0);
+    generateSliderMoves(side, pos, .rook, attacks.rookAttacksOnTheFly, list, false, 0);
+    generateSliderMoves(side, pos, .queen, attacks.queenAttacksOnTheFly, list, false, 0);
+    generateLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, false, 0);
     generateCastlingMoves(side, pos, list);
+}
+
+/// Legality-FUSED generation (perf-r8). Valid only under the caller's proof
+/// that the side to move is NOT in check, NOTHING is pinned, there is no en
+/// passant square and no castling rights remain. In that regime the only
+/// pseudo-legal moves that can be illegal are king steps onto a square the
+/// opponent attacks, so masking the target sets deletes exactly the moves the
+/// legality filter used to delete — and the caller no longer has to re-read and
+/// re-pack the whole list afterwards (that pass was 54% of `generateHinted`'s
+/// samples). `enemy_king` is masked out of EVERY target set, reproducing the
+/// filter's `capturesOpponentKing` guard bit for bit; `king_unsafe` is the
+/// opponent's attack map with our king removed from occupancy.
+/// Move CONTENT and ORDER are identical to generate-then-filter.
+pub fn generateLegalNoPins(
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    enemy_king: bitboard.Bitboard,
+    king_unsafe: bitboard.Bitboard,
+) void {
+    list.clear();
+    switch (pos.side_to_move) {
+        .white => generateLegalNoPinsFor(.white, pos, list, enemy_king, king_unsafe),
+        .black => generateLegalNoPinsFor(.black, pos, list, enemy_king, king_unsafe),
+    }
+}
+
+fn generateLegalNoPinsFor(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    enemy_king: bitboard.Bitboard,
+    king_unsafe: bitboard.Bitboard,
+) void {
+    generatePawnMoves(side, pos, list, true, enemy_king);
+    generateLeaperMoves(side, pos, .knight, attacks.knightAttacksFrom, list, true, enemy_king);
+    generateSliderMoves(side, pos, .bishop, attacks.bishopAttacksOnTheFly, list, true, enemy_king);
+    generateSliderMoves(side, pos, .rook, attacks.rookAttacksOnTheFly, list, true, enemy_king);
+    generateSliderMoves(side, pos, .queen, attacks.queenAttacksOnTheFly, list, true, enemy_king);
+    generateLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, true, enemy_king | king_unsafe);
+    // No castling moves: the caller only takes this path with no rights left.
 }
 
 pub fn generateTactical(pos: *const position.Position, list: *move_mod.MoveList) void {
@@ -34,15 +74,22 @@ pub fn generateTactical(pos: *const position.Position, list: *move_mod.MoveList)
 }
 
 fn generateTacticalFor(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateTacticalPawnMoves(side, pos, list);
-    generateTacticalKnightMoves(side, pos, list);
-    generateTacticalBishopMoves(side, pos, list);
-    generateTacticalRookMoves(side, pos, list);
-    generateTacticalQueenMoves(side, pos, list);
-    generateTacticalKingMoves(side, pos, list);
+    generateTacticalPawnMoves(side, pos, list, false, 0);
+    generateTacticalLeaperMoves(side, pos, .knight, attacks.knightAttacksFrom, list, false, 0);
+    generateTacticalSliderMoves(side, pos, .bishop, attacks.bishopAttacksOnTheFly, list, false, 0);
+    generateTacticalSliderMoves(side, pos, .rook, attacks.rookAttacksOnTheFly, list, false, 0);
+    generateTacticalSliderMoves(side, pos, .queen, attacks.queenAttacksOnTheFly, list, false, 0);
+    generateTacticalLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, false, 0);
 }
 
-fn generatePawnMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
+
+fn generatePawnMoves(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    comptime masked: bool,
+    forbidden: bitboard.Bitboard,
+) void {
     var pawns = pos.pieceBitboard(side, .pawn);
     const opponent_occ = pos.occupancyFor(side.other());
     const forward_delta: i8 = if (side == .white) 1 else -1;
@@ -75,6 +122,7 @@ fn generatePawnMoves(comptime side: types.Color, pos: *const position.Position, 
         }
 
         var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ;
+        if (masked) capture_targets &= ~forbidden;
         while (bitboard.popLsb(&capture_targets)) |to| {
             if (rank == promotion_from_rank) {
                 addPromotions(list, from, to, true);
@@ -83,16 +131,26 @@ fn generatePawnMoves(comptime side: types.Color, pos: *const position.Position, 
             }
         }
 
-        if (pos.en_passant) |ep_square| {
-            const ep_mask = bitboard.bit(ep_square);
-            if ((attacks.pawnAttacksFrom(side, from) & ep_mask) != 0) {
-                list.add(move_mod.Move.init(from, ep_square, .en_passant));
+        // The fused caller guarantees `pos.en_passant == null`, so this whole
+        // block is statically dead on that path.
+        if (!masked) {
+            if (pos.en_passant) |ep_square| {
+                const ep_mask = bitboard.bit(ep_square);
+                if ((attacks.pawnAttacksFrom(side, from) & ep_mask) != 0) {
+                    list.add(move_mod.Move.init(from, ep_square, .en_passant));
+                }
             }
         }
     }
 }
 
-fn generateTacticalPawnMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
+fn generateTacticalPawnMoves(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    comptime masked: bool,
+    forbidden: bitboard.Bitboard,
+) void {
     var pawns = pos.pieceBitboard(side, .pawn);
     const opponent_occ = pos.occupancyFor(side.other());
     const forward_delta: i8 = if (side == .white) 1 else -1;
@@ -111,6 +169,7 @@ fn generateTacticalPawnMoves(comptime side: types.Color, pos: *const position.Po
         }
 
         var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ;
+        if (masked) capture_targets &= ~forbidden;
         while (bitboard.popLsb(&capture_targets)) |to| {
             if (rank == promotion_from_rank) {
                 addPromotions(list, from, to, true);
@@ -119,22 +178,20 @@ fn generateTacticalPawnMoves(comptime side: types.Color, pos: *const position.Po
             }
         }
 
-        if (pos.en_passant) |ep_square| {
-            const ep_mask = bitboard.bit(ep_square);
-            if ((attacks.pawnAttacksFrom(side, from) & ep_mask) != 0) {
-                list.add(move_mod.Move.init(from, ep_square, .en_passant));
+        // The fused caller guarantees `pos.en_passant == null`, so this whole
+        // block is statically dead on that path.
+        if (!masked) {
+            if (pos.en_passant) |ep_square| {
+                const ep_mask = bitboard.bit(ep_square);
+                if ((attacks.pawnAttacksFrom(side, from) & ep_mask) != 0) {
+                    list.add(move_mod.Move.init(from, ep_square, .en_passant));
+                }
             }
         }
     }
 }
 
-fn generateKnightMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateLeaperMoves(side, pos, .knight, attacks.knightAttacks, list);
-}
 
-fn generateTacticalKnightMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateTacticalLeaperMoves(side, pos, .knight, attacks.knightAttacks, list);
-}
 
 /// Pseudo-legal QUIET moves that give DIRECT check to the enemy king. No
 /// captures or promotions (generateTactical covers those) and no discovered
@@ -159,29 +216,29 @@ fn generateQuietChecksFor(comptime side: types.Color, pos: *const position.Posit
     // Squares from which each piece type delivers check under CURRENT occupancy.
     // Filling `to` never blocks its own ray and emptying `from` only opens lines,
     // so every generated move checks; see the doc comment for the rare misses.
-    const knight_checks = attacks.knightAttacks(ksq) & empty;
-    const bishop_checks = attacks.bishopAttacks(ksq, occ) & empty;
-    const rook_checks = attacks.rookAttacks(ksq, occ) & empty;
+    const knight_checks = attacks.knightAttacksFrom(ksq) & empty;
+    const bishop_checks = attacks.bishopAttacksOnTheFly(ksq, occ) & empty;
+    const rook_checks = attacks.rookAttacksOnTheFly(ksq, occ) & empty;
     const pawn_checks = attacks.pawnAttacksFrom(enemy, ksq) & empty;
 
     var knights = pos.pieceBitboard(side, .knight);
     while (bitboard.popLsb(&knights)) |from| {
-        var targets = attacks.knightAttacks(from) & knight_checks;
+        var targets = attacks.knightAttacksFrom(from) & knight_checks;
         while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
     }
     var bishops = pos.pieceBitboard(side, .bishop);
     while (bitboard.popLsb(&bishops)) |from| {
-        var targets = attacks.bishopAttacks(from, occ) & bishop_checks;
+        var targets = attacks.bishopAttacksOnTheFly(from, occ) & bishop_checks;
         while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
     }
     var rooks = pos.pieceBitboard(side, .rook);
     while (bitboard.popLsb(&rooks)) |from| {
-        var targets = attacks.rookAttacks(from, occ) & rook_checks;
+        var targets = attacks.rookAttacksOnTheFly(from, occ) & rook_checks;
         while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
     }
     var queens = pos.pieceBitboard(side, .queen);
     while (bitboard.popLsb(&queens)) |from| {
-        const from_attacks = attacks.bishopAttacks(from, occ) | attacks.rookAttacks(from, occ);
+        const from_attacks = attacks.bishopAttacksOnTheFly(from, occ) | attacks.rookAttacksOnTheFly(from, occ);
         var targets = from_attacks & (bishop_checks | rook_checks);
         while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
     }
@@ -211,13 +268,7 @@ fn generateQuietChecksFor(comptime side: types.Color, pos: *const position.Posit
     }
 }
 
-fn generateKingMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateLeaperMoves(side, pos, .king, attacks.kingAttacks, list);
-}
 
-fn generateTacticalKingMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateTacticalLeaperMoves(side, pos, .king, attacks.kingAttacks, list);
-}
 
 fn generateLeaperMoves(
     comptime side: types.Color,
@@ -225,13 +276,15 @@ fn generateLeaperMoves(
     comptime piece_type: piece.PieceType,
     comptime attack_fn: fn (square.Square) bitboard.Bitboard,
     list: *move_mod.MoveList,
+    comptime masked: bool,
+    forbidden: bitboard.Bitboard,
 ) void {
     var pieces = pos.pieceBitboard(side, piece_type);
-    const own_occ = pos.occupancyFor(side);
+    const blocked = if (masked) pos.occupancyFor(side) | forbidden else pos.occupancyFor(side);
     const opp_occ = pos.occupancyFor(side.other());
 
     while (bitboard.popLsb(&pieces)) |from| {
-        var targets = attack_fn(from) & ~own_occ;
+        var targets = attack_fn(from) & ~blocked;
         while (bitboard.popLsb(&targets)) |to| {
             const flag: move_mod.MoveFlag = if ((opp_occ & bitboard.bit(to)) != 0) .capture else .quiet;
             list.add(move_mod.Move.init(from, to, flag));
@@ -245,9 +298,11 @@ fn generateTacticalLeaperMoves(
     comptime piece_type: piece.PieceType,
     comptime attack_fn: fn (square.Square) bitboard.Bitboard,
     list: *move_mod.MoveList,
+    comptime masked: bool,
+    forbidden: bitboard.Bitboard,
 ) void {
     var pieces = pos.pieceBitboard(side, piece_type);
-    const opp_occ = pos.occupancyFor(side.other());
+    const opp_occ = if (masked) pos.occupancyFor(side.other()) & ~forbidden else pos.occupancyFor(side.other());
 
     while (bitboard.popLsb(&pieces)) |from| {
         var targets = attack_fn(from) & opp_occ;
@@ -257,29 +312,11 @@ fn generateTacticalLeaperMoves(
     }
 }
 
-fn generateBishopMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateSliderMoves(side, pos, .bishop, attacks.bishopAttacks, list);
-}
 
-fn generateTacticalBishopMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateTacticalSliderMoves(side, pos, .bishop, attacks.bishopAttacks, list);
-}
 
-fn generateRookMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateSliderMoves(side, pos, .rook, attacks.rookAttacks, list);
-}
 
-fn generateTacticalRookMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateTacticalSliderMoves(side, pos, .rook, attacks.rookAttacks, list);
-}
 
-fn generateQueenMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateSliderMoves(side, pos, .queen, attacks.queenAttacks, list);
-}
 
-fn generateTacticalQueenMoves(comptime side: types.Color, pos: *const position.Position, list: *move_mod.MoveList) void {
-    generateTacticalSliderMoves(side, pos, .queen, attacks.queenAttacks, list);
-}
 
 fn generateSliderMoves(
     comptime side: types.Color,
@@ -287,14 +324,16 @@ fn generateSliderMoves(
     comptime piece_type: piece.PieceType,
     comptime attack_fn: fn (square.Square, bitboard.Bitboard) bitboard.Bitboard,
     list: *move_mod.MoveList,
+    comptime masked: bool,
+    forbidden: bitboard.Bitboard,
 ) void {
     var pieces = pos.pieceBitboard(side, piece_type);
-    const own_occ = pos.occupancyFor(side);
+    const blocked = if (masked) pos.occupancyFor(side) | forbidden else pos.occupancyFor(side);
     const opp_occ = pos.occupancyFor(side.other());
     const occupied = pos.occupancy();
 
     while (bitboard.popLsb(&pieces)) |from| {
-        var targets = attack_fn(from, occupied) & ~own_occ;
+        var targets = attack_fn(from, occupied) & ~blocked;
         while (bitboard.popLsb(&targets)) |to| {
             const flag: move_mod.MoveFlag = if ((opp_occ & bitboard.bit(to)) != 0) .capture else .quiet;
             list.add(move_mod.Move.init(from, to, flag));
@@ -308,9 +347,11 @@ fn generateTacticalSliderMoves(
     comptime piece_type: piece.PieceType,
     comptime attack_fn: fn (square.Square, bitboard.Bitboard) bitboard.Bitboard,
     list: *move_mod.MoveList,
+    comptime masked: bool,
+    forbidden: bitboard.Bitboard,
 ) void {
     var pieces = pos.pieceBitboard(side, piece_type);
-    const opp_occ = pos.occupancyFor(side.other());
+    const opp_occ = if (masked) pos.occupancyFor(side.other()) & ~forbidden else pos.occupancyFor(side.other());
     const occupied = pos.occupancy();
 
     while (bitboard.popLsb(&pieces)) |from| {

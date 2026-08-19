@@ -29,12 +29,28 @@ pub const Result = enum {
             .unknown => "result_unknown",
         };
     }
+
+    pub fn whiteScore(self: Result) f32 {
+        return switch (self) {
+            .white_win => 1.0,
+            .draw, .unknown => 0.5,
+            .black_win => 0.0,
+        };
+    }
 };
 
 pub const Split = enum {
     train,
     validation,
     @"test",
+
+    pub fn text(self: Split) []const u8 {
+        return switch (self) {
+            .train => "train",
+            .validation => "validation",
+            .@"test" => "test",
+        };
+    }
 };
 
 pub const SplitMode = enum {
@@ -202,6 +218,7 @@ test "corpus line parser accepts result_unknown as neutral resultless target" {
     const record = try parseLine(arena.allocator(), line);
     try std.testing.expectEqual(Result.unknown, record.result);
     try std.testing.expectEqualStrings("result_unknown", record.result.text());
+    try std.testing.expectEqual(@as(f32, 0.5), record.result.whiteScore());
     try std.testing.expectEqual(@as(?i32, 37), record.search_white_pov_total);
 }
 

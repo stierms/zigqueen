@@ -15,8 +15,8 @@ src/
                   Position/StateInfo, FEN, zobrist hashing
   movegen/        attack tables (magics), pseudo-legal generation, legality
                   filtering, make/unmake, perft
-  eval/           NNUE runtime (nnue768.zig), threat-feature enumeration
-                  (threats.zig), eval backend dispatch, embedded default net
+  eval/           NNUE runtime (nnue768.zig), full-threat enumeration/deltas
+                  (fullthreats.zig), eval backend dispatch, embedded default net
   search/         engine state, search context/stack, TT, eval cache, qsearch,
                   root/negamax, pruning, reductions (LMR), move ordering,
                   history tables, SEE, repetition, PV, Syzygy probing, time
@@ -41,33 +41,30 @@ Structural rules:
 
 ## NNUE evaluation
 
-![ZQB8 network dataflow](diagrams/net-architecture.png)
-
-*(An annotated, editable SVG variant with the incremental-update details lives
-at [diagrams/net-architecture-annotated.svg](diagrams/net-architecture-annotated.svg).)*
+![ZQB9 network dataflow](diagrams/net-architecture-annotated.svg)
 
 The evaluator is a pure NNUE (no hand-crafted evaluation) in the engine's own
-`ZQB` family of net formats, loaded from an embedded ~30 MB net
+`ZQB` family of net formats, loaded from an embedded 74.6 MB net
 (`src/eval/default_net.zqb`) or an external file via the `EvalFile` UCI
-option. The deployed generation is **ZQB8**:
+option. The deployed generation is **ZQB9**:
 
 - **Feature transformer — HalfKA-8.** Standard Chess768 features (color x
   piece type x square, 768 per block) replicated over 8 king buckets with
   horizontal mirroring: per perspective, the bucket is chosen by that side's
   own king square (black's frame is rank-flipped via `sq ^ 56`), and files
-  e-h are mirrored onto a-d. Accumulator width is 1536 per perspective, i16
+  e-h are mirrored onto a-d. Accumulator width is 1024 per perspective, i16
   quantized.
-- **Threat features.** A lean SFNNv10-style threat set: 7,680 features
-  encoding attacker piece -> occupied target square -> target piece
-  relations (kings are targets, never sources), deduplicated per perspective
-  as a 7,680-bit set. Threat rows are stored i8 and added into the same
-  accumulator as the HalfKA rows.
+- **Threat features.** The `zqHalfKA9` full-threat mapping has 60,144 sparse
+  attacker/target-relation inputs. Threat rows are stored as i8 weights and
+  maintained in a separate incremental half before the readout combines them
+  with the HalfKA accumulator.
 - **PSQT head.** A per-feature scalar head, bucketed alongside the output
   buckets (Stockfish-style), added outside the nonlinear stack.
 - **Layerstack readout.** An SFNNv5-style output stack per material bucket:
   clipped-ReLU + pairwise multiply on the accumulator halves, then
-  l1 (i8 weights, VNNI/dot-product matmul) -> squared-clipped-ReLU -> l2 ->
-  l3 -> scalar, blended with the PSQT head.
+  `1024 -> 16` l1 (i8 weights, VNNI/dot-product matmul) ->
+  squared-clipped-ReLU -> `16 -> 32` l2 -> `32 -> 1` l3, blended with the
+  PSQT head. There are eight material buckets.
 
 Inference uses portable `@Vector` SIMD (lowers to AVX-512/AVX2/NEON with a
 scalar fallback); integer SIMD is bit-exact, so eval output is identical
@@ -75,18 +72,18 @@ across targets.
 
 ### Incremental update machinery
 
-- **Per-ply accumulators.** `applyMove` edits the parent accumulator
-  (add/sub of feature rows) instead of a full rebuild. Threat features are
-  non-local (a move can create or destroy discovered attack relations across
-  the board), so threat deltas are computed by a dedicated incremental
-  algorithm rather than piece-list diffs.
+- **Per-ply accumulators.** `applyMove` edits the parent HalfKA and threat
+  state instead of rebuilding. Threat features are non-local (a move can
+  create or destroy discovered attack relations across the board), so threat
+  deltas are computed by a dedicated attacker-group algorithm and unwind log
+  rather than piece-list diffs.
 - **Lazy materialization.** Accumulator edits are deferred until a node
   actually evaluates; nodes that cut off on TT hits or never reach a static
   eval skip the accumulator work entirely.
-- **Finny table.** A per-(side, king-bucket/flip) cache of accumulator plus
-  board snapshot. When a king move crosses a bucket or mirror boundary
-  (which invalidates every feature of that perspective), the rebuild applies
-  only the piece diff against the cached snapshot instead of a full refresh.
+- **Refresh caches and barriers.** HalfKA uses a per-(side,
+  king-bucket/flip) finny cache. Full-threat updates use lazy per-ply deltas,
+  with barrier records and a small flip cache when a king changes the
+  perspective's bucket/mirror orientation.
 
 The net is trained with the [bullet](https://github.com/jw1912/bullet)
 trainer on the publicly published Stockfish NNUE training datasets

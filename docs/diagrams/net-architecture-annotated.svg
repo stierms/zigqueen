@@ -7,7 +7,7 @@
   <rect width="1560" height="1040" fill="#1a1b26"/>
 
   <!-- title -->
-  <text x="60" y="72" fill="#f5efe0" font-size="30" font-weight="bold">zigqueen &#183; ZQB8 network</text>
+  <text x="60" y="72" fill="#f5efe0" font-size="30" font-weight="bold">zigqueen &#183; ZQB9 network</text>
   <path d="M60 92 h330" stroke="#F7A41D" stroke-width="3"/>
   <path d="M390 92 l14 -10 l-6 10 l14 -10" stroke="#F7A41D" stroke-width="3" fill="none"/>
   <text x="1500" y="72" fill="#8a8fa3" font-size="18" text-anchor="end">one board &#8594; one centipawn score</text>
@@ -21,7 +21,7 @@
 
     <rect x="60" y="310" width="300" height="120" rx="10" fill="none" stroke="#F7A41D" stroke-width="3"/>
     <text x="210" y="356" fill="#f5efe0" font-size="22" text-anchor="middle">threat features</text>
-    <text x="210" y="388" fill="#F7A41D" font-size="22" text-anchor="middle">7,680 / persp</text>
+    <text x="210" y="388" fill="#F7A41D" font-size="20" text-anchor="middle">60,144 / persp</text>
     <text x="210" y="412" fill="#8a8fa3" font-size="16" text-anchor="middle">attacker &#8594; target relations, i8 rows</text>
   </g>
 
@@ -31,7 +31,7 @@
   <g>
     <rect x="440" y="150" width="300" height="280" rx="10" fill="#F7A41D"/>
     <text x="590" y="230" fill="#1a1b26" font-size="26" font-weight="bold" text-anchor="middle">accumulator</text>
-    <text x="590" y="266" fill="#1a1b26" font-size="24" text-anchor="middle">1536 &#215; i16</text>
+    <text x="590" y="266" fill="#1a1b26" font-size="24" text-anchor="middle">1024 &#215; i16</text>
     <text x="590" y="300" fill="#1a1b26" font-size="18" text-anchor="middle">two perspectives (stm / ntm)</text>
     <text x="590" y="350" fill="#5c3d00" font-size="16" text-anchor="middle">incremental: applyMove edits,</text>
     <text x="590" y="374" fill="#5c3d00" font-size="16" text-anchor="middle">lazy materialization, finny refresh</text>
@@ -43,7 +43,7 @@
     <rect x="820" y="220" width="290" height="140" rx="10" fill="none" stroke="#F7A41D" stroke-width="3"/>
     <text x="965" y="268" fill="#f5efe0" font-size="22" text-anchor="middle">CReLU + pairwise mul</text>
     <text x="965" y="300" fill="#F7A41D" font-size="22" text-anchor="middle">768 &#215; u8 / persp</text>
-    <text x="965" y="330" fill="#8a8fa3" font-size="16" text-anchor="middle">concat stm|ntm &#8594; 1536 &#215; u8</text>
+    <text x="965" y="330" fill="#8a8fa3" font-size="16" text-anchor="middle">combine stm|ntm &#8594; 1024 &#215; u8</text>
   </g>
 
   <!-- layerstack -->
@@ -53,7 +53,7 @@
     <text x="1345" y="188" fill="#8a8fa3" font-size="16" text-anchor="middle">&#215; 8 material buckets (piece count)</text>
 
     <rect x="1240" y="210" width="210" height="64" rx="8" fill="#F7A41D"/>
-    <text x="1345" y="250" fill="#1a1b26" font-size="21" font-weight="bold" text-anchor="middle">L1: 1536 &#8594; 16 (i8)</text>
+    <text x="1345" y="250" fill="#1a1b26" font-size="21" font-weight="bold" text-anchor="middle">L1: 1024 &#8594; 16 (i8)</text>
 
     <path d="M1345 274 V300" stroke="#F7A41D" stroke-width="3" marker-end="url(#arr)"/>
     <rect x="1240" y="306" width="210" height="64" rx="8" fill="#F7A41D"/>
@@ -89,5 +89,5 @@
   <text x="60" y="880" fill="#8a8fa3" font-size="18">&#8226; threat deltas are computed by an incremental algorithm (attacks are non-local; no piece-list diff suffices)</text>
   <text x="60" y="912" fill="#8a8fa3" font-size="18">&#8226; nodes that never evaluate (TT cutoffs) skip accumulator work entirely; a raw-eval cache skips repeat evals</text>
   <text x="60" y="944" fill="#8a8fa3" font-size="18">&#8226; integer SIMD (@Vector &#8594; AVX-512/AVX2/NEON) is bit-exact: identical eval on every target</text>
-  <text x="1500" y="990" fill="#3d3f52" font-size="15" text-anchor="end">net: ~31 MB embedded (ZQB8) &#183; trained with bullet on published Stockfish datasets</text>
+  <text x="1500" y="990" fill="#3d3f52" font-size="15" text-anchor="end">net: 74.6 MB embedded (ZQB9) &#183; trained from scratch with extended bullet on published Stockfish datasets</text>
 </svg>

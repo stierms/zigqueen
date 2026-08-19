@@ -86,7 +86,7 @@ pub const SearchStats = struct {
     rfp_hint_cutoffs_depth_2: u64 = 0,
     rfp_hint_cutoffs_depth_3: u64 = 0,
     rfp_hint_alpha_raises: u64 = 0,
-    // Raw-eval cache. Probes happen ONLY after a TT static-eval
+    // Raw-eval cache (perf-r11). Probes happen ONLY after a TT static-eval
     // miss, so hits/probes IS the hit-after-TT-miss rate.
     eval_cache_probes: u64 = 0,
     eval_cache_hits: u64 = 0,

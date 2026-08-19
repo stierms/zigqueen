@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const eval_backend = @import("../eval/backend.zig");
 const tunables = @import("../search/tunables.zig");
 
@@ -11,7 +10,7 @@ pub const Options = struct {
     move_overhead_ms: u32 = 20,
     // Out-of-the-box default: the embedded bullet pure NNUE at its calibrated
     // scale (queen ~= HCE centipawns). Engine plays correctly with zero setoption.
-    nnue_scale_percent: u16 = eval_backend.default_nnue_scale_percent,
+    nnue_scale_percent: u16 = eval_backend.builtin_nnue_scale_percent,
     // Draw contempt in engine cp: in-tree draws score -contempt for the root
     // side. 0 (default) = classical draws, bit-identical to pre-contempt play.
     contempt_cp: i16 = 0,
@@ -49,15 +48,12 @@ pub const Options = struct {
         const eval_file_line = try std.fmt.bufPrint(&eval_file_buffer, "option name EvalFile type string default {s}\n", .{self.evalFilePath()});
         try sink.writeAll(eval_file_line);
 
-        // Runtime-tunable search params: only advertised in -Dtunables builds
-        // (internal SPSA tuning). The release binary ships the compiled-in
-        // defaults and does not expose them.
-        if (build_options.tunables) {
-            inline for (tunables.specs) |spec| {
-                var buffer: [160]u8 = undefined;
-                const line = try std.fmt.bufPrint(&buffer, "option name {s} type spin default {d} min {d} max {d}\n", .{ spec.uci_name, spec.default, spec.min, spec.max });
-                try sink.writeAll(line);
-            }
+        // Runtime-tunable search params (SPSA scaffold). Defaults = shipped values,
+        // so an engine that sets none of them plays identically.
+        inline for (tunables.specs) |spec| {
+            var buffer: [160]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buffer, "option name {s} type spin default {d} min {d} max {d}\n", .{ spec.uci_name, spec.default, spec.min, spec.max });
+            try sink.writeAll(line);
         }
     }
 
@@ -159,10 +155,9 @@ pub const Options = struct {
             return .applied;
         }
 
-        // Runtime-tunable search params -> global tunables.active (only settable
-        // in -Dtunables builds; clamps internally, so a boundary perturbation
-        // never stalls an SPSA driver).
-        if (build_options.tunables and value.len != 0) {
+        // Runtime-tunable search params (SPSA scaffold) -> global tunables.active
+        // (clamps internally, so a boundary perturbation never stalls the driver).
+        if (value.len != 0) {
             if (std.fmt.parseInt(i32, value, 10)) |parsed| {
                 if (tunables.set(name, parsed)) return .applied;
             } else |_| {}

@@ -8,7 +8,7 @@ const nnue768 = @import("../eval/nnue768.zig");
 
 pub const MAX_PLY: usize = 128;
 
-/// Lazy-accumulator state: `clean` = acc holds this
+/// Lazy-accumulator state (nps package, 2026-07-17): `clean` = acc holds this
 /// ply's position (or the entry was never part of a make chain — tests refresh
 /// directly); `dirty_*` = a make recorded its inputs but the update is deferred
 /// until an eval at-or-below this ply materializes the ancestor chain.
@@ -40,6 +40,14 @@ pub const StackEntry = struct {
 
 pub const SearchStack = struct {
     entries: [MAX_PLY]StackEntry = [_]StackEntry{.{}} ** MAX_PLY,
+    /// Length of the contiguous CLEAN accumulator prefix on the live line: every
+    /// entry in 0..=clean_depth holds the accumulator for its own ply, and every
+    /// ply made since the last materialization is above it. Maintained by
+    /// prepareRoot (0), onMakeMove/onMakeNullMove (min with the parent ply) and
+    /// ensureMaterialized (set to the materialized ply) — perf-r5: the walk used
+    /// to REDISCOVER this by scanning acc_state down from `ply`, one dependent
+    /// load per ply into entries that sit ~18KB (>1 page) apart.
+    clean_depth: usize = 0,
 
     pub fn entry(self: *SearchStack, ply: usize) *StackEntry {
         std.debug.assert(ply < self.entries.len);

@@ -62,6 +62,10 @@ pub const HintTable = struct {
         self.clear();
     }
 
+    pub fn hintSizeMb(self: *const HintTable) u32 {
+        return self.configured_hint_mb;
+    }
+
     /// Overlap the per-node hint-cluster cache miss with the work before the probe
     /// (same idea as the TT prefetch). The cluster is zobrist-indexed -> a cache miss
     /// per probed node; prefetching it in the parent hides most of that latency.

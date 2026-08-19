@@ -8,12 +8,12 @@ const types = @import("../core/types.zig");
 const tunables = @import("tunables.zig");
 
 // Pruning margins/caps are runtime-tunable (SPSA scaffold). Defaults (in
-// `tunables.zig`) are the shipped values, so behaviour is identical out of the
-// box; an SPSA driver perturbs them via UCI options (-Dtunables builds)
-// without recompiling. Forward pruning extends into the mid-tree (RFP to
-// depth 6, quiet futility to depth 4) with larger deep margins; the shallow
-// range (<= the const below) keeps the separately-tuned shallow margin. The
-// min-index gates stay const (structural, not tuned).
+// `tunables.zig`) are the shipped v3.1.0 values, so behaviour is identical out of
+// the box; an SPSA driver perturbs them via UCI options without recompiling. See
+// scripts/spsa-tune.py. The depth-efficiency campaign (2026-06-05) extended forward
+// pruning into the mid-tree (RFP to depth 6, quiet futility to depth 4) with larger
+// SF-calibrated deep margins; the shallow range (<= the const below) keeps the
+// tuned shallow margin. The min-index gates stay const (structural, not tuned).
 const REVERSE_FUTILITY_SHALLOW_MAX_DEPTH: u16 = 3;
 
 pub fn shouldTryNullMove(
@@ -107,13 +107,14 @@ fn latePruneThreshold(depth: u16, improving: bool) usize {
     return base / 2;
 }
 
-// History pruning: skip late quiet moves whose quiet-history is strongly
-// negative in the mid-tree. Conservative: only mid-depth, only past the first
-// few moves, and only when history is well below a depth-scaled (more negative
-// with depth = safer deeper) threshold.
+// History pruning (depth-efficiency campaign, 2026-06-05): skip late quiet moves
+// whose quiet-history is strongly negative in the mid-tree. We had NO history-based
+// pruning before -- a core SF tree-shrinker. Conservative: only mid-depth, only
+// past the first few moves, and only when history is well below a depth-scaled
+// (more negative with depth = safer deeper) threshold.
 const HISTORY_PRUNE_MIN_INDEX: usize = 3;
 
-// SEE-based quiet pruning: skip late quiets that walk
+// SEE-based quiet pruning (depth-efficiency campaign): skip late quiets that walk
 // into a losing exchange (SEE below a depth-scaled margin). The gate runs the
 // cheap checks first so SEE (expensive) is only computed for the few late quiets
 // that could actually be pruned.

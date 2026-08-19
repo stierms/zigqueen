@@ -53,6 +53,11 @@ pub const SearchContext = struct {
     stack: stack.SearchStack = .{},
     /// Per-thread finny (accumulator-refresh) cache; reset each search via prepareRoot.
     finny: nnue768.FinnyTable = .{},
+    /// v6 full-threats shared state (ZQB9 nets only): ONE bitset pair + the
+    /// per-ply path stack + the 2-slot flip cache — per search context, NOT per
+    /// ply (the 7.5KB/perspective bitsets are exactly what the per-ply copies
+    /// must avoid). Reset each search via prepareRoot; inert for other nets.
+    ft: nnue768.FullThreatState = .{},
     control: time.Controller,
     stats: stats.SearchStats = .{},
     nodes: u64 = 0,
@@ -160,7 +165,7 @@ pub const SearchContext = struct {
         self.stats.rfp_hint_alpha_raises += 1;
     }
 
-    /// Raw-eval cache: probed only after a TT static-eval miss, so
+    /// Raw-eval cache (perf-r11): probed only after a TT static-eval miss, so
     /// the hit rate doubles as the hit-after-TT-miss rate.
     pub fn noteEvalCacheProbe(self: *SearchContext, hit: bool) void {
         if (comptime !stats_enabled) return;

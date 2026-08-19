@@ -6,6 +6,8 @@
   sources, trainer, and what was and was not taken from other projects.
 - [`STRENGTH.md`](STRENGTH.md) — anchored gauntlet results and the
   self-assessment methodology.
+- [`RELEASE_NOTES_6.0.0.md`](RELEASE_NOTES_6.0.0.md) — 6.0.0 changes from
+  the public 5.8.3 release.
 - [`TUNING.md`](TUNING.md) — the candidate-validation ladder (self-play screen,
   SPRT, external gauntlet) used to accept strength changes.
 - [`QUALITY_GATES.md`](QUALITY_GATES.md) — correctness and promotion gates.

@@ -42,7 +42,7 @@ pub fn runWithOptions(writer: anytype, pos: *const position.Position, depth: u16
             net.weight_methods.l2_weights_t.name(),
         });
     }
-    // Eval-cache configuration + end-of-search occupancy (does the
+    // perf-r12: eval-cache configuration + end-of-search occupancy (does the
     // search even fill the table?) for the sizing/replacement sweeps.
     const eval_cache_occ = engine.eval_cache.occupancy();
     try writer.print("eval_cache_config size_mb {d} assoc {d} entries {d} filled {d} fill_permille {d}\n", .{

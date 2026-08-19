@@ -8,8 +8,8 @@ android {
         applicationId "org.stierms.zigqueen"
         minSdk 21
         targetSdk 35
-        versionCode 583
-        versionName "5.8.3"
+        versionCode 600
+        versionName "6.0.0"
     }
 
     flavorDimensions = ["variant"]
@@ -17,12 +17,12 @@ android {
         generic {
             dimension "variant"
             applicationIdSuffix ".generic"
-            manifestPlaceholders = [appLabel: "zigqueen 5.8.3"]
+            manifestPlaceholders = [appLabel: "zigqueen 6.0.0"]
         }
         dotprod {
             dimension "variant"
             applicationIdSuffix ".dotprod"
-            manifestPlaceholders = [appLabel: "zigqueen 5.8.3 dotprod"]
+            manifestPlaceholders = [appLabel: "zigqueen 6.0.0 dotprod"]
         }
     }
 

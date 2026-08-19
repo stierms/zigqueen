@@ -1,11 +1,12 @@
-# zigqueen
+# zigqueen 6.0.0 — full-threats NNUE chess engine
 
 <p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
 
 zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
 NNUE evaluation and a single-threaded alpha-beta search. Engine code is a
-clean-room implementation (see `CLEAN_ROOM_RULES.md`); the network is trained
-from the publicly published Stockfish NNUE training datasets.
+clean-room implementation (see `CLEAN_ROOM_RULES.md`); the 6.0.0 network is
+trained from random initialization on publicly published Stockfish NNUE
+training datasets.
 
 Copyright (C) 2026 stierms — licensed under GPLv3 (see `LICENSE`). The
 vendored Fathom tablebase prober (`deps/fathom`) is distributed under its own
@@ -50,14 +51,16 @@ developed under — no code was copied or translated from other engines.
 
 | Engine version | Self-assessment (blitz 180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 |
 |---|---|---|---|
+| v6.0.0 | **~3602** — 1,620-game, 27-opponent anchored gauntlet, 2026-08-18/19 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v5.8.3 | ~3590 — 1,620-game anchored gauntlet, 2026-07-26 ([methodology](docs/STRENGTH.md)) | **3569 ±16** (#76–77, [official listing](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — |
 | v5.8.2 | ~3594 — 1,620-game anchored gauntlet, 2026-07-25 ([methodology](docs/STRENGTH.md)) | — | — |
 | v5.8.0 | ~3588 — 1,620-game anchored gauntlet, 2026-07-19 ([methodology](docs/STRENGTH.md)) | — | — |
 
-The official CCRL Blitz rating (951 games, first listed 2026-08-01) is the
-authoritative number. The self-assessment anchors a private gauntlet to
-published CCRL Blitz ratings; it landed within ~20 Elo of the official
-result — treat it as an estimate (~±20).
+The 5.8.3 CCRL result is the latest authoritative public number. The 6.0.0
+self-assessment anchors a private gauntlet to published CCRL ratings and has
+a ±63 Elo per-opponent implied-rating spread. Its `UHO_4060_v4`/Hash 256
+conditions differ from the July 5.8.0 run's 96-line suite/Hash 64, so the
+~3602 estimate is not an official rating or a controlled head-to-head delta.
 
 ## Development hardware
 
@@ -72,20 +75,21 @@ was done on a single desktop machine:
 | OS | Windows 11 with WSL2 (Ubuntu) — training and testing run under WSL2; Windows binaries are cross-compiled with Zig |
 
 No cluster, no distributed testing framework, and no external compute: the
-network trains on the one GPU (about 30 hours for the shipped net), and the gauntlets
-and SPRT matches run on the same box's CPU cores. (The only exception is
+network trains on the one GPU, and the gauntlets and SPRT matches run on the
+same box's CPU cores. (The only exception is
 the published release binaries, which are built by GitHub Actions so that
 anyone can reproduce them from the tagged source.)
 
 ## Features
 
-**Evaluation** — pure NNUE ("ZQB8" format, ~30 MB net embedded in the binary):
+**Evaluation** — pure NNUE (`zqHalfKA9` in a `ZQB9` container, 74.6 MB net embedded):
 
-- HalfKA feature transformer, 8 king buckets with horizontal mirroring, width 1536
-- lean threat-feature set (7,680 attacker->target features) with custom
-  incremental non-local update algorithms
-- PSQT head and a bucketed SFNNv-style layerstack readout (l1/l2 with i8
-  VNNI matmul)
+- HalfKA feature transformer, 8 king buckets with horizontal mirroring,
+  width 1024
+- full-threat feature set with 60,144 sparse attacker/target relations and
+  custom incremental non-local update algorithms
+- PSQT head and eight material-bucketed `1024 -> 16 -> 32 -> 1` layer stacks
+  with i8 VNNI/dot-product matmul
 - incremental accumulators with lazy materialization and a finny-style
   refresh cache
 - trained with the [bullet](https://github.com/jw1912/bullet) trainer on
@@ -101,6 +105,8 @@ anyone can reproduce them from the tagged source.)
 - LMR (runtime-shaped table), RFP, razoring, futility, history and SEE pruning
 - killer/countermove/main/continuation/correction history; staged
   TT-move-first generation at depth 1
+- six deterministic exact-root book entries retained from the promoted
+  dev.2 engine
 - SEE-gated quiet checks at the first qsearch ply
 - Syzygy WDL probing via Fathom
 
@@ -122,8 +128,10 @@ The default build targets the native CPU. Portable release binaries use
 `-Dcpu-baseline=avx2` (x86-64-v3: AVX2, no AVX-512 — runs on Haswell/Zen 1
 and newer) or `-Dcpu-baseline=avx512` (x86-64-v4 + VNNI — Ice Lake/Zen 4 and
 newer); all variants are bit-exact, only speed differs. Windows binaries
-cross-compile with `-Dtarget=x86_64-windows-gnu`. `scripts/package-release.sh`
-builds and zips all four release variants into `release/`.
+cross-compile with `-Dtarget=x86_64-windows-gnu`. Android uses the `armv8`
+and `armv8-dotprod` baselines. `scripts/package-release.sh` builds and zips
+all six raw-binary release variants into `release/`; signed OEX APKs are
+packaged locally from `android/oex/`.
 
 ## UCI options
 
@@ -132,10 +140,13 @@ builds and zips all four release variants into `release/`.
 | `Hash` | spin | 256 | Transposition table size in MB (1-65536); also sizes the eval cache. |
 | `Threads` | spin | 1 | Search threads. The engine is single-threaded; fixed at 1. |
 | `Move Overhead` | spin | 20 | Per-move time reserve in ms for GUI/connection latency (0-1000). |
-| `NNUE Scale Percent` | spin | 66 | Eval scaling in percent (0-400). The default is the calibrated value; changing it is not recommended. |
+| `NNUE Scale Percent` | spin | 48 | Eval scaling in percent (0-400). The default is keyed to the embedded net; changing it is not recommended. |
 | `SyzygyPath` | string | empty | Directories containing Syzygy tablebases (WDL probing). |
 | `Contempt` | spin | 0 | Draw contempt in centipawns (-200 to 200); 0 = classical draw scoring. |
 | `EvalFile` | string | `<builtin>` | Path to an external `.zqb` net; leave at `<builtin>` for the embedded net. |
+
+Advanced search-tuning options are also exposed through UCI with the shipped
+defaults; leaving them unchanged selects the tested 6.0.0 configuration.
 
 ## Platform notes
 

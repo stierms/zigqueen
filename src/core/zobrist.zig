@@ -25,6 +25,19 @@ pub fn hashPosition(pos: *const position.Position) u64 {
     return key;
 }
 
+/// Address the piece-square table ROW, never copy it.
+///
+/// `PIECE_SQUARE_KEYS[i][j]` with a runtime `i` makes the first index produce a
+/// `[64]u64` **value**: LLVM materialises the whole 512-byte row on the stack
+/// (8x zmm load + 8x zmm store) and then does the 8-byte load out of it — which
+/// additionally fails store-to-load forwarding. That was 7 sites and 112 zmm
+/// moves inside `makeMove` alone. Handing out a `*const [64]u64` keeps the
+/// access a single GEP into .rodata. Same defect class as the note on
+/// `Position.pieceRow`.
+pub inline fn pieceSquareRow(piece_index: usize) *const [64]u64 {
+    return &PIECE_SQUARE_KEYS[piece_index];
+}
+
 pub inline fn castlingIndex(rights: position.CastlingRights) usize {
     return @as(u4, @bitCast(rights));
 }

@@ -20,6 +20,7 @@ const tt = @import("tt.zig");
 const history_mod = @import("history.zig");
 const legal = @import("../movegen/legal.zig");
 const make_unmake = @import("../movegen/make_unmake.zig");
+const opening_book = @import("opening_book.zig");
 
 pub const MAX_TRACE: usize = 64;
 const ASPIRATION_MIN_DEPTH: u16 = 3;
@@ -50,6 +51,9 @@ pub const SearchDiagnostics = struct {
     projected_next_iteration_ns: u64 = 0,
     stable_iteration_streak: u8 = 0,
     iteration_stop_reason: ?IterationStopReason = null,
+    /// Last combined three-signal soft-limit factor (percent, 100 = neutral).
+    /// Stays 100 unless a ZQ_TM_NF/BM/SC signal is enabled.
+    soft_scale_pct: u32 = 100,
 };
 
 pub const SearchResult = struct {
@@ -64,13 +68,19 @@ pub const SearchResult = struct {
 
 pub const EvalOptions = eval_backend.Options;
 /// Re-exported so the CLI fallback (main.zig) shares the one source of truth.
-pub const default_nnue_scale_percent = eval_backend.default_nnue_scale_percent;
+pub const default_nnue_scale_percent = eval_backend.builtin_nnue_scale_percent;
+
+pub const OpeningBookPolicy = enum {
+    use_book,
+    skip_book,
+};
 
 pub const Engine = struct {
     tt: tt.TranspositionTable,
     rfp_hint: rfp_hint_mod.HintTable,
-    /// Raw-eval memo: position-keyed cache of the exact raw static eval,
-    /// sized off Hash (Hash/4, clamped [4,64] MB; 2-way). No UCI option.
+    /// Raw-eval memo (perf-r11): position-keyed cache of the exact raw static
+    /// eval, sized off Hash (Hash/4, clamped [4,64] MB; 2-way since perf-r12).
+    /// No UCI option.
     eval_cache: eval_cache_mod.EvalCache,
     history: history_mod.HistoryTable = .{},
     evaluator: eval_backend.EngineState,
@@ -102,10 +112,14 @@ pub const Engine = struct {
         var history = history_mod.HistoryTable{};
         try history.initContinuation(allocator);
         errdefer history.deinitContinuation(allocator);
-        // Correction-history tables are deliberately not allocated: with a null
-        // table every corrhist read/update is a no-op (it measured as a
-        // regression for this eval, whose static error is small and whose
-        // pruning margins would need co-tuning with any correction term).
+        // Correction history is PARKED (tables not allocated -> corrhist reads/updates
+        // are no-ops, play is identical to v4.0.3): v1 (+/-72cp, qsearch read) self-SPRT
+        // -17.4 +/-13.2; v2 (+/-32cp, main-search only) -3.5 +/-7.4 = flat. Hypothesis:
+        // the PSQT-anchored eval has little systematic error to correct, and the pruning
+        // margins want CO-TUNING with the correction (the deferred SPSA campaign).
+        // Revive by uncommenting when SPSA can co-tune the constants:
+        // try history.initCorrection(allocator);
+        // errdefer history.deinitCorrection(allocator);
         const ctx = try allocator.create(context_mod.SearchContext);
         errdefer allocator.destroy(ctx);
         return .{
@@ -189,15 +203,26 @@ pub const Engine = struct {
         limits: time.Limits,
         stop_flag: *const std.atomic.Value(bool),
     ) SearchResult {
-        return self.searchImpl(pos, root_history, limits, stop_flag);
+        return self.searchWithOpeningBookPolicy(pos, root_history, limits, stop_flag, .use_book);
     }
 
-    fn searchImpl(
+    pub fn searchRawNoBook(
         self: *Engine,
         pos: *const position.Position,
         root_history: *const repetition.History,
         limits: time.Limits,
         stop_flag: *const std.atomic.Value(bool),
+    ) SearchResult {
+        return self.searchWithOpeningBookPolicy(pos, root_history, limits, stop_flag, .skip_book);
+    }
+
+    fn searchWithOpeningBookPolicy(
+        self: *Engine,
+        pos: *const position.Position,
+        root_history: *const repetition.History,
+        limits: time.Limits,
+        stop_flag: *const std.atomic.Value(bool),
+        opening_book_policy: OpeningBookPolicy,
     ) SearchResult {
         self.tt.newSearch();
         var working = pos.*;
@@ -214,7 +239,7 @@ pub const Engine = struct {
         ctx.contempt = self.contempt_cp;
         ctx.root_color = working.side_to_move;
         if (ctx.repetition.count == 0) ctx.repetition.push(working.zobrist_key);
-        self.evaluator.prepareRoot(&ctx.stack, &working, &ctx.finny);
+        self.evaluator.prepareRoot(&ctx.stack, &working, &ctx.finny, &ctx.ft);
 
         const fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock));
         var best = SearchResult{ .best_move = fallback };
@@ -228,9 +253,10 @@ pub const Engine = struct {
         // Fathom's DTZ-optimal move directly — search cannot outplay the table,
         // and pawnless wins (KBN vs K et al.) are invisible to the in-search
         // WDL probe (no zeroing move ever resets the clock, so its rule-50
-        // gate never opens). Draws/losses fall through to the normal search:
-        // against imperfect opposition the search keeps practical chances
-        // that "any TB-optimal move" would forfeit.
+        // gate never opens; measured live: 50 shuffled moves, drawn win).
+        // Draws/losses fall through to the normal search: against imperfect
+        // opposition the search keeps practical winning/swindle chances that
+        // "any TB-optimal move" would forfeit.
         if (syzygy.probeRoot(&working)) |tbv| {
             if (tbv.win) {
                 if (matchLegalMove(&working, tbv)) |mv| {
@@ -246,11 +272,28 @@ pub const Engine = struct {
             }
         }
 
+        if (opening_book_policy == .use_book) {
+            if (opening_book.findRootMove(&working)) |book_move| {
+                best.best_move = book_move;
+                best.score = self.evaluator.evaluate(&ctx.stack, 0, &working, &ctx.finny, &ctx.ft);
+                best.depth = 1;
+                best.seldepth = 1;
+                best.nodes = 1;
+                best.pv.push(book_move);
+                best.diagnostics.stats = ctx.stats;
+                return best;
+            }
+        }
 
         const max_depth = limits.depth orelse 64;
         var previous_trace: ?IterationTrace = null;
         var previous_root_hints: ?root.RootMoveHints = null;
         var stable_iteration_streak: u8 = 0;
+        // TM arc r1: three-signal soft-limit scaling (all default OFF; the
+        // policy then reduces to the legacy stop test bit-for-bit).
+        const tm_cfg = time.tmConfig();
+        const tm_signals_enabled = tm_cfg.signalsEnabled();
+        var best_move_streak: u32 = 0;
         var depth: u16 = 1;
         search_loop: while (depth <= max_depth) : (depth += 1) {
             if (ctx.control.stopReasonNow(ctx.nodes)) |reason| {
@@ -327,6 +370,10 @@ pub const Engine = struct {
                 best.diagnostics.trace_len += 1;
             }
             stable_iteration_streak = nextStableIterationStreak(stable_iteration_streak, previous_trace, current_trace);
+            best_move_streak = if (previous_trace) |prev|
+                (if (prev.best_move == current_trace.best_move) best_move_streak + 1 else 1)
+            else
+                1;
             best.diagnostics.last_iteration_elapsed_ns = @intCast(@max(iteration_elapsed_ns, 0));
             best.diagnostics.projected_next_iteration_ns = @intCast(@max(estimateNextIterationNs(iteration_elapsed_ns), 0));
             best.diagnostics.stable_iteration_streak = stable_iteration_streak;
@@ -345,7 +392,21 @@ pub const Engine = struct {
                 } });
             }
 
-            if (iterationStopReasonWithElapsed(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns)) |reason| {
+            var soft_policy = SoftLimitPolicy{};
+            if (tm_signals_enabled) {
+                soft_policy = .{
+                    .scale_pct = time.signalScalePct(tm_cfg, .{
+                        .best_move_node_permille = bestMoveNodePermille(&iteration.root_hints, current_trace.best_move),
+                        .best_move_streak = best_move_streak,
+                        .score_drop_cp = if (previous_trace) |prev| prev.score - current_trace.score else null,
+                    }),
+                    .ignore_best_move_gate = tm_cfg.bm,
+                    .ignore_score_gate = tm_cfg.sc,
+                };
+                best.diagnostics.soft_scale_pct = soft_policy.scale_pct;
+            }
+
+            if (iterationStopReasonWithPolicy(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns, soft_policy)) |reason| {
                 best.diagnostics.iteration_stop_reason = reason;
                 switch (reason) {
                     .maximum_elapsed => ctx.noteIterationStopMaximumElapsed(),
@@ -477,6 +538,21 @@ fn moveWouldChangeCastlingRights(pos: *const position.Position, moving_piece: pi
     };
 }
 
+/// TM arc r1: how the optimum (soft) budget check is shaped by the enabled
+/// three-signal scalers. The default policy reproduces the legacy behavior
+/// exactly (scale 100%, both binary stability gates active).
+///
+/// When a signal gate is enabled, it REPLACES its binary counterpart with a
+/// graded multiplicative factor already folded into `scale_pct`:
+///   ZQ_TM_BM  -> ignore_best_move_gate (streak factor prices the change)
+///   ZQ_TM_SC  -> ignore_score_gate (drop factor prices the swing)
+///   ZQ_TM_NF has no binary counterpart; it only contributes to scale_pct.
+const SoftLimitPolicy = struct {
+    scale_pct: u32 = 100,
+    ignore_best_move_gate: bool = false,
+    ignore_score_gate: bool = false,
+};
+
 fn shouldStopAfterIterationWithElapsed(
     limits: time.Limits,
     previous: ?IterationTrace,
@@ -494,10 +570,33 @@ fn iterationStopReasonWithElapsed(
     elapsed_ns: i128,
     iteration_elapsed_ns: i128,
 ) ?IterationStopReason {
+    return iterationStopReasonWithPolicy(limits, previous, current, elapsed_ns, iteration_elapsed_ns, .{});
+}
+
+fn iterationStopReasonWithPolicy(
+    limits: time.Limits,
+    previous: ?IterationTrace,
+    current: IterationTrace,
+    elapsed_ns: i128,
+    iteration_elapsed_ns: i128,
+    policy: SoftLimitPolicy,
+) ?IterationStopReason {
     const projected_elapsed_ns = projectedElapsedNs(elapsed_ns, iteration_elapsed_ns);
     if (budgetStopReason(elapsed_ns, projected_elapsed_ns, limits.maximum_budget_ns, .maximum_elapsed, .maximum_projected)) |reason| return reason;
-    if (!isStableIteration(previous, current)) return null;
-    return budgetStopReason(elapsed_ns, projected_elapsed_ns, limits.optimum_budget_ns, .optimum_elapsed, .optimum_projected);
+    if (!isStableIterationWithPolicy(previous, current, policy)) return null;
+    const scaled_optimum = scaledOptimumBudgetNs(limits, policy.scale_pct);
+    return budgetStopReason(elapsed_ns, projected_elapsed_ns, scaled_optimum, .optimum_elapsed, .optimum_projected);
+}
+
+/// Optimum budget scaled by the combined signal factor. The soft budget never
+/// exceeds the maximum (hard) budget: signals shape WHEN we willingly stop,
+/// the hard cap still protects the clock.
+fn scaledOptimumBudgetNs(limits: time.Limits, scale_pct: u32) ?u64 {
+    const optimum = limits.optimum_budget_ns orelse return null;
+    if (scale_pct == 100) return optimum;
+    const scaled = optimum / 100 * scale_pct + (optimum % 100) * scale_pct / 100;
+    if (limits.maximum_budget_ns) |maximum| return @min(scaled, maximum);
+    return scaled;
 }
 
 fn projectedElapsedNs(elapsed_ns: i128, iteration_elapsed_ns: i128) i128 {
@@ -529,12 +628,36 @@ fn estimateNextIterationNs(iteration_elapsed_ns: i128) i128 {
     return @max(@as(i128, 2) * std.time.ns_per_ms, iteration_elapsed_ns * 2);
 }
 
-fn isStableIteration(previous: ?IterationTrace, current: IterationTrace) bool {
-    const prior = previous orelse return true;
-    if (prior.best_move != current.best_move) return false;
+const STABILITY_SCORE_WINDOW_CP: i32 = 80;
 
-    const delta = current.score - prior.score;
-    return delta < 80 and delta > -80;
+fn isStableIteration(previous: ?IterationTrace, current: IterationTrace) bool {
+    return isStableIterationWithPolicy(previous, current, .{});
+}
+
+fn isStableIterationWithPolicy(previous: ?IterationTrace, current: IterationTrace, policy: SoftLimitPolicy) bool {
+    const prior = previous orelse return true;
+    if (!policy.ignore_best_move_gate and prior.best_move != current.best_move) return false;
+    if (!policy.ignore_score_gate) {
+        const delta = current.score - prior.score;
+        if (delta >= STABILITY_SCORE_WINDOW_CP or delta <= -STABILITY_SCORE_WINDOW_CP) return false;
+    }
+    return true;
+}
+
+/// Permille of the iteration's root-move subtree nodes spent under the best
+/// move (the node-fraction TM signal). Null when the best move is unknown,
+/// absent from the hints, or no nodes were attributed.
+fn bestMoveNodePermille(hints: *const root.RootMoveHints, best_move: ?move_mod.Move) ?u32 {
+    const mv = best_move orelse return null;
+    var total: u64 = 0;
+    var best_nodes: ?u64 = null;
+    for (hints.hints[0..hints.count]) |hint| {
+        total += hint.subtree_nodes;
+        if (hint.mv == mv) best_nodes = hint.subtree_nodes;
+    }
+    if (total == 0) return null;
+    const nodes = best_nodes orelse return null;
+    return @intCast(nodes * 1000 / total);
 }
 
 test "aspiration windows start from previous stable score" {
@@ -605,7 +728,118 @@ test "no budgets means no iteration stop signal" {
     try std.testing.expect(!shouldStopAfterIterationWithElapsed(.{}, null, current, 10 * std.time.ns_per_ms, 10 * std.time.ns_per_ms));
 }
 
-test "engine search returns a legal searched move (no opening book)" {
+test "default soft policy reproduces the legacy stop decision" {
+    const previous = IterationTrace{ .score = 10, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const stable = IterationTrace{ .score = 20, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const changed = IterationTrace{ .score = 10, .best_move = move_mod.Move.init(.d2, .d4, .double_push) };
+    const limits = time.Limits{ .optimum_budget_ns = 50 * std.time.ns_per_ms };
+
+    // Stable + past optimum -> stop; unstable -> optimum ignored. Same as legacy.
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, .optimum_elapsed),
+        iterationStopReasonWithPolicy(limits, previous, stable, 60 * std.time.ns_per_ms, 2 * std.time.ns_per_ms, .{}),
+    );
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, null),
+        iterationStopReasonWithPolicy(limits, previous, changed, 60 * std.time.ns_per_ms, 2 * std.time.ns_per_ms, .{}),
+    );
+}
+
+test "bm policy replaces the binary best-move gate with the graded factor" {
+    const previous = IterationTrace{ .score = 10, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const changed = IterationTrace{ .score = 10, .best_move = move_mod.Move.init(.d2, .d4, .double_push) };
+    const limits = time.Limits{ .optimum_budget_ns = 50 * std.time.ns_per_ms };
+
+    // Legacy: a changed best move skips the optimum check entirely (no stop
+    // even far past budget). With the BM gate replaced and a 130% factor,
+    // the scaled optimum (65ms) DOES stop once elapsed crosses it.
+    const policy = SoftLimitPolicy{ .scale_pct = 130, .ignore_best_move_gate = true };
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, null),
+        iterationStopReasonWithPolicy(limits, previous, changed, 60 * std.time.ns_per_ms, 1 * std.time.ns_per_ms, policy),
+    );
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, .optimum_elapsed),
+        iterationStopReasonWithPolicy(limits, previous, changed, 66 * std.time.ns_per_ms, 1 * std.time.ns_per_ms, policy),
+    );
+}
+
+test "sc policy replaces the score window with the graded factor" {
+    const previous = IterationTrace{ .score = 100, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const dropped = IterationTrace{ .score = -50, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const limits = time.Limits{ .optimum_budget_ns = 50 * std.time.ns_per_ms };
+
+    // Legacy: a 150cp drop is "unstable" -> optimum ignored at 60ms.
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, null),
+        iterationStopReasonWithPolicy(limits, previous, dropped, 60 * std.time.ns_per_ms, 2 * std.time.ns_per_ms, .{}),
+    );
+    // SC policy prices the drop as a 160% extension instead: no stop at
+    // 60ms (< 80ms scaled), stop once elapsed crosses the scaled budget.
+    const policy = SoftLimitPolicy{ .scale_pct = 160, .ignore_score_gate = true };
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, null),
+        iterationStopReasonWithPolicy(limits, previous, dropped, 60 * std.time.ns_per_ms, 2 * std.time.ns_per_ms, policy),
+    );
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, .optimum_elapsed),
+        iterationStopReasonWithPolicy(limits, previous, dropped, 81 * std.time.ns_per_ms, 2 * std.time.ns_per_ms, policy),
+    );
+}
+
+test "shrinking soft scale stops earlier than the unscaled optimum" {
+    const previous = IterationTrace{ .score = 10, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const stable = IterationTrace{ .score = 12, .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
+    const limits = time.Limits{ .optimum_budget_ns = 50 * std.time.ns_per_ms };
+
+    // 80% factor -> 40ms scaled budget: 42ms elapsed stops where legacy would not.
+    const policy = SoftLimitPolicy{ .scale_pct = 80 };
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, .optimum_elapsed),
+        iterationStopReasonWithPolicy(limits, previous, stable, 42 * std.time.ns_per_ms, 1 * std.time.ns_per_ms, policy),
+    );
+    try std.testing.expectEqual(
+        @as(?IterationStopReason, null),
+        iterationStopReasonWithPolicy(limits, previous, stable, 42 * std.time.ns_per_ms, 1 * std.time.ns_per_ms, .{}),
+    );
+}
+
+test "scaled optimum budget never exceeds the maximum budget" {
+    const limits = time.Limits{
+        .optimum_budget_ns = 50 * std.time.ns_per_ms,
+        .maximum_budget_ns = 70 * std.time.ns_per_ms,
+    };
+    try std.testing.expectEqual(@as(?u64, 70 * std.time.ns_per_ms), scaledOptimumBudgetNs(limits, 200));
+    try std.testing.expectEqual(@as(?u64, 50 * std.time.ns_per_ms), scaledOptimumBudgetNs(limits, 100));
+    try std.testing.expectEqual(@as(?u64, 40 * std.time.ns_per_ms), scaledOptimumBudgetNs(limits, 80));
+
+    const uncapped = time.Limits{ .optimum_budget_ns = 50 * std.time.ns_per_ms };
+    try std.testing.expectEqual(@as(?u64, 100 * std.time.ns_per_ms), scaledOptimumBudgetNs(uncapped, 200));
+    try std.testing.expectEqual(@as(?u64, null), scaledOptimumBudgetNs(.{}, 200));
+}
+
+test "best-move node permille reflects root subtree concentration" {
+    var hints = root.RootMoveHints{};
+    const e4 = move_mod.Move.init(.e2, .e4, .double_push);
+    const d4 = move_mod.Move.init(.d2, .d4, .double_push);
+    const c4 = move_mod.Move.init(.c2, .c4, .double_push);
+    hints.record(e4, 30, 750);
+    hints.record(d4, 10, 200);
+    hints.record(c4, -5, 50);
+
+    try std.testing.expectEqual(@as(?u32, 750), bestMoveNodePermille(&hints, e4));
+    try std.testing.expectEqual(@as(?u32, 200), bestMoveNodePermille(&hints, d4));
+    try std.testing.expectEqual(@as(?u32, 50), bestMoveNodePermille(&hints, c4));
+    // Unknown move or missing best move -> no signal.
+    try std.testing.expectEqual(@as(?u32, null), bestMoveNodePermille(&hints, move_mod.Move.init(.g1, .f3, .quiet)));
+    try std.testing.expectEqual(@as(?u32, null), bestMoveNodePermille(&hints, null));
+    // Zero attributed nodes -> no signal.
+    var empty = root.RootMoveHints{};
+    empty.record(e4, 0, 0);
+    try std.testing.expectEqual(@as(?u32, null), bestMoveNodePermille(&empty, e4));
+}
+
+test "engine opening book policy preserves default and enables raw no-book search" {
     const fen = @import("../core/fen.zig");
 
     var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
@@ -616,7 +850,12 @@ test "engine search returns a legal searched move (no opening book)" {
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(false);
 
-    const raw = engine.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
+    const booked = engine.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
+    try std.testing.expectEqual(move_mod.Move.init(.e1, .g1, .castle), booked.best_move.?);
+    try std.testing.expectEqual(@as(u16, 1), booked.depth);
+    try std.testing.expectEqual(@as(u64, 1), booked.nodes);
+
+    const raw = engine.searchRawNoBook(&pos, &history, .{ .depth = 2 }, &stop_flag);
     try std.testing.expect(raw.best_move != null);
     try std.testing.expect(raw.nodes > 1);
     try std.testing.expect(pv.isLegal(&pos, &history, &raw.pv));
@@ -858,7 +1097,7 @@ test "engine stops after a finite movetime and returns completed iteration" {
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(false);
 
-    const limits = (time.GoLimits{ .movetime_ms = 20 }).toControllerLimits(.white, time.DEFAULT_MOVE_OVERHEAD_MS);
+    const limits = (time.GoLimits{ .movetime_ms = 20 }).toControllerLimits(.white, time.DEFAULT_MOVE_OVERHEAD_MS, 1);
     const result = engine.search(&pos, &history, limits, &stop_flag);
     try std.testing.expect(result.best_move != null);
     try std.testing.expect(result.depth >= 1);
@@ -868,7 +1107,7 @@ test "engine stops after a finite movetime and returns completed iteration" {
 test "lazy accumulator reconstruction matches full refresh across real searches" {
     const fen = @import("../core/fen.zig");
 
-    // Materialization reconstructs ancestor boards from the
+    // R4b (2026-07-18): materialization reconstructs ancestor boards from the
     // live position (unmake/re-make) instead of eager per-make snapshots. With
     // verify_threats_incremental on, every eval in these searches (Debug builds)
     // asserts incremental == full refresh — covering single- and multi-ply dirty
@@ -890,6 +1129,47 @@ test "lazy accumulator reconstruction matches full refresh across real searches"
         history.push(pos.zobrist_key);
         var stop_flag = std.atomic.Value(bool).init(false);
         const result = engine.search(&pos, &history, .{ .depth = 6 }, &stop_flag);
+        try std.testing.expect(result.best_move != null);
+    }
+}
+
+test "lazy accumulator reconstruction matches full refresh across real searches (ZQB9 full threats)" {
+    const fen = @import("../core/fen.zig");
+    const nnue768 = @import("../eval/nnue768.zig");
+
+    // Block B mirror of the test above for the v6 FULL-threats incremental path:
+    // real searches over a synthetic ZQB9 net with verify_threats_incremental on,
+    // so every evaluated node (Debug builds) asserts evaluateFull9Incremental ==
+    // the evaluateFull9 full refresh — across single- and multi-ply dirty chains,
+    // null-move plies, probcut makes, qsearch check chains, and the shared
+    // bitset-state unwind/advance (incl. flip barriers) those searches produce.
+    eval_backend.verify_threats_incremental = true;
+    defer eval_backend.verify_threats_incremental = false;
+
+    const allocator = std.testing.allocator;
+    const blob = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(blob);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "zqb9-test.zqb", .data = blob });
+    const net_path = try tmp.dir.realpathAlloc(allocator, "zqb9-test.zqb");
+    defer allocator.free(net_path);
+
+    var engine = try Engine.initWithOptions(allocator, tt.DEFAULT_HASH_MB, .{ .eval_file_path = net_path });
+    defer engine.deinit();
+    try std.testing.expect(engine.evaluator.net.?.full_threats);
+
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1b1k2r/2qnbppp/p2ppn2/1p4B1/3NPPP1/2N2Q2/PPP4P/2KR1B1R w kq - 0 11",
+        "8/2k5/3p4/p2P1p2/P2P1P2/8/8/4K3 w - - 0 1", // king walks -> mirror-flip barriers
+    };
+    for (fens) |fen_text| {
+        const pos = try fen.parse(fen_text);
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        var stop_flag = std.atomic.Value(bool).init(false);
+        const result = engine.search(&pos, &history, .{ .depth = 5 }, &stop_flag);
         try std.testing.expect(result.best_move != null);
     }
 }

@@ -48,8 +48,8 @@ fn runGoLimitsWithOptions(
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(false);
 
-    const plan = go_limits.plan(pos.side_to_move, search_time.DEFAULT_MOVE_OVERHEAD_MS).?;
-    const controller_limits = go_limits.toControllerLimits(pos.side_to_move, search_time.DEFAULT_MOVE_OVERHEAD_MS);
+    const plan = go_limits.plan(pos.side_to_move, search_time.DEFAULT_MOVE_OVERHEAD_MS, pos.fullmove_number).?;
+    const controller_limits = go_limits.toControllerLimits(pos.side_to_move, search_time.DEFAULT_MOVE_OVERHEAD_MS, pos.fullmove_number);
 
     var timer = std.time.Timer.start() catch null;
     const result = engine.search(pos, &history, controller_limits, &stop_flag);

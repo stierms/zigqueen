@@ -39,5 +39,7 @@ See `docs/TUNING.md` for the validation ladder these implement.
 
 ## Misc
 
+- `source-hygiene-audit.py` — conservative unused-private-function audit;
+  counts call sites and value references.
 - `uci-movetime-probe.py` — probe an engine's movetime/clock behavior over
   UCI.
