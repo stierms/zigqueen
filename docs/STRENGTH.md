@@ -18,8 +18,10 @@ official rating.
 **zigqueen 6.0.0: ~3602 CCRL Blitz Elo** in a 1,620-game anchored gauntlet
 against 27 CCRL-listed opponents. The per-opponent implied ratings have a
 63-Elo standard-deviation spread; that spread is not a confidence interval.
-Applying the ~20-Elo instrument offset observed on 5.8.3 (above), a CCRL
-retest of 6.0.0 would be expected to land in the ~3575-3590 region.
+Applying the ~20-Elo instrument offset observed on 5.8.3 (above), an
+official test of 6.0.0 — none is planned or has been requested; 5.8.3
+remains the submitted version — would be expected to land in the
+~3575-3590 region.
 
 The run scored **478 wins, 737 draws, and 405 losses: 846.5/1,620, or
 52.3% overall**.
