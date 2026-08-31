@@ -1,0 +1,18 @@
+# gitleaks configuration for zigqueen.
+#
+# The global pre-push hook scans the full repository history before any push.
+# The paths below are large data files (NNUE network containers, opening
+# books, diagram images) that cannot contain credentials but dominate the
+# scan time; allowlisting them keeps the pre-push scan fast without reducing
+# coverage of actual source and configuration files.
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''.*\.zqb$''',
+  '''openings/.*\.(epd|pgn)$''',
+  '''docs/diagrams/.*''',
+  '''.*\.(png|svg|jar)$''',
+]
