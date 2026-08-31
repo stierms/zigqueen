@@ -26,6 +26,9 @@ pub const Entry = struct {
     // saves the NNUE forward on TT hits without a cutoff. Fits in the struct's
     // existing padding (18 -> 20 bytes, layout stays 24), so zero size cost.
     static_eval: i16 = STATIC_EVAL_NONE,
+    /// True when this position was stored from a PV node. Basin LMR uses the
+    /// bit as an accuracy brake if the position later appears off-PV.
+    was_pv: bool = false,
 };
 
 pub const StoreOutcome = struct {
@@ -139,10 +142,10 @@ pub const TranspositionTable = struct {
     }
 
     pub inline fn store(self: *TranspositionTable, key: u64, depth: i16, score: i32, bound: Bound, mv: ?move_mod.Move) void {
-        _ = self.storeWithOutcome(key, depth, score, bound, mv, STATIC_EVAL_NONE);
+        _ = self.storeWithOutcome(key, depth, score, bound, mv, STATIC_EVAL_NONE, false);
     }
 
-    pub inline fn storeWithOutcome(self: *TranspositionTable, key: u64, depth: i16, score: i32, bound: Bound, mv: ?move_mod.Move, static_eval: i16) StoreOutcome {
+    pub inline fn storeWithOutcome(self: *TranspositionTable, key: u64, depth: i16, score: i32, bound: Bound, mv: ?move_mod.Move, static_eval: i16, was_pv: bool) StoreOutcome {
         var outcome = StoreOutcome{
             .current_generation = self.generation,
             .new_bound = bound,
@@ -200,6 +203,7 @@ pub const TranspositionTable = struct {
         replacement.generation = self.generation;
         replacement.bound = bound;
         replacement.static_eval = kept_eval;
+        replacement.was_pv = was_pv;
         return outcome;
     }
 
@@ -293,18 +297,18 @@ test "tt store outcome reports replacement classes" {
     defer tt.deinit();
 
     const mv = move_mod.Move.init(.e2, .e4, .double_push);
-    const first = tt.storeWithOutcome(0x55, 4, 10, .exact, mv, 123);
+    const first = tt.storeWithOutcome(0x55, 4, 10, .exact, mv, 123, true);
     try std.testing.expect(first.stored);
     try std.testing.expect(first.empty_slot);
     try std.testing.expect(first.new_had_move);
 
-    const same = tt.storeWithOutcome(0x55, 5, 20, .lower, null, STATIC_EVAL_NONE);
+    const same = tt.storeWithOutcome(0x55, 5, 20, .lower, null, STATIC_EVAL_NONE, false);
     try std.testing.expect(same.stored);
     try std.testing.expect(same.same_key);
     try std.testing.expect(same.victim_had_move);
     try std.testing.expectEqual(Bound.exact, same.victim_bound);
 
-    const skipped = tt.storeWithOutcome(0x55, 4, 30, .upper, null, STATIC_EVAL_NONE);
+    const skipped = tt.storeWithOutcome(0x55, 4, 30, .upper, null, STATIC_EVAL_NONE, false);
     // same-key overwrite without an eval preserved the cached one
     try std.testing.expectEqual(@as(i16, 123), tt.lookup(0x55).?.static_eval);
     try std.testing.expect(!skipped.stored);

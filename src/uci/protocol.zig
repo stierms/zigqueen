@@ -10,6 +10,7 @@ const options_mod = @import("options.zig");
 const position = @import("../core/position.zig");
 const repetition = @import("../search/repetition.zig");
 const search_time = @import("../search/time.zig");
+const tunables = @import("../search/tunables.zig");
 const worker_mod = @import("worker.zig");
 
 pub const UciError = error{
@@ -120,7 +121,7 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
 
     if (std.mem.eql(u8, command, "uci")) {
         try state.worker.output.print("id name zigqueen {s}\n", .{build_options.version});
-        try state.worker.output.writeAll("id author OpenAI + mstie\n");
+        try state.worker.output.writeAll("id author Matthias Stier\n");
         try state.options.writeUciOptions(state.worker.output);
         try state.worker.output.writeAll("uciok\n");
         return false;
@@ -162,6 +163,8 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
             } else if (state.options.hash_mb == previous.hash_mb and !state.options.evalFileChanged(previous) and state.options.contempt_cp == previous.contempt_cp and !state.options.syzygyPathChanged(previous)) {
                 state.worker.resetEngine();
             }
+        } else {
+            try state.worker.output.print("info string unknown option: {s}\n", .{setOptionNameForNotice(line)});
         }
         return false;
     }
@@ -198,6 +201,19 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
     }
 
     return false;
+}
+
+fn setOptionNameForNotice(line: []const u8) []const u8 {
+    var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    _ = tokens.next() orelse return "<unknown>";
+    _ = tokens.next() orelse return "<unknown>";
+
+    const name_start = tokens.next() orelse return "<unknown>";
+    const start = @intFromPtr(name_start.ptr) - @intFromPtr(line.ptr);
+    if (std.mem.indexOfPos(u8, line, start, " value ")) |value_start| {
+        return std.mem.trim(u8, line[start..value_start], " ");
+    }
+    return std.mem.trim(u8, line[start..], " ");
 }
 
 fn handleGo(state: *UciState, line: []const u8) !void {
@@ -388,10 +404,29 @@ test "handleCommand writes uci handshake" {
     const out = output.contents();
     try std.testing.expect(std.mem.indexOf(u8, out, "id name zigqueen ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, build_options.version) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "option name Hash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "option name NNUE Scale Percent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "option name EvalFile") != null);
+    const built_in_names = [_][]const u8{
+        "Hash",
+        "Threads",
+        "Move Overhead",
+        "SyzygyPath",
+        "EvalFile",
+        "NNUE Scale Percent",
+        "Contempt",
+    };
+    for (built_in_names) |name| try expectAdvertisedOption(out, name, true);
+
+    try std.testing.expectEqual(@as(usize, 25), tunables.specs.len);
+    for (tunables.specs) |spec| try expectAdvertisedOption(out, spec.uci_name, build_options.tuning);
+
+    const expected_count: usize = if (build_options.tuning) 32 else 7;
+    try std.testing.expectEqual(expected_count, std.mem.count(u8, out, "option name "));
     try std.testing.expect(std.mem.indexOf(u8, out, "uciok") != null);
+}
+
+fn expectAdvertisedOption(out: []const u8, name: []const u8, expected: bool) !void {
+    var buffer: [96]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&buffer, "option name {s} type ", .{name});
+    try std.testing.expectEqual(expected, std.mem.indexOf(u8, out, needle) != null);
 }
 
 test "setoption hash reconfigures engine-owned table" {
@@ -482,6 +517,25 @@ test "setoption move overhead is accepted" {
 
     try std.testing.expect(!try handleCommand(&state, "setoption name Move Overhead value 12"));
     try std.testing.expectEqual(@as(u32, 12), state.options.move_overhead_ms);
+}
+
+test "RazorBase setoption follows the build flavour" {
+    tunables.reset();
+    defer tunables.reset();
+
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    try std.testing.expect(!try handleCommand(&state, "setoption name RazorBase value 200"));
+    if (build_options.tuning) {
+        try std.testing.expectEqual(@as(i32, 200), tunables.active.razor_base);
+        try std.testing.expect(std.mem.indexOf(u8, output.contents(), "unknown option") == null);
+    } else {
+        try std.testing.expectEqual(@as(i32, 5), tunables.active.razor_base);
+        try std.testing.expectEqualStrings("info string unknown option: RazorBase\n", output.contents());
+    }
 }
 
 test "parse go command keeps node and time-control fields" {

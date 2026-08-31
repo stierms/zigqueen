@@ -370,6 +370,7 @@ static void *map_file(FD fd, map_t *mapping)
 			      MAP_SHARED, fd, 0);
   if (data == MAP_FAILED) {
     perror("mmap");
+    close_tb(fd);
     return NULL;
   }
 #ifdef POSIX_MADV_RANDOM
@@ -722,8 +723,12 @@ static void *map_tb(const char *name, const char *suffix, map_t *mapping)
 
   void *data = map_file(fd, mapping);
   if (data == NULL) {
-    fprintf(stderr, "Could not map %s%s into memory.\n", name, suffix);
-    exit(EXIT_FAILURE);
+    /* zigqueen: a table that exists but cannot be mapped (ENOMEM under an
+       address-space limit, fragmented VAS, ...) is a probe miss, never a
+       reason to terminate the engine mid-search. */
+    fprintf(stderr, "Could not map %s%s into memory; continuing without it.\n", name, suffix);
+    close_tb(fd);
+    return NULL;
   }
 
   close_tb(fd);
@@ -927,8 +932,11 @@ bool tb_init(const char *path)
     pawnEntry = (struct PawnEntry*)malloc(TB_MAX_PAWN * sizeof(*pawnEntry));
 #endif
     if (!pieceEntry || !pawnEntry) {
-      fprintf(stderr, "Out of memory.\n");
-      exit(EXIT_FAILURE);
+      /* zigqueen: fail closed (no tablebases) instead of exiting. */
+      fprintf(stderr, "Out of memory allocating tablebase entries; tablebases disabled.\n");
+      free(pieceEntry); free(pawnEntry);
+      pieceEntry = NULL; pawnEntry = NULL;
+      return false;
     }
   }
 

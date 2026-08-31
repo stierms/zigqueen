@@ -269,6 +269,36 @@ test "worker emits bestmove after stop on infinite search" {
     try std.testing.expect(std.mem.indexOf(u8, out, "bestmove 0000") == null);
 }
 
+test "TB-decisive go infinite stays active until stop" {
+    const fen = @import("../core/fen.zig");
+    const path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return;
+    defer std.testing.allocator.free(path);
+
+    var output = TestOutput{};
+    var worker = try Worker.init(output.sink(), tt.DEFAULT_HASH_MB);
+    try worker.start();
+    defer worker.deinit();
+    try std.testing.expect(worker.setSyzygyPath(path));
+
+    var history = repetition.History{};
+    const pos = try fen.parse("8/8/3Qkpp1/2P5/8/1r5P/4K3/8 b - - 2 57");
+    history.push(pos.zobrist_key);
+    worker.startSearch(.{
+        .position = pos,
+        .history = history,
+        .limits = .{ .infinite = true },
+    });
+
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    worker.mutex.lock();
+    const still_searching = worker.searching;
+    worker.mutex.unlock();
+    try std.testing.expect(still_searching);
+
+    worker.stopAndWait();
+    try std.testing.expect(std.mem.indexOf(u8, output.contents(), "bestmove ") != null);
+}
+
 test "worker prints a pv line starting with the reported bestmove" {
     const fen = @import("../core/fen.zig");
 

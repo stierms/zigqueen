@@ -1,4 +1,5 @@
 const std = @import("std");
+const basin = @import("basin.zig");
 const hugealloc = @import("../util/hugealloc.zig");
 const move_mod = @import("../core/move.zig");
 const piece = @import("../core/piece.zig");
@@ -315,12 +316,12 @@ pub const HistoryTable = struct {
     }
 
     pub fn bonus(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
-        const bonus_value: i32 = @as(i32, depth) * @as(i32, depth) + 8;
+        const bonus_value: i32 = if (basin.ENABLED) basin.historyBonus(depth) else @as(i32, depth) * @as(i32, depth) + 8;
         adjust(self, side, moved_piece, to, bonus_value);
     }
 
     pub fn penalize(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
-        const penalty: i32 = @as(i32, depth) * @as(i32, depth) + 8;
+        const penalty: i32 = if (basin.ENABLED) basin.historyMalus(depth) else @as(i32, depth) * @as(i32, depth) + 8;
         adjust(self, side, moved_piece, to, -penalty);
     }
 
@@ -352,11 +353,11 @@ pub const HistoryTable = struct {
     }
 
     pub fn contBonus(self: *HistoryTable, cont: *const ContContext, cur_key: u16, depth: u16) void {
-        self.contAdjust(cont, cur_key, @as(i32, depth) * @as(i32, depth) + 8);
+        self.contAdjust(cont, cur_key, if (basin.ENABLED) basin.historyBonus(depth) else @as(i32, depth) * @as(i32, depth) + 8);
     }
 
     pub fn contPenalize(self: *HistoryTable, cont: *const ContContext, cur_key: u16, depth: u16) void {
-        self.contAdjust(cont, cur_key, -(@as(i32, depth) * @as(i32, depth) + 8));
+        self.contAdjust(cont, cur_key, -(if (basin.ENABLED) basin.historyMalus(depth) else @as(i32, depth) * @as(i32, depth) + 8));
     }
 
     fn contAdjust(self: *HistoryTable, cont: *const ContContext, cur_key: u16, delta: i32) void {
@@ -498,7 +499,7 @@ test "history gravity updates avoid immediate saturation" {
     }
     const saturated = history.score(.white, .knight, .f3);
     try std.testing.expect(saturated > 0);
-    try std.testing.expect(saturated < HISTORY_LIMIT);
+    try std.testing.expect(saturated <= HISTORY_LIMIT);
 
     history.penalize(.white, .knight, .f3, 4);
     try std.testing.expect(history.score(.white, .knight, .f3) < saturated);

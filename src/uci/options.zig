@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const eval_backend = @import("../eval/backend.zig");
 const tunables = @import("../search/tunables.zig");
 
@@ -48,12 +49,14 @@ pub const Options = struct {
         const eval_file_line = try std.fmt.bufPrint(&eval_file_buffer, "option name EvalFile type string default {s}\n", .{self.evalFilePath()});
         try sink.writeAll(eval_file_line);
 
-        // Runtime-tunable search params (SPSA scaffold). Defaults = shipped values,
-        // so an engine that sets none of them plays identically.
-        inline for (tunables.specs) |spec| {
-            var buffer: [160]u8 = undefined;
-            const line = try std.fmt.bufPrint(&buffer, "option name {s} type spin default {d} min {d} max {d}\n", .{ spec.uci_name, spec.default, spec.min, spec.max });
-            try sink.writeAll(line);
+        // Runtime-tunable search params are a development-only UCI surface.
+        // Their defaults remain the shipped search values in both flavours.
+        if (comptime build_options.tuning) {
+            inline for (tunables.specs) |spec| {
+                var buffer: [160]u8 = undefined;
+                const line = try std.fmt.bufPrint(&buffer, "option name {s} type spin default {d} min {d} max {d}\n", .{ spec.uci_name, spec.default, spec.min, spec.max });
+                try sink.writeAll(line);
+            }
         }
     }
 
@@ -155,12 +158,14 @@ pub const Options = struct {
             return .applied;
         }
 
-        // Runtime-tunable search params (SPSA scaffold) -> global tunables.active
-        // (clamps internally, so a boundary perturbation never stalls the driver).
-        if (value.len != 0) {
-            if (std.fmt.parseInt(i32, value, 10)) |parsed| {
-                if (tunables.set(name, parsed)) return .applied;
-            } else |_| {}
+        // Runtime-tunable search params (SPSA scaffold) -> global tunables.active.
+        // The whole dispatch path is absent from the default release flavour.
+        if (comptime build_options.tuning) {
+            if (value.len != 0) {
+                if (std.fmt.parseInt(i32, value, 10)) |parsed| {
+                    if (tunables.set(name, parsed)) return .applied;
+                } else |_| {}
+            }
         }
 
         return .ignored;
@@ -251,3 +256,20 @@ test "setoption updates EvalFile and builtin sentinel" {
     try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name EvalFile value <builtin>"));
     try std.testing.expectEqualStrings(eval_backend.builtin_eval_file, options.evalFilePath());
 }
+
+test "tuning setoption dispatch follows the build flavour" {
+    tunables.reset();
+    defer tunables.reset();
+
+    var options = Options{};
+    const result = try options.applySetOptionLine("setoption name RazorBase value 200");
+    if (build_options.tuning) {
+        try std.testing.expectEqual(ApplyOptionResult.applied, result);
+        try std.testing.expectEqual(@as(i32, 200), tunables.active.razor_base);
+    } else {
+        try std.testing.expectEqual(ApplyOptionResult.ignored, result);
+        try std.testing.expectEqual(TunablesDefaults.razor_base, tunables.active.razor_base);
+    }
+}
+
+const TunablesDefaults = tunables.Tunables{};

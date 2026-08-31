@@ -47,7 +47,7 @@ const TB_RESULT_FAILED: c_uint = 0xFFFFFFFF;
 /// Clearly above any eval, clearly below the mate band (MATE_SCORE 29_000,
 /// threshold 28_872): a proven TB win outranks judgment, never masquerades
 /// as a concrete mate.
-pub const TB_WIN_SCORE: types.Score = 28_000;
+pub const TB_WIN_SCORE: types.Score = score_mod.TB_WIN_SCORE;
 
 var initialized: bool = false;
 var largest: u32 = 0;

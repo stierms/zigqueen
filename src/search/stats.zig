@@ -69,6 +69,10 @@ pub const zero_move_order_detail_score_sums: MoveOrderDetailScoreSums = [_][MOVE
 } ** MOVE_ORDER_NODE_TYPE_COUNT;
 
 pub const SearchStats = struct {
+    /// Depth-0 entries that the legacy negamax wrapper and qsearch both counted.
+    /// This is a functional exception to the diagnostic-only stats below: root
+    /// ordering adds it back to honest nodes to preserve its legacy effort scale.
+    horizon_transitions: u64 = 0,
     qnodes: u64 = 0,
     main_static_evals: u64 = 0,
     reverse_futility_prunes: u64 = 0,

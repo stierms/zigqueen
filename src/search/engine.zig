@@ -21,10 +21,15 @@ const history_mod = @import("history.zig");
 const legal = @import("../movegen/legal.zig");
 const make_unmake = @import("../movegen/make_unmake.zig");
 const opening_book = @import("opening_book.zig");
+const basin = @import("basin.zig");
 
 pub const MAX_TRACE: usize = 64;
 const ASPIRATION_MIN_DEPTH: u16 = 3;
-const ASPIRATION_START_CP: i32 = 30;
+const ASPIRATION_START_CP: i32 = if (basin.ENABLED) basin.ASPIRATION_INITIAL_CP else 30;
+/// The reviewed mate regressions became visible at depths 11, 12, and 13.
+/// Require all of depth 13 to complete before a stable TB decision may stop
+/// iterative deepening, leaving that short-mate horizon available.
+const TB_DECISION_MIN_COMPLETED_DEPTH: u16 = 13;
 
 pub const IterationStopReason = enum {
     maximum_elapsed,
@@ -289,6 +294,7 @@ pub const Engine = struct {
         var previous_trace: ?IterationTrace = null;
         var previous_root_hints: ?root.RootMoveHints = null;
         var stable_iteration_streak: u8 = 0;
+        var tb_decision_streak: u8 = 0;
         // TM arc r1: three-signal soft-limit scaling (all default OFF; the
         // policy then reduces to the legacy stop test bit-for-bit).
         const tm_cfg = time.tmConfig();
@@ -307,6 +313,11 @@ pub const Engine = struct {
             var beta = initialAspirationBeta(guess, delta);
             var iteration = root.IterationResult{ .depth = depth };
             var iteration_elapsed_ns: i128 = std.time.ns_per_ms;
+
+            // Retain the last genuinely searched iteration as the result. Once
+            // its finite-search decision is eligible for reuse, end ID cleanly
+            // instead of fabricating deeper iterations with frozen counters.
+            if (shouldStopOnTablebaseDecision(ctx.control.limits, tb_decision_streak, previous_trace)) break;
 
             while (true) {
                 const reused_root_hints = if (previous_root_hints) |*hints| hints else null;
@@ -331,6 +342,9 @@ pub const Engine = struct {
                 } else {
                     ctx.noteAspirationFailHigh();
                 }
+                // Only a direction-matching decisive bound proves the WDL:
+                // fail-low can prove a loss, and fail-high can prove a win.
+                if (isTablebaseWdlProof(alpha, beta, iteration.score)) break;
                 if (ctx.info_emitter) |emitter| {
                     emitter.emit(.{ .iteration = .{
                         .depth = depth,
@@ -369,6 +383,7 @@ pub const Engine = struct {
                 best.diagnostics.trace[best.diagnostics.trace_len] = current_trace;
                 best.diagnostics.trace_len += 1;
             }
+            tb_decision_streak = nextTablebaseDecisionStreak(tb_decision_streak, previous_trace, current_trace);
             stable_iteration_streak = nextStableIterationStreak(stable_iteration_streak, previous_trace, current_trace);
             best_move_streak = if (previous_trace) |prev|
                 (if (prev.best_move == current_trace.best_move) best_move_streak + 1 else 1)
@@ -377,6 +392,11 @@ pub const Engine = struct {
             best.diagnostics.last_iteration_elapsed_ns = @intCast(@max(iteration_elapsed_ns, 0));
             best.diagnostics.projected_next_iteration_ns = @intCast(@max(estimateNextIterationNs(iteration_elapsed_ns), 0));
             best.diagnostics.stable_iteration_streak = stable_iteration_streak;
+
+            // The wider hard deadline is evidence-gated: only this completed
+            // trace can arm it for the next iteration. Stable traces restore
+            // the legacy deadline before either the projection or next depth.
+            ctx.control.setWiderMaximumArmed(completedIterationArmsWiderMaximum(previous_trace, current_trace));
 
             if (ctx.info_emitter) |emitter| {
                 emitter.emit(.{ .iteration = .{
@@ -425,6 +445,12 @@ pub const Engine = struct {
             best.nodes = ctx.nodes;
             if (best.best_move) |mv| best.pv.push(mv);
         }
+        // Depth 64 is the engine's structural ID ceiling, not permission for
+        // `go infinite` to emit bestmove. If it is ever reached, remain in the
+        // search until the GUI sends `stop`.
+        if (ctx.control.limits.infinite and !stop_flag.load(.acquire)) {
+            while (!stop_flag.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+        }
         best.diagnostics.stats = ctx.stats;
         return best;
     }
@@ -457,6 +483,12 @@ fn initialAspirationBeta(guess: ?i32, delta: i32) i32 {
 fn shouldResearchAspiration(guess: ?i32, alpha: i32, beta: i32, score: i32) bool {
     _ = guess orelse return false;
     return score <= alpha or score >= beta;
+}
+
+fn isTablebaseWdlProof(alpha: i32, beta: i32, score: i32) bool {
+    if (!score_mod.isTablebaseDecisive(score)) return false;
+    return (score <= alpha and score <= -score_mod.TB_DECISIVE_THRESHOLD) or
+        (score >= beta and score >= score_mod.TB_DECISIVE_THRESHOLD);
 }
 
 fn widenAspirationWindow(guess: i32, alpha: *i32, beta: *i32, delta: *i32, score: i32) void {
@@ -610,6 +642,21 @@ fn nextStableIterationStreak(previous_streak: u8, previous: ?IterationTrace, cur
     return 1;
 }
 
+fn nextTablebaseDecisionStreak(previous_streak: u8, previous: ?IterationTrace, current: IterationTrace) u8 {
+    if (!score_mod.isTablebaseDecisive(current.score)) return 0;
+    const prior = previous orelse return 1;
+    if (!score_mod.isTablebaseDecisive(prior.score)) return 1;
+    if ((prior.score < 0) != (current.score < 0)) return 1;
+    if (prior.best_move != current.best_move) return 1;
+    return if (previous_streak == std.math.maxInt(u8)) previous_streak else previous_streak + 1;
+}
+
+fn shouldStopOnTablebaseDecision(limits: time.Limits, streak: u8, previous: ?IterationTrace) bool {
+    if (!limits.hasFiniteLimit() or streak < 2) return false;
+    const prior = previous orelse return false;
+    return prior.depth >= TB_DECISION_MIN_COMPLETED_DEPTH and score_mod.isTablebaseDecisive(prior.score);
+}
+
 fn budgetStopReason(
     elapsed_ns: i128,
     projected_elapsed_ns: i128,
@@ -629,6 +676,14 @@ fn estimateNextIterationNs(iteration_elapsed_ns: i128) i128 {
 }
 
 const STABILITY_SCORE_WINDOW_CP: i32 = 80;
+const WIDER_MAX_SCORE_DROP_CP: i32 = 30;
+
+fn completedIterationArmsWiderMaximum(previous: ?IterationTrace, current: IterationTrace) bool {
+    const prior = previous orelse return false;
+    if (prior.best_move != current.best_move) return true;
+    const score_drop = @as(i64, prior.score) - @as(i64, current.score);
+    return score_drop >= WIDER_MAX_SCORE_DROP_CP;
+}
 
 fn isStableIteration(previous: ?IterationTrace, current: IterationTrace) bool {
     return isStableIterationWithPolicy(previous, current, .{});
@@ -671,6 +726,65 @@ test "iteration stability treats first completed iteration as stable enough" {
     const trace = IterationTrace{ .best_move = move_mod.Move.init(.e2, .e4, .double_push) };
     try std.testing.expect(isStableIteration(null, trace));
     try std.testing.expectEqual(@as(u8, 1), nextStableIterationStreak(0, null, trace));
+}
+
+test "tablebase decision reuse requires two matching decisive iterations" {
+    const best = move_mod.Move.init(.e2, .e4, .double_push);
+    const other = move_mod.Move.init(.d2, .d4, .double_push);
+    const loss = IterationTrace{ .score = -score_mod.TB_WIN_SCORE + 8, .best_move = best };
+    const later_loss = IterationTrace{ .score = -score_mod.TB_WIN_SCORE + 10, .best_move = best };
+
+    try std.testing.expectEqual(@as(u8, 1), nextTablebaseDecisionStreak(0, null, loss));
+    try std.testing.expectEqual(@as(u8, 2), nextTablebaseDecisionStreak(1, loss, later_loss));
+    try std.testing.expectEqual(@as(u8, 1), nextTablebaseDecisionStreak(2, later_loss, .{ .score = score_mod.TB_WIN_SCORE - 8, .best_move = best }));
+    try std.testing.expectEqual(@as(u8, 1), nextTablebaseDecisionStreak(2, later_loss, .{ .score = -score_mod.TB_WIN_SCORE + 9, .best_move = other }));
+    try std.testing.expectEqual(@as(u8, 0), nextTablebaseDecisionStreak(2, later_loss, .{ .score = score_mod.MATE_SCORE - 1, .best_move = best }));
+}
+
+test "tablebase WDL aspiration proof requires matching bound direction" {
+    const win = score_mod.TB_DECISIVE_THRESHOLD;
+    const loss = -score_mod.TB_DECISIVE_THRESHOLD;
+    try std.testing.expect(isTablebaseWdlProof(-50, 50, win));
+    try std.testing.expect(isTablebaseWdlProof(-50, 50, loss));
+    try std.testing.expect(!isTablebaseWdlProof(loss - 50, loss - 10, loss));
+    try std.testing.expect(!isTablebaseWdlProof(win + 10, win + 50, win));
+    try std.testing.expect(!isTablebaseWdlProof(-50, 50, score_mod.MATE_SCORE - 1));
+}
+
+test "tablebase decision stop requires a finite limit and completed depth floor" {
+    const best = move_mod.Move.init(.e2, .e4, .double_push);
+    const before_floor = IterationTrace{ .depth = TB_DECISION_MIN_COMPLETED_DEPTH - 1, .score = score_mod.TB_WIN_SCORE, .best_move = best };
+    const at_floor = IterationTrace{ .depth = TB_DECISION_MIN_COMPLETED_DEPTH, .score = score_mod.TB_WIN_SCORE, .best_move = best };
+    try std.testing.expect(!shouldStopOnTablebaseDecision(.{ .depth = 35 }, 2, before_floor));
+    try std.testing.expect(shouldStopOnTablebaseDecision(.{ .depth = 35 }, 2, at_floor));
+    try std.testing.expect(!shouldStopOnTablebaseDecision(.{ .infinite = true }, 2, at_floor));
+    try std.testing.expect(!shouldStopOnTablebaseDecision(.{}, 2, at_floor));
+}
+
+test "iterative deepening searches through an early TB decision to a short mate" {
+    const fen = @import("../core/fen.zig");
+    const path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return;
+    defer std.testing.allocator.free(path);
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    try std.testing.expect(engine.setSyzygyPath(path));
+    defer _ = engine.setSyzygyPath("");
+
+    const pos = try fen.parse("k7/8/1P6/K7/p1P5/1p4Q1/8/8 w - - 2 40");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    var stop_flag = std.atomic.Value(bool).init(false);
+    const result = engine.searchRawNoBook(&pos, &history, .{ .depth = 14 }, &stop_flag);
+
+    var saw_tb_decision = false;
+    for (result.diagnostics.trace[0..result.diagnostics.trace_len]) |trace| {
+        if (score_mod.isTablebaseDecisive(trace.score)) saw_tb_decision = true;
+    }
+    try std.testing.expect(saw_tb_decision);
+    try std.testing.expect(score_mod.isMateLike(result.score));
+    try std.testing.expectEqual(@as(u16, 14), result.depth);
+    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.trace_len);
 }
 
 test "engine tracks selective depth during search" {
@@ -721,6 +835,50 @@ test "maximum budget stops even unstable iterations" {
 
     try std.testing.expect(shouldStopAfterIterationWithElapsed(limits, previous, current, 40 * std.time.ns_per_ms, 10 * std.time.ns_per_ms));
     try std.testing.expectEqual(@as(?IterationStopReason, .maximum_projected), iterationStopReasonWithElapsed(limits, previous, current, 40 * std.time.ns_per_ms, 10 * std.time.ns_per_ms));
+}
+
+test "wider maximum arms only after completed instability" {
+    const e4 = move_mod.Move.init(.e2, .e4, .double_push);
+    const d4 = move_mod.Move.init(.d2, .d4, .double_push);
+    const previous = IterationTrace{ .score = 100, .best_move = e4 };
+    const stable = IterationTrace{ .score = 71, .best_move = e4 };
+    const changed = IterationTrace{ .score = 100, .best_move = d4 };
+    const dropped = IterationTrace{ .score = 70, .best_move = e4 };
+    const legacy_ns = 50 * std.time.ns_per_ms;
+    const wide_ns = 100 * std.time.ns_per_ms;
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var controller = time.Controller.init(&stop_flag, .{
+        .maximum_budget_ns = legacy_ns,
+        .wider_maximum_budget_ns = wide_ns,
+    });
+
+    // No predecessor and a stable predecessor both retain the legacy cap.
+    controller.setWiderMaximumArmed(completedIterationArmsWiderMaximum(null, stable));
+    try std.testing.expectEqual(@as(?u64, legacy_ns), controller.limits.maximum_budget_ns);
+    controller.setWiderMaximumArmed(completedIterationArmsWiderMaximum(previous, stable));
+    try std.testing.expectEqual(@as(?u64, legacy_ns), controller.limits.maximum_budget_ns);
+
+    // Either trigger arms the wider cap for the next iteration. A subsequent
+    // stable completion disarms it again.
+    controller.setWiderMaximumArmed(completedIterationArmsWiderMaximum(previous, changed));
+    try std.testing.expectEqual(@as(?u64, wide_ns), controller.limits.maximum_budget_ns);
+    controller.setWiderMaximumArmed(completedIterationArmsWiderMaximum(previous, dropped));
+    try std.testing.expectEqual(@as(?u64, wide_ns), controller.limits.maximum_budget_ns);
+    controller.setWiderMaximumArmed(completedIterationArmsWiderMaximum(previous, stable));
+    try std.testing.expectEqual(@as(?u64, legacy_ns), controller.limits.maximum_budget_ns);
+
+    // At <=1s, the planner makes the stored wide cap equal the legacy cap, so
+    // even an unstable completed trace cannot widen the deadline.
+    const low = time.GoLimits{ .wtime_ms = 1_000, .winc_ms = 100 };
+    const wide_plan = low.planWithConfig(.{}, .white, time.DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    const legacy_plan = low.planWithConfig(.{ .max_growth_pct = 50, .max_fraction_divisor = 8 }, .white, time.DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expectEqual(legacy_plan.maximum_ms, wide_plan.maximum_ms);
+    var low_controller = time.Controller.init(&stop_flag, .{
+        .maximum_budget_ns = legacy_plan.maximum_ms * std.time.ns_per_ms,
+        .wider_maximum_budget_ns = wide_plan.maximum_ms * std.time.ns_per_ms,
+    });
+    low_controller.setWiderMaximumArmed(completedIterationArmsWiderMaximum(previous, changed));
+    try std.testing.expectEqual(@as(?u64, legacy_plan.maximum_ms * std.time.ns_per_ms), low_controller.limits.maximum_budget_ns);
 }
 
 test "no budgets means no iteration stop signal" {

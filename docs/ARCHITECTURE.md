@@ -18,9 +18,10 @@ src/
   eval/           NNUE runtime (nnue768.zig), full-threat enumeration/deltas
                   (fullthreats.zig), eval backend dispatch, embedded default net
   search/         engine state, search context/stack, TT, eval cache, qsearch,
-                  root/negamax, pruning, reductions (LMR), move ordering,
+                  root/negamax, pruning, reductions (basin), move ordering,
                   history tables, SEE, repetition, PV, Syzygy probing, time
-                  management, runtime tunables
+                  management, tunables (compiled in; exposed only in
+                  `-Dtuning` builds)
   uci/            UCI protocol, options, search worker integration
   tools/          offline diagnostics: bench, stability, search/eval profiling,
                   data extraction
@@ -106,10 +107,13 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
   It gives TT-evicted positions a second chance: the TT's depth-preferred
   replacement evicts shallow entries whose static eval is still worth
   remembering.
-- **Pruning/reductions:** null-move pruning with verification search,
-  probcut, reverse futility pruning (with a prefetched hint table),
-  razoring, futility pruning, history-based pruning, SEE pruning, and
-  late-move reductions driven by a runtime-shaped table.
+- **Pruning/reductions:** interior reductions and the forward-pruning
+  families (null move with verification, reverse futility with a prefetched
+  hint table, futility, late-move and history pruning, SEE pruning) share
+  one fractional "basin" depth-dose scheme, following designs documented in
+  modern open-source engines; probcut and razoring sit alongside it. At the
+  root, post-PV moves are scouted at reduced depth and re-searched at full
+  depth on a fail-high.
 - **Extensions:** a singular-extension family, plus desperation-conditioned
   check extensions (checks extend at shallow depth always, and at any depth
   only when the static eval is at or below alpha — never while ahead, which
@@ -121,10 +125,17 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
 - **Quiescence:** captures/promotions plus SEE-gated quiet checks at the
   first qsearch ply (a direct-check generator keeps the horizon
   check-aware without a movegen pass).
+- **Node accounting:** one visited position, one node — `nodes`/`nps` are
+  honest counts.
 - **Endgames:** Syzygy WDL probing at search time via the vendored Fathom
-  prober (`SyzygyPath`).
+  prober (`SyzygyPath`). Tablebase-decided root results are proven once
+  (two agreeing completed iterations past a depth floor) and reused instead
+  of re-searched every iteration.
 - **Time management:** iteration-based budgeting with a `Move Overhead`
-  guard; the per-node clock check is throttled off the hot path.
+  guard; the hard per-move deadline extends beyond its normal ceiling only
+  for the iteration after a completed iteration that changed its best move
+  or dropped the score. The per-node clock check is throttled off the hot
+  path.
 
 Search behavior at fixed depth is bit-deterministic, which the tooling
 exploits: performance work is validated by node-identity (identical node

@@ -1,7 +1,8 @@
 # The network: data, training, and provenance
 
-zigqueen 6.0.0 ships the `zqHalfKA9` full-threats network in the engine's
-`ZQB9` container. This page records what the network is, how it was trained,
+zigqueen has shipped the `zqHalfKA9` full-threats network in the engine's
+`ZQB9` container since 6.0.0; 6.1.0 ships it unchanged. This page records
+what the network is, how it was trained,
 and what was not used to produce its weights.
 
 | | |

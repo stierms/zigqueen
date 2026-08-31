@@ -17,6 +17,7 @@ pub fn write(writer: anytype, result: *const search_engine.SearchResult, elapsed
     try writer.print("seldepth {d}\n", .{result.seldepth});
     try writer.print("score {d}\n", .{result.score});
     try writer.print("nodes {d}\n", .{result.nodes});
+    try writer.print("horizon_transitions {d}\n", .{stats.horizon_transitions});
     try writer.print("main_nodes {d}\n", .{main_nodes});
     try writer.print("qnodes {d}\n", .{stats.qnodes});
     try writer.print("qnode_ratio_permille {d}\n", .{ratioPermille(stats.qnodes, result.nodes)});

@@ -65,6 +65,7 @@ test "search profile prints search counters" {
 
     try run(&sink.writer, &pos, 2);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "qnodes ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "horizon_transitions ") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "tt_probes ") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "iteration depth 1 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "history_table_entries ") != null);

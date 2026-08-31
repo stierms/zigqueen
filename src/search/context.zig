@@ -20,8 +20,8 @@ const tt = @import("tt.zig");
 /// every diagnostic ctx.note*() body — and the record_* outcome-classification
 /// paths in the hot loops — compiles to nothing. FUNCTIONAL counters are always
 /// kept: noteNode (node count -> time management + UCI nodes/nps), noteQNode's
-/// noteNode part, observePly (seldepth -> UCI), and the stop/hard-stop control
-/// flow itself.
+/// noteNode part, noteHorizonTransition (legacy root-effort scale), observePly
+/// (seldepth -> UCI), and the stop/hard-stop control flow itself.
 pub const stats_enabled: bool = build_options.search_stats;
 
 pub const Resources = struct {
@@ -109,6 +109,20 @@ pub const SearchContext = struct {
     pub fn noteQNode(self: *SearchContext) bool {
         if (comptime stats_enabled) self.stats.qnodes += 1;
         return self.noteNode();
+    }
+
+    /// Record a main-search depth-0 entry after qsearch's sole stop/draw gate
+    /// has passed. These are exactly the entries the legacy wrapper counted a
+    /// second time; draw/stop terminals were already single-counted.
+    pub inline fn noteHorizonTransition(self: *SearchContext) void {
+        self.stats.horizon_transitions += 1;
+    }
+
+    /// Root move ordering historically consumed the double-counted subtree
+    /// total. Preserve that private effort scale so honest UCI accounting cannot
+    /// perturb the functional log2(subtree) bonus or TM node-fraction signal.
+    pub inline fn rootEffortNodes(self: *const SearchContext) u64 {
+        return self.nodes + self.stats.horizon_transitions;
     }
 
     pub fn noteMainStaticEval(self: *SearchContext) void {

@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     // Bump policy: MINOR for an accepted strength gain (each promoted baseline),
     // PATCH for fixes/tooling/perf-neutral changes, MAJOR for architecture
     // milestones. Highest version == newest.
-    const semver = "6.0.0";
+    const semver = "6.1.0";
     const version_override = b.option(
         []const u8,
         "version",
@@ -82,9 +82,19 @@ pub fn build(b: *std.Build) void {
         "Compile diagnostic search counters into the main binary (default: false).",
     ) orelse false;
 
+    // Runtime search-parameter UCI options are development-only. The release
+    // binary keeps the same compiled-in search defaults but has no SPSA
+    // setoption surface unless this flavour is requested explicitly.
+    const tuning = b.option(
+        bool,
+        "tuning",
+        "Compile runtime search-tuning UCI options (default: false).",
+    ) orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "search_stats", search_stats);
+    build_options.addOption(bool, "tuning", tuning);
     const build_options_module = build_options.createModule();
 
     const root_module = b.createModule(.{
@@ -115,6 +125,7 @@ pub fn build(b: *std.Build) void {
     const stats_options = b.addOptions();
     stats_options.addOption([]const u8, "version", version);
     stats_options.addOption(bool, "search_stats", true);
+    stats_options.addOption(bool, "tuning", tuning);
     const stats_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

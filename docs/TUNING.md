@@ -17,22 +17,23 @@ Run before any serious candidate screen (requires Zig 0.15.2 and
 - `scripts/selfplay-vs-baseline.sh` builds HEAD and a baseline ref and runs a
   fixed-game screen (default 192 games).
 - Default TC `3+0.1`; set `CONCURRENCY` to your core count.
-- Openings: `openings/real-openings-96.pgn` (or set `OPENINGS_FILE`).
+- Openings: `openings/UHO_4060_v4.epd` (or set `OPENINGS_FILE`). The UHO
+  book is White-favoured by construction; every opening is played twice
+  with colours reversed.
 - Passing the screen only earns an SPRT; it does not promote.
 
 ## Tier 1b — SPRT
 
 - `scripts/sprt-vs-baseline.sh` (wrapping `scripts/benchmark-sprt.sh`).
-- Defaults: `elo0=0`, `elo1=10`, `alpha=beta=0.05`, pentanomial
-  `model=normalized`, cap 400 paired games (`SPRT_MAX_ROUNDS=200`).
-- H1 reached: accept (subject to Tier 2). H0 reached: reject.
-- Unresolved at the cap and non-positive: reject.
-- Unresolved and positive: one extended SPRT (e.g. `SPRT_MAX_ROUNDS=1000`)
-  may be run before a final decision.
-
-Fast-TC caveat: gains that buy depth or trade speed for eval compress or
-invert at longer time controls. For ships that matter, confirm with a leg at
-a deploy-relevant TC (e.g. `60+0.6` or longer).
+- Bounds `elo0=0`, `elo1=5`, `alpha=beta=0.05`. H1 reached: accept
+  (subject to the second leg). H0 reached, or unresolved at the cap and
+  non-positive: reject.
+- Accepted changes are confirmed with a second SPRT leg at a
+  deploy-relevant TC (`60+0.6`, tablebases on) — H1 at both legs or no
+  merge. Fast-TC gains that buy depth or trade speed for eval can compress
+  or invert at longer time controls; the second leg is what catches that.
+- Time-management candidates additionally pass a fast-TC screen with an
+  any-time-loss veto.
 
 ## Tier 2 — external check
 
@@ -41,6 +42,13 @@ the periodic transfer / anti-overfit check (per release or per tuning batch,
 never per step — a few-hundred-game gauntlet has several-percentage-point
 noise). Run it from a clean tagged commit and record binaries, options, and
 results with the release.
+
+## Tuning builds
+
+Release builds expose exactly the seven documented UCI options. The runtime
+search-tuning scaffold (the SPSA knobs) exists only in builds compiled with
+`-Dtuning=true`; SPSA drivers and parameter sweeps must build with that
+flag. The compiled-in default values are identical in both flavours.
 
 ## Runtime NNUE candidates
 

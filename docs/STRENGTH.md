@@ -8,34 +8,34 @@ first listed 2026-08-01
 ([engine details](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)).
 
 The July anchored self-assessments were ~3588 for 5.8.0 and ~3590 for 5.8.3.
-The official 5.8.3 result landed about 21 Elo below its self-assessment, which
-is useful calibration context but does not turn the 6.0.0 estimate into an
-official rating.
+The official 5.8.3 result landed about 21 Elo below its self-assessment,
+useful calibration context for the estimates below.
 
+## zigqueen 6.1.0 anchored self-assessment
 
-## zigqueen 6.0.0 anchored self-assessment
+**zigqueen 6.1.0: ~3644 on the project's anchored gauntlet scale** — a
+1,620-game run against 27 CCRL-listed opponents. The per-opponent implied
+ratings have a 56-Elo standard-deviation spread; that spread is not a
+confidence interval. The estimate is slightly conservative in one known
+direction: several opponents run newer, stronger builds than their
+CCRL-listed version.
 
-**zigqueen 6.0.0: ~3602 on the project's anchored gauntlet scale** — a 1,620-game run
-against 27 CCRL-listed opponents. The per-opponent implied ratings have a
-63-Elo standard-deviation spread; that spread is not a confidence interval.
-
-The run scored **478 wins, 737 draws, and 405 losses: 846.5/1,620, or
-52.3% overall**.
-
-Relative to the published historical self-assessments, the estimate is +14
-Elo over 5.8.0 (~3588) and +12 over the listed 5.8.3 run (~3590). These are
-not strict same-condition deltas: the 6.0.0 run used the `UHO_4060_v4`
-opening book and Hash 256 MB, while the July 5.8.0 run used the 96-line suite
-and Hash 64 MB. Treat the comparison as an anchored release indicator, not a
-controlled head-to-head result.
+The run scored **583 wins, 702 draws, and 335 losses: 934/1,620, or 57.7 %
+overall** (6.0.0, same instrument: 52.3 %).
 
 ### Methodology
 
-- **Date:** 2026-08-18 to 2026-08-19
+- **Date:** 2026-08-30 to 2026-08-31
 - **Time control:** 180s + 1s increment
 - **Games:** 1,620; 60 against each of 27 opponents
-- **Openings:** `UHO_4060_v4`
-- **Hash:** 256 MB
+- **Openings:** `UHO_4060_v4`, drawn per opponent (each opponent's match
+  uses its own seeded random draw of 30 openings, each played with colours
+  reversed). Earlier gauntlets (6.0.0 and before) used Hash 64 MB and one
+  30-opening draw shared across all opponents; the 6.1.0 run uses Hash 256
+  and the per-opponent draw, so its confidence behaves better and its
+  figure starts a fresh measurement series — cross-version comparisons on
+  this table are indicative, not controlled deltas.
+- **Hash:** 256 MB; **tablebases:** Syzygy up to 6 men (zigqueen only)
 - **Anchors:** the opponents' listed CCRL Blitz ratings
 - **Estimate:** each match score is converted to an implied rating against
   its opponent's anchor, then the 27 equally sized matches are combined
@@ -45,42 +45,45 @@ controlled head-to-head result.
 Score is from zigqueen's perspective. The table is ordered by CCRL Blitz
 anchor.
 
-| Engine | Version | CCRL Blitz | W-D-L | Games | Score |
+| Engine | Version | CCRL Blitz | W-D-L | Score | Implied |
 |---|---|---:|---:|---:|---:|
-| [Stockfish](https://github.com/official-stockfish/Stockfish) | 17.1 | 3773 | 0-24-36 | 60 | 20.0% |
-| [Reckless](https://github.com/codedeliveryservice/Reckless) | 0.9.0 | 3767 | 0-25-35 | 60 | 20.8% |
-| [Viridithas](https://github.com/cosmobobak/viridithas) | 20.0.0 | 3751 | 1-26-33 | 60 | 23.3% |
-| [Stormphrax](https://github.com/Ciekce/Stormphrax) | 8.0.0 | 3747 | 1-27-32 | 60 | 24.2% |
-| [Hobbes](https://github.com/kelseyde/hobbes-chess-engine) | 2.1 | 3726 | 3-23-34 | 60 | 24.2% |
-| [Renegade](https://github.com/pkrisz99/Renegade) | 1.3.0 | 3698 | 4-29-27 | 60 | 30.8% |
-| [Starzix](https://github.com/zzzzz151/Starzix) | 6.0 | 3692 | 5-28-27 | 60 | 31.7% |
-| [Heimdall](https://github.com/nocturn9x/heimdall) | 1.4.3 | 3662 | 9-25-26 | 60 | 35.8% |
-| [Velvet](https://github.com/mhonert/velvet-chess) | 8.1.1 | 3650 | 9-36-15 | 60 | 45.0% |
-| [Minke](https://github.com/enfmarinho/Minke) | 6.0.0 | 3595 | 18-28-14 | 60 | 53.3% |
-| [Eleanor](https://github.com/rektdie/Eleanor) | 4.1 | 3587 | 21-23-16 | 60 | 54.2% |
-| [Turbulence](https://github.com/ksw0518/Turbulence_v4) | 0.0.8 | 3580 | 11-34-15 | 60 | 46.7% |
-| [akimbo](https://github.com/jw1912/akimbo) | 1.0.0 | 3569 | 20-29-11 | 60 | 57.5% |
-| [Serendipity](https://github.com/xu-shawn/Serendipity) | 1.0 | 3550 | 16-29-15 | 60 | 50.8% |
-| [Patricia](https://github.com/Adam-Kulju/Patricia) | 5.0 | 3540 | 13-33-14 | 60 | 49.2% |
-| [Yukari](https://github.com/yukarichess/yukari) | 2025.11.1 | 3537 | 21-33-6 | 60 | 62.5% |
-| [Willow](https://github.com/Adam-Kulju/Willow) | 4.0 | 3533 | 42-18-0 | 60 | 85.0% |
-| [Lunar](https://github.com/Synthetica9/lunar) | 0.4.0 | 3516 | 21-30-9 | 60 | 60.0% |
-| [Lambergar](https://github.com/jabolcni/Lambergar) | 1.5 | 3509 | 31-23-6 | 60 | 70.8% |
-| [Schoenemann](https://github.com/Jochengehtab/Schoenemann) | 0.5.0 | 3506 | 29-27-4 | 60 | 70.8% |
-| [Oxide](https://github.com/Miguevrgo/Oxide) | 2.0.0 | 3493 | 24-32-4 | 60 | 66.7% |
-| [Leorik](https://github.com/lithander/Leorik) | 3.2.1 | 3491 | 29-26-5 | 60 | 70.0% |
-| [Tucano](https://github.com/alcides-schulz/Tucano) | 12.00 | 3489 | 28-26-6 | 60 | 68.3% |
-| [Celeris](https://github.com/Hin-Yu-Evan-Fung/Celeris) | 2.0 | 3482 | 30-28-2 | 60 | 73.3% |
-| [Prelude](https://github.com/Quinniboi10/Prelude) | 2.1 | 3465 | 27-26-7 | 60 | 66.7% |
-| [Arcanum](https://github.com/LarsAur/Arcanum) | 2.8 | 3465 | 33-22-5 | 60 | 73.3% |
-| [Saturn](https://github.com/egormoroz/saturn) | 1.3 | 3453 | 32-27-1 | 60 | 75.8% |
+| [Stockfish](https://github.com/official-stockfish/Stockfish) | 17.1 | 3773 | 0-27-33 | 22.5% | 3558 |
+| [Reckless](https://github.com/codedeliveryservice/Reckless) | 0.9.0 | 3767 | 0-27-33 | 22.5% | 3552 |
+| [Viridithas](https://github.com/cosmobobak/viridithas) | 20.0.0 | 3751 | 3-27-30 | 27.5% | 3583 |
+| [Stormphrax](https://github.com/Ciekce/Stormphrax) | 8.0.0 | 3747 | 2-26-32 | 25.0% | 3556 |
+| [Hobbes](https://github.com/kelseyde/hobbes-chess-engine) | 2.1 | 3726 | 6-22-32 | 28.3% | 3565 |
+| [Renegade](https://github.com/pkrisz99/Renegade) | 1.3.0 | 3698 | 5-32-23 | 35.0% | 3590 |
+| [Starzix](https://github.com/zzzzz151/Starzix) | 6.0 | 3692 | 10-31-19 | 42.5% | 3640 |
+| [Heimdall](https://github.com/nocturn9x/heimdall) | 1.4.3 | 3662 | 16-28-16 | 50.0% | 3662 |
+| [Velvet](https://github.com/mhonert/velvet-chess) | 8.1.1 | 3650 | 18-25-17 | 50.8% | 3656 |
+| [Minke](https://github.com/enfmarinho/Minke) | 6.0.0 | 3595 | 21-26-13 | 56.7% | 3642 |
+| [Eleanor](https://github.com/rektdie/Eleanor) | 4.1 | 3587 | 23-27-10 | 60.8% | 3664 |
+| [Turbulence](https://github.com/ksw0518/Turbulence_v4) | 0.0.8 | 3580 | 21-29-10 | 59.2% | 3644 |
+| [akimbo](https://github.com/jw1912/akimbo) | 1.0.0 | 3569 | 24-29-7 | 64.2% | 3670 |
+| [Serendipity](https://github.com/xu-shawn/Serendipity) | 1.0 | 3550 | 19-36-5 | 61.7% | 3633 |
+| [Patricia](https://github.com/Adam-Kulju/Patricia) | 5.0 | 3540 | 27-22-11 | 63.3% | 3635 |
+| [Yukari](https://github.com/yukarichess/yukari) | 2025.11.1 | 3537 | 28-26-6 | 68.3% | 3671 |
+| [Willow](https://github.com/Adam-Kulju/Willow) | 4.0 | 3533 | 41-17-2 | 82.5% | 3802 |
+| [Lunar](https://github.com/Synthetica9/lunar) | 0.4.0 | 3516 | 28-27-5 | 69.2% | 3656 |
+| [Lambergar](https://github.com/jabolcni/Lambergar) | 1.5 | 3509 | 28-26-6 | 68.3% | 3643 |
+| [Schoenemann](https://github.com/Jochengehtab/Schoenemann) | 0.5.0 | 3506 | 34-22-4 | 75.0% | 3697 |
+| [Oxide](https://github.com/Miguevrgo/Oxide) | 2.0.0 | 3493 | 34-22-4 | 75.0% | 3684 |
+| [Leorik](https://github.com/lithander/Leorik) | 3.2.1 | 3491 | 29-27-4 | 70.8% | 3645 |
+| [Tucano](https://github.com/alcides-schulz/Tucano) | 12.00 | 3489 | 29-27-4 | 70.8% | 3643 |
+| [Celeris](https://github.com/Hin-Yu-Evan-Fung/Celeris) | 2.0 | 3482 | 32-27-1 | 75.8% | 3681 |
+| [Arcanum](https://github.com/LarsAur/Arcanum) | 2.8 | 3465 | 41-18-1 | 83.3% | 3745 |
+| [Prelude](https://github.com/Quinniboi10/Prelude) | 2.1 | 3465 | 28-26-6 | 68.3% | 3599 |
+| [Saturn](https://github.com/egormoroz/saturn) | 1.3 | 3453 | 36-23-1 | 79.2% | 3685 |
 
 Heimdall's primary home is
 [git.nocturn9x.space/heimdall-engine/heimdall](https://git.nocturn9x.space/heimdall-engine/heimdall);
 the GitHub link above is the author's official mirror.
 
-## Acknowledgments
+## Historical self-assessments
 
-Thanks to the authors of every engine in the roster. These were private test
-matches, not endorsements or affiliations; the links above credit the work
-that makes a meaningful external strength check possible.
+| Version | Estimate | Run |
+|---|---|---|
+| 6.1.0 | ~3644 | 1,620 games, Hash 256, per-opponent openings, 2026-08-30/31 |
+| 6.0.0 | ~3602 | 1,620 games, Hash 64, shared openings, 2026-08-18/19 |
+| 5.8.3 | ~3590 | 1,620 games, Hash 64, shared openings, 2026-07-26 |
+| 5.8.0 | ~3588 | 1,620 games, Hash 64, shared openings, 2026-07-19 |

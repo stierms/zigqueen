@@ -23,6 +23,11 @@ const LOW_TIME_DIVISOR: u64 = 32;
 ///
 /// Spend-level knob (r2): ZQ_TM_OPT_PCT — uniform percent scale on the soft
 /// (optimum) budget; DEFAULT 130 (shipped); 100 = legacy v5.8.3 spend.
+///
+/// Hard-budget shape (r6 lane 1): ZQ_TM_MAX_GROWTH_PCT / ZQ_TM_MAX_FRAC_DIV —
+/// instability-armed burst headroom on the sudden-death maximum; DEFAULT
+/// 300 / 6 (was 50 / 8). Set 50 / 8 to recover the pre-r6 1.5x ceiling
+/// bit-for-bit.
 pub const TmConfig = struct {
     /// ZQ_TM_CLAMP: fix the budget-exceeds-clock defect (see above).
     clamp_fix: bool = false,
@@ -39,6 +44,32 @@ pub const TmConfig = struct {
     /// anywhere; the only surviving mechanism of TM arc r1/r2. Set
     /// ZQ_TM_OPT_PCT=100 to recover legacy spend exactly.
     opt_pct: u32 = 130,
+
+    /// ZQ_TM_MAX_GROWTH_PCT / ZQ_TM_MAX_FRAC_DIV (r6 lane 1, burst headroom):
+    /// the HARD (maximum) sudden-death budget as a percentage of the soft one
+    /// and as a fraction of the remaining clock:
+    ///   maximum = min(optimum + max(optimum*growth/100, inc/2),
+    ///                 remaining/frac_div + inc/2,
+    ///                 hard_cap)
+    /// The head shipped 50 / 8, i.e. a hard budget of exactly 1.5x the soft one:
+    /// the binary instability gate (best move changed OR |dscore| >= 80cp) makes
+    /// the search keep going, and it then hits that ceiling. Measured on 178
+    /// replayed r3 gauntlet games (12,973 of our moves, warm TT, simulated
+    /// 20+0.2 clock, r6 lane 1): the 1.5x ceiling BINDS on 14.3% of moves, and
+    /// on 11.4% the last completed iteration had just changed its best move or
+    /// lost >= 30cp — the search wanted more depth exactly where the position
+    /// was moving. Field reference (r3 gauntlet, 121,100 of our moves at 180+1,
+    /// past the book): burst capacity t/(remaining/20 + inc) p99 1.42x, max
+    /// 1.65x, 0.000% of moves above 2x, while every top-5 opponent bursts to
+    /// p99 3-4x on 3-5% of moves.
+    /// 300 / 6 gives an effective ceiling of ~2.5-3.1x the soft budget (the
+    /// clock fraction binds first, and it tightens as the clock runs down, so
+    /// the burst shrinks in time trouble). The Controller starts at the legacy
+    /// 50 / 8 ceiling and the ID loop arms this value only for the iteration
+    /// after a completed best-move change or >=30cp score drop. Set 50 / 8 to
+    /// recover the head's budgets bit-for-bit.
+    max_growth_pct: u32 = 300,
+    max_fraction_divisor: u32 = 6,
 
     /// ZQ_TM_PHASE: enable the game-phase ramp. The soft (optimum) budget is
     /// multiplied by a hyperbolic decay over the full-move clock m:
@@ -105,6 +136,8 @@ pub fn loadTmConfigFromEnv() TmConfig {
     var cfg = TmConfig{};
     cfg.clamp_fix = envFlag(a, "ZQ_TM_CLAMP") orelse cfg.clamp_fix;
     cfg.opt_pct = envU32(a, "ZQ_TM_OPT_PCT") orelse cfg.opt_pct;
+    cfg.max_growth_pct = envU32(a, "ZQ_TM_MAX_GROWTH_PCT") orelse cfg.max_growth_pct;
+    cfg.max_fraction_divisor = envU32(a, "ZQ_TM_MAX_FRAC_DIV") orelse cfg.max_fraction_divisor;
     cfg.phase = envFlag(a, "ZQ_TM_PHASE") orelse cfg.phase;
     cfg.phase_max_pct = envU32(a, "ZQ_TM_PHASE_MAX_PCT") orelse cfg.phase_max_pct;
     cfg.phase_min_pct = envU32(a, "ZQ_TM_PHASE_MIN_PCT") orelse cfg.phase_min_pct;
@@ -155,7 +188,21 @@ pub const Limits = struct {
     depth: ?u16 = null,
     node_limit: ?u64 = null,
     optimum_budget_ns: ?u64 = null,
+    /// Live Controller deadline. Sudden-death clock searches start with the
+    /// legacy 50/8 ceiling; the engine may replace it with the stored wider
+    /// ceiling only after a completed unstable iteration.
     maximum_budget_ns: ?u64 = null,
+    wider_maximum_budget_ns: ?u64 = null,
+    /// Preserve the UCI `go infinite` intent after GoLimits is converted so
+    /// search policy cannot treat the request like a finite depth-64 search.
+    infinite: bool = false,
+
+    pub fn hasFiniteLimit(self: Limits) bool {
+        return !self.infinite and (self.depth != null or
+            self.node_limit != null or
+            self.optimum_budget_ns != null or
+            self.maximum_budget_ns != null);
+    }
 };
 
 pub const GoLimits = struct {
@@ -218,11 +265,25 @@ pub const GoLimits = struct {
         var limits = Limits{
             .depth = self.depth,
             .node_limit = self.node_limit,
+            .infinite = self.infinite,
         };
 
-        if (self.plan(side, move_overhead_ms, fullmove_number)) |timing| {
+        const cfg = tmConfig();
+        if (self.planWithConfig(cfg, side, move_overhead_ms, fullmove_number)) |timing| {
             limits.optimum_budget_ns = timing.optimum_ms * std.time.ns_per_ms;
             limits.maximum_budget_ns = timing.maximum_ms * std.time.ns_per_ms;
+
+            // Fixed movetime and moves-to-go retain their single deadline.
+            // Only sudden-death clock searches store a second, instability-
+            // armed ceiling; their live Controller deadline starts at 50/8.
+            if (self.movetime_ms == null and self.movestogo == null) {
+                var legacy_cfg = cfg;
+                legacy_cfg.max_growth_pct = 50;
+                legacy_cfg.max_fraction_divisor = 8;
+                const legacy = self.planWithConfig(legacy_cfg, side, move_overhead_ms, fullmove_number).?;
+                limits.maximum_budget_ns = legacy.maximum_ms * std.time.ns_per_ms;
+                limits.wider_maximum_budget_ns = timing.maximum_ms * std.time.ns_per_ms;
+            }
         }
 
         return limits;
@@ -302,8 +363,12 @@ fn planSuddenDeath(cfg: TmConfig, remaining: u64, increment: u64, move_overhead_
         optimum_ms = @min(optimum_ms, emergency_cap);
     }
 
-    const growth_margin = @max(@as(u64, 1), @max(optimum_ms / 2, increment / 2));
-    const fraction_cap = @max(@as(u64, 1), safe_remaining / 8 + increment / 2);
+    // Burst headroom applies only while there is a clock to burst from; inside
+    // the low-time regime the legacy 1.5x ceiling stands (safety clamps win).
+    const growth_pct: u64 = if (remaining <= LOW_TIME_THRESHOLD_MS) 50 else cfg.max_growth_pct;
+    const fraction_divisor: u64 = if (remaining <= LOW_TIME_THRESHOLD_MS) 8 else @max(@as(u64, 1), cfg.max_fraction_divisor);
+    const growth_margin = @max(@as(u64, 1), @max(optimum_ms * growth_pct / 100, increment / 2));
+    const fraction_cap = @max(@as(u64, 1), safe_remaining / fraction_divisor + increment / 2);
     var maximum_ms = optimum_ms + growth_margin;
     maximum_ms = @min(maximum_ms, fraction_cap);
     maximum_ms = @min(maximum_ms, hard_cap);
@@ -379,14 +444,26 @@ pub const StopNowReason = enum {
 pub const Controller = struct {
     stop_flag: *const std.atomic.Value(bool),
     limits: Limits,
+    legacy_maximum_budget_ns: ?u64 = null,
     timer: ?std.time.Timer = null,
 
     pub fn init(stop_flag: *const std.atomic.Value(bool), limits: Limits) Controller {
         return .{
             .stop_flag = stop_flag,
             .limits = limits,
+            .legacy_maximum_budget_ns = limits.maximum_budget_ns,
             .timer = std.time.Timer.start() catch null,
         };
+    }
+
+    /// Select the deadline for the next iteration. The engine calls this only
+    /// after a completed iteration, so an unfinished iteration can never arm
+    /// its own extra headroom.
+    pub fn setWiderMaximumArmed(self: *Controller, armed: bool) void {
+        self.limits.maximum_budget_ns = if (armed)
+            self.limits.wider_maximum_budget_ns orelse self.legacy_maximum_budget_ns
+        else
+            self.legacy_maximum_budget_ns;
     }
 
     pub fn elapsedNs(self: *Controller) u64 {
@@ -427,7 +504,10 @@ test "opt_pct: default ships 130, 100 recovers legacy exactly" {
     const legacy = base.planWithConfig(.{ .opt_pct = 100 }, .white, 20, 10).?;
     const at130 = base.planWithConfig(.{ .opt_pct = 130 }, .white, 20, 10).?;
     try std.testing.expectEqual(legacy.optimum_ms * 130 / 100, at130.optimum_ms);
-    try std.testing.expect(at130.maximum_ms > legacy.maximum_ms);
+    // r6 lane 1: at a comfortable clock the hard budget is the clock fraction,
+    // not an optimum multiple, so the spend level no longer moves the ceiling.
+    try std.testing.expect(at130.maximum_ms >= legacy.maximum_ms);
+    try std.testing.expect(at130.maximum_ms >= at130.optimum_ms * 5 / 2);
 
     // The shipped default IS 130.
     const default_plan = base.planWithConfig(.{}, .white, 20, 10).?;
@@ -450,7 +530,49 @@ test "go limits compute sudden-death plan with wider hard headroom" {
 
     const plan = limits.planWithConfig(.{ .opt_pct = 100 }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
     try std.testing.expectEqual(@as(u64, 1_499), plan.optimum_ms);
-    try std.testing.expectEqual(@as(u64, 2_248), plan.maximum_ms);
+    // 29_980/6 + 500: the clock fraction binds before the 4x optimum multiple.
+    try std.testing.expectEqual(@as(u64, 5_496), plan.maximum_ms);
+
+    // 50 / 8 recovers the pre-r6 ceiling (optimum + optimum/2) exactly.
+    const legacy_ceiling = TmConfig{ .opt_pct = 100, .max_growth_pct = 50, .max_fraction_divisor = 8 };
+    const legacy = limits.planWithConfig(legacy_ceiling, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expectEqual(@as(u64, 1_499), legacy.optimum_ms);
+    try std.testing.expectEqual(@as(u64, 2_248), legacy.maximum_ms);
+}
+
+test "burst headroom stays inside the clock and stands down in time trouble" {
+    // Comfortable clock: the hard budget is 2-4x the soft one, never more than
+    // the remaining/6 fraction and never past the remaining-clock hard cap.
+    const cases = [_]GoLimits{
+        .{ .wtime_ms = 180_000, .winc_ms = 1_000 },
+        .{ .wtime_ms = 60_000, .winc_ms = 600 },
+        .{ .wtime_ms = 20_000, .winc_ms = 200 },
+        .{ .wtime_ms = 8_000, .winc_ms = 80 },
+        .{ .wtime_ms = 3_000, .winc_ms = 100 },
+        .{ .wtime_ms = 30_000, .winc_ms = 0 },
+    };
+    for (cases) |limits| {
+        const plan = limits.planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 20).?;
+        const remaining = limits.wtime_ms.?;
+        const safe = remaining - DEFAULT_MOVE_OVERHEAD_MS;
+        try std.testing.expect(plan.maximum_ms >= plan.optimum_ms * 2);
+        try std.testing.expect(plan.maximum_ms <= plan.optimum_ms * 4);
+        try std.testing.expect(plan.maximum_ms <= safe / 6 + limits.winc_ms / 2);
+        try std.testing.expect(plan.maximum_ms <= safe);
+    }
+
+    // Low-time regime (<= 1s left): the legacy 1.5x ceiling still applies, so
+    // the scramble behaviour is bit-identical to the head (values pinned).
+    const scramble = [_]struct { limits: GoLimits, optimum: u64, maximum: u64 }{
+        .{ .limits = .{ .wtime_ms = 1_000, .winc_ms = 100 }, .optimum = 71, .maximum = 121 },
+        .{ .limits = .{ .wtime_ms = 500, .winc_ms = 50 }, .optimum = 35, .maximum = 60 },
+        .{ .limits = .{ .wtime_ms = 100, .winc_ms = 1_000 }, .optimum = 255, .maximum = 255 },
+    };
+    for (scramble) |case| {
+        const plan = case.limits.planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 60).?;
+        try std.testing.expectEqual(case.optimum, plan.optimum_ms);
+        try std.testing.expectEqual(case.maximum, plan.maximum_ms);
+    }
 }
 
 test "go limits compute moves-to-go plan with wider hard headroom" {
@@ -582,20 +704,21 @@ test "phase ramp scales sudden-death optimum by game progress" {
         .winc_ms = 1_000,
     };
 
-    // Move 1: 140% of the base 1499ms optimum.
+    // Move 1: 140% of the base 1499ms optimum. The hard budget is the
+    // remaining/6 clock fraction (5_496ms) for every phase here.
     const early = limits.planWithConfig(cfg, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
     try std.testing.expectEqual(@as(u64, 2_098), early.optimum_ms);
-    try std.testing.expectEqual(@as(u64, 3_147), early.maximum_ms);
+    try std.testing.expectEqual(@as(u64, 5_496), early.maximum_ms);
 
     // Move 49: neutral crossing — identical to the un-ramped plan.
     const neutral = limits.planWithConfig(cfg, .white, DEFAULT_MOVE_OVERHEAD_MS, 49).?;
     try std.testing.expectEqual(@as(u64, 1_499), neutral.optimum_ms);
-    try std.testing.expectEqual(@as(u64, 2_248), neutral.maximum_ms);
+    try std.testing.expectEqual(@as(u64, 5_496), neutral.maximum_ms);
 
     // Move 200: late game shrinks toward the floor.
     const late = limits.planWithConfig(cfg, .white, DEFAULT_MOVE_OVERHEAD_MS, 200).?;
     try std.testing.expectEqual(@as(u64, 1_289), late.optimum_ms);
-    try std.testing.expectEqual(@as(u64, 1_933), late.maximum_ms);
+    try std.testing.expectEqual(@as(u64, 5_156), late.maximum_ms);
 }
 
 test "phase ramp never overrides the low-time emergency cap" {
@@ -635,11 +758,15 @@ test "phase ramp off is bit-identical across the full-move clock" {
     }
 }
 
-test "tm config defaults keep every mechanism off" {
+test "tm config defaults keep every signal mechanism off" {
     const cfg = TmConfig{};
     try std.testing.expect(!cfg.clamp_fix);
     try std.testing.expect(!cfg.phase);
     try std.testing.expect(!cfg.signalsEnabled());
+    // Shipped levels: r2 spend 130, r6 burst headroom 300/6.
+    try std.testing.expectEqual(@as(u32, 130), cfg.opt_pct);
+    try std.testing.expectEqual(@as(u32, 300), cfg.max_growth_pct);
+    try std.testing.expectEqual(@as(u32, 6), cfg.max_fraction_divisor);
 }
 
 test "signal scale is neutral with no signal enabled" {
@@ -726,4 +853,10 @@ test "go limit conversion carries node limits and deadlines" {
     try std.testing.expectEqual(@as(?u64, 128), converted.node_limit);
     try std.testing.expect(converted.optimum_budget_ns != null);
     try std.testing.expect(converted.maximum_budget_ns != null);
+}
+
+test "go infinite remains marked as unlimited after conversion" {
+    const converted = (GoLimits{ .infinite = true }).toControllerLimits(.white, DEFAULT_MOVE_OVERHEAD_MS, 1);
+    try std.testing.expect(converted.infinite);
+    try std.testing.expect(!converted.hasFiniteLimit());
 }

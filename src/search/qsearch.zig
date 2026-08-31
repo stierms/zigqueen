@@ -7,6 +7,7 @@ const make_unmake = @import("../movegen/make_unmake.zig");
 const move_mod = @import("../core/move.zig");
 const ordering = @import("ordering.zig");
 const piece_values = @import("../core/piece_values.zig");
+const ply_limit = @import("ply_limit.zig");
 const position = @import("../core/position.zig");
 const score_mod = @import("score.zig");
 const see = @import("see.zig");
@@ -30,7 +31,22 @@ pub fn search(
     ply: usize,
     in_check_hint: ?bool,
 ) types.Score {
-    return searchDepth(ctx, resources, pos, alpha_in, beta, ply, 0, in_check_hint);
+    return searchDepth(ctx, resources, pos, alpha_in, beta, ply, 0, in_check_hint, false);
+}
+
+/// Enter qsearch through a transparent depth-0 negamax wrapper. Qsearch still
+/// owns the position's one node count and stop/draw gate; only a position that
+/// passes that gate records a removed legacy duplicate count.
+pub fn searchFromHorizon(
+    ctx: *context_mod.SearchContext,
+    resources: context_mod.Resources,
+    pos: *position.Position,
+    alpha_in: types.Score,
+    beta: types.Score,
+    ply: usize,
+    in_check_hint: ?bool,
+) types.Score {
+    return searchDepth(ctx, resources, pos, alpha_in, beta, ply, 0, in_check_hint, true);
 }
 
 fn searchDepth(
@@ -42,10 +58,13 @@ fn searchDepth(
     ply: usize,
     qs_depth: u8,
     in_check_hint: ?bool,
+    comptime from_horizon: bool,
 ) types.Score {
     if (ctx.noteQNode()) return 0;
     ctx.observePly(ply);
     if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
+    if (from_horizon) ctx.noteHorizonTransition();
+    if (ply_limit.fallback(ctx, resources.evaluator, pos, ply, in_check_hint)) |score| return score;
 
     const alpha_orig = alpha_in;
     // Out-pointer probe — same store-forward-stall fix as negamax (see the
@@ -89,7 +108,7 @@ fn searchDepth(
         stand_pat = eval_score;
         if (eval_score >= beta_local) {
             ctx.noteQsearchStandPatCutoff();
-            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, null, tt_store.evalToTt(stand_pat));
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, null, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
             return beta_local;
         }
     }
@@ -105,7 +124,7 @@ fn searchDepth(
         if (in_check) return -MATE_SCORE + @as(types.Score, @intCast(ply));
         if (stand_pat) |static_eval| {
             const best_static = @max(alpha, static_eval);
-            tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best_static, null, tt_store.evalToTt(stand_pat));
+            tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best_static, null, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
             return best_static;
         }
         return alpha;
@@ -156,7 +175,7 @@ fn searchDepth(
         // Lazy accumulator: record the move only — boards/undo-state are
         // reconstructed at materialization time from the live position.
         resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
-        const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null);
+        const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null, false);
         ctx.repetition.pop();
         make_unmake.unmakeMove(pos, mv, &entry.state);
 
@@ -164,7 +183,7 @@ fn searchDepth(
         if (score >= beta_local) {
             ctx.noteBetaCutoff(index);
             if (is_capture and !is_promotion) ctx.noteCaptureCutoff(index, capture_see_score, true);
-            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat));
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
             return beta_local;
         }
         if (score > best) {
@@ -186,12 +205,12 @@ fn searchDepth(
             resources.tt.prefetch(child_key);
             ctx.repetition.push(child_key);
             resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
-            const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null);
+            const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null, false);
             ctx.repetition.pop();
             make_unmake.unmakeMove(pos, mv, &entry.state);
             if (ctx.stopped) return 0;
             if (score >= beta_local) {
-                tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat));
+                tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
                 return beta_local;
             }
             if (score > best) {
@@ -201,7 +220,7 @@ fn searchDepth(
         }
     }
 
-    tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best, best_move, tt_store.evalToTt(stand_pat));
+    tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best, best_move, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
     return best;
 }
 
@@ -303,4 +322,37 @@ test "qsearch stores shallow tt best move when tactical move exists" {
 
     _ = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, 0, null);
     try std.testing.expect(table.bestMove(pos.zobrist_key) != null);
+}
+
+test "qsearch caps a deep repetition-free capture line before stack overflow" {
+    const fen = @import("../core/fen.zig");
+    const history = @import("history.zig");
+    const rfp_hint = @import("rfp_hint.zig");
+    const tt = @import("tt.zig");
+
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var context = context_mod.SearchContext{
+        .repetition = .{},
+        .control = @import("time.zig").Controller.init(&stop_flag, .{}),
+    };
+    var history_table = history.HistoryTable{};
+    // The test targets recursion/stack bounds; a model-less backend makes every
+    // nonterminal cap fallback exactly zero without needing a synthetic 123-ply
+    // accumulator path.
+    var evaluator = @import("../eval/backend.zig").EngineState{ .allocator = std.testing.allocator };
+    var table = try tt.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hint_table = try rfp_hint.HintTable.init(std.testing.allocator, rfp_hint.MIN_HINT_MB);
+    defer hint_table.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+    // The natural qsearch line e4xd5 e6xd5 Nc3xd5 Nf6xd5 Qd1xd5 is
+    // repetition-free and would reach ply 128 when qsearch starts at ply 123.
+    var pos = try fen.parse("6k1/8/4pn2/3p4/4P3/2N5/8/3Q2K1 w - - 0 1");
+    context.repetition.push(pos.zobrist_key);
+
+    const start_ply = ply_limit.START - 1;
+    _ = search(&context, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, -INF, INF, start_ply, null);
+    try std.testing.expect(!context.stopped);
+    try std.testing.expectEqual(@as(u16, @intCast(ply_limit.START)), context.seldepth);
 }
