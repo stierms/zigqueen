@@ -118,10 +118,10 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
   check extensions (checks extend at shallow depth always, and at any depth
   only when the static eval is at or below alpha — never while ahead, which
   keeps the branching factor position-aware).
-- **Move ordering:** TT move first (staged generation at depth 1 avoids
-  generating the full move list when the TT move cuts), captures by SEE,
-  killers, countermove, main history, continuation history; correction
-  history refines the static eval.
+- **Move ordering:** TT move first, captures by SEE, killers, countermove,
+  main history, continuation history. Correction history is implemented but
+  parked in this release (its tables are not allocated, so the static eval is
+  used uncorrected).
 - **Quiescence:** captures/promotions plus SEE-gated quiet checks at the
   first qsearch ply (a direct-check generator keeps the horizon
   check-aware without a movegen pass).

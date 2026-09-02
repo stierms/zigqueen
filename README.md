@@ -52,8 +52,8 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
   dedicated 2-way eval cache
 - null move with verification, probcut, singular extensions,
   desperation-conditioned check extensions
-- killer/countermove/main/continuation/correction history; staged
-  TT-move-first generation at depth 1
+- killer/countermove/main/continuation history (correction history is
+  implemented but parked: its tables are not allocated in this release)
 - honest node accounting: one visited position, one node
 - Syzygy WDL probing via Fathom; tablebase-decided root results are proven
   once and reused instead of re-searched every iteration
