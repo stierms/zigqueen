@@ -210,7 +210,7 @@ fn playOneGame(
             continue :opening;
         }
 
-        first_search = engine.searchRawNoBook(&pos, &history, limits, &stop_flag);
+        first_search = engine.search(&pos, &history, limits, &stop_flag);
         const white_pov = whitePov(first_search.score, pos.side_to_move);
         if (white_pov > OPENING_MAX_ABS_CP or white_pov < -OPENING_MAX_ABS_CP) {
             discards += 1;
@@ -245,7 +245,7 @@ fn playOneGame(
             const search_result = if (pending_first) |first| blk: {
                 pending_first = null;
                 break :blk first;
-            } else engine.searchRawNoBook(&pos, &history, limits, &stop_flag);
+            } else engine.search(&pos, &history, limits, &stop_flag);
             const best_move = search_result.best_move orelse return error.SearchReturnedNoMove;
             const white_pov = whitePov(search_result.score, pos.side_to_move);
 

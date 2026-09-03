@@ -9,7 +9,7 @@ android {
         minSdk 21
         targetSdk 35
         versionCode 600
-        versionName "6.1.0"
+        versionName "6.1.1"
     }
 
     flavorDimensions = ["variant"]
@@ -17,12 +17,12 @@ android {
         generic {
             dimension "variant"
             applicationIdSuffix ".generic"
-            manifestPlaceholders = [appLabel: "zigqueen 6.1.0"]
+            manifestPlaceholders = [appLabel: "zigqueen 6.1.1"]
         }
         dotprod {
             dimension "variant"
             applicationIdSuffix ".dotprod"
-            manifestPlaceholders = [appLabel: "zigqueen 6.1.0 dotprod"]
+            manifestPlaceholders = [appLabel: "zigqueen 6.1.1 dotprod"]
         }
     }
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <enginelist>
     <engine
-        name="zigqueen 6.1.0 dotprod"
+        name="zigqueen 6.1.1 dotprod"
         filename="libzigqueen.so"
         target="arm64-v8a" />
 </enginelist>

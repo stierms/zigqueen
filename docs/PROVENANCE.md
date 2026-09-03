@@ -156,7 +156,8 @@ values for SEE are the textbook 100/320/330/500/900. None of these were taken fr
   here, we say so and replace it (§1).
 - Six opening-book root moves (`src/search/opening_book.zig`, present from the first public release 5.8.0 through
   6.1.0) were chosen with Stockfish analysis of a test opening set. Engine output is not licensed material; we mention
-  it because our rules say other engines are opponents, not oracles. The file is removed in the next release.
+  it because our rules say other engines are opponents, not oracles. Removed in 6.1.1, which is 6.1.0 without those
+  entries and otherwise identical.
 
 ## 8. Repository structure and git history
 
@@ -187,5 +188,5 @@ where a license requires it, or by correcting the attribution where a license pe
 - 2026-09 — first version: Stormphrax parameter-set disclosure (§1); ODbL notice and the full training-data component
   list added to `docs/NETWORK.md`; `THIRD_PARTY_LICENSES.md` added and packaged; Fathom relabelled MIT (was "BSD" in two
   comments) and its two local modifications documented; README/ARCHITECTURE corrected on correction history (parked,
-  not live) and on the origin of the six opening-book moves (removed for the next release); `CLEAN_ROOM_RULES.md`
-  renamed to `ORIGINALITY.md` and reworded to what was done.
+  not live) and on the origin of the six opening-book moves (removed in 6.1.1); `CLEAN_ROOM_RULES.md` renamed to
+  `ORIGINALITY.md` and reworded to what was done; training-data sources and labels corrected (§4).

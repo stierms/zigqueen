@@ -20,7 +20,6 @@ const tt = @import("tt.zig");
 const history_mod = @import("history.zig");
 const legal = @import("../movegen/legal.zig");
 const make_unmake = @import("../movegen/make_unmake.zig");
-const opening_book = @import("opening_book.zig");
 const basin = @import("basin.zig");
 
 pub const MAX_TRACE: usize = 64;
@@ -74,11 +73,6 @@ pub const SearchResult = struct {
 pub const EvalOptions = eval_backend.Options;
 /// Re-exported so the CLI fallback (main.zig) shares the one source of truth.
 pub const default_nnue_scale_percent = eval_backend.builtin_nnue_scale_percent;
-
-pub const OpeningBookPolicy = enum {
-    use_book,
-    skip_book,
-};
 
 pub const Engine = struct {
     tt: tt.TranspositionTable,
@@ -208,27 +202,6 @@ pub const Engine = struct {
         limits: time.Limits,
         stop_flag: *const std.atomic.Value(bool),
     ) SearchResult {
-        return self.searchWithOpeningBookPolicy(pos, root_history, limits, stop_flag, .use_book);
-    }
-
-    pub fn searchRawNoBook(
-        self: *Engine,
-        pos: *const position.Position,
-        root_history: *const repetition.History,
-        limits: time.Limits,
-        stop_flag: *const std.atomic.Value(bool),
-    ) SearchResult {
-        return self.searchWithOpeningBookPolicy(pos, root_history, limits, stop_flag, .skip_book);
-    }
-
-    fn searchWithOpeningBookPolicy(
-        self: *Engine,
-        pos: *const position.Position,
-        root_history: *const repetition.History,
-        limits: time.Limits,
-        stop_flag: *const std.atomic.Value(bool),
-        opening_book_policy: OpeningBookPolicy,
-    ) SearchResult {
         self.tt.newSearch();
         var working = pos.*;
         // Reset the heap-owned context (also zeroes the ~1MB accumulator stack),
@@ -274,19 +247,6 @@ pub const Engine = struct {
                     best.diagnostics.stats = ctx.stats;
                     return best;
                 }
-            }
-        }
-
-        if (opening_book_policy == .use_book) {
-            if (opening_book.findRootMove(&working)) |book_move| {
-                best.best_move = book_move;
-                best.score = self.evaluator.evaluate(&ctx.stack, 0, &working, &ctx.finny, &ctx.ft);
-                best.depth = 1;
-                best.seldepth = 1;
-                best.nodes = 1;
-                best.pv.push(book_move);
-                best.diagnostics.stats = ctx.stats;
-                return best;
             }
         }
 
@@ -775,7 +735,7 @@ test "iterative deepening searches through an early TB decision to a short mate"
     var history = repetition.History{};
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(false);
-    const result = engine.searchRawNoBook(&pos, &history, .{ .depth = 14 }, &stop_flag);
+    const result = engine.search(&pos, &history, .{ .depth = 14 }, &stop_flag);
 
     var saw_tb_decision = false;
     for (result.diagnostics.trace[0..result.diagnostics.trace_len]) |trace| {
@@ -995,28 +955,6 @@ test "best-move node permille reflects root subtree concentration" {
     var empty = root.RootMoveHints{};
     empty.record(e4, 0, 0);
     try std.testing.expectEqual(@as(?u32, null), bestMoveNodePermille(&empty, e4));
-}
-
-test "engine opening book policy preserves default and enables raw no-book search" {
-    const fen = @import("../core/fen.zig");
-
-    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
-    defer engine.deinit();
-
-    const pos = try fen.parse("r1bqkb1r/1ppp1ppp/p1n2n2/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 5");
-    var history = repetition.History{};
-    history.push(pos.zobrist_key);
-    var stop_flag = std.atomic.Value(bool).init(false);
-
-    const booked = engine.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
-    try std.testing.expectEqual(move_mod.Move.init(.e1, .g1, .castle), booked.best_move.?);
-    try std.testing.expectEqual(@as(u16, 1), booked.depth);
-    try std.testing.expectEqual(@as(u64, 1), booked.nodes);
-
-    const raw = engine.searchRawNoBook(&pos, &history, .{ .depth = 2 }, &stop_flag);
-    try std.testing.expect(raw.best_move != null);
-    try std.testing.expect(raw.nodes > 1);
-    try std.testing.expect(pv.isLegal(&pos, &history, &raw.pv));
 }
 
 test "engine search diagnostics expose search counters" {

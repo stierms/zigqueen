@@ -17,9 +17,9 @@ Two product flavors build two independently installable APKs:
 1. Build the engine binaries (from the repository root; no NDK required):
 
    ```sh
-   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8 -Dtarget=aarch64-linux-musl -Dversion=6.0.0
+   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8 -Dtarget=aarch64-linux-musl -Dversion=6.1.1
    cp zig-out/bin/zigqueen-aarch64-armv8 android/oex/app/src/generic/jniLibs/arm64-v8a/libzigqueen.so
-   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8-dotprod -Dtarget=aarch64-linux-musl -Dversion=6.0.0
+   zig build -Doptimize=ReleaseFast -Dcpu-baseline=armv8-dotprod -Dtarget=aarch64-linux-musl -Dversion=6.1.1
    cp zig-out/bin/zigqueen-aarch64-armv8-dotprod android/oex/app/src/dotprod/jniLibs/arm64-v8a/libzigqueen.so
    ```
 
@@ -46,6 +46,13 @@ Two product flavors build two independently installable APKs:
    for the Android packager's temporary state.
 
    Outputs land in `app/build/outputs/apk/<flavor>/release/`.
+
+## Licenses shipped in the APK
+
+`app/src/main/assets/` carries `LICENSE` (GPL-3.0-or-later, zigqueen) and
+`THIRD_PARTY_LICENSES.md` (Fathom MIT notice; Apache-2.0 text for the vendored
+chessenginesupport-androidlib and the Gradle wrapper), so every APK
+distributes the notices its components require.
 
 ## Provenance
 

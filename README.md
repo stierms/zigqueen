@@ -1,4 +1,4 @@
-# zigqueen 6.1.0 — full-threats NNUE chess engine
+# zigqueen 6.1.1 — full-threats NNUE chess engine
 
 <p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
 
@@ -64,9 +64,8 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 - time management with an instability-armed burst: the hard per-move
   deadline extends only after a completed iteration changed its best move
   or dropped the score
-- six exact-root book moves, chosen from Stockfish analysis of the gauntlet
-  opening set (see `docs/PROVENANCE.md`); SEE-gated quiet checks at the
-  first qsearch ply
+- SEE-gated quiet checks at the first qsearch ply (the six built-in root
+  book moves of 6.0.0/6.1.0 are gone as of 6.1.1 — see `docs/PROVENANCE.md`)
 
 **Performance** — AVX-512/AVX2 SIMD via Zig `@Vector` (portable, bit-exact),
 LTO, transparent-huge-page self-enable on Linux/WSL2, Windows large pages,
@@ -159,6 +158,7 @@ the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDR
 
 ## Documentation
 
+- `docs/RELEASE_NOTES_6.1.1.md` — what changed in 6.1.1
 - `docs/RELEASE_NOTES_6.1.0.md` — what changed in 6.1.0
 - `docs/STRENGTH.md` — gauntlet methodology and per-opponent results
 - `docs/ARCHITECTURE.md` — module map, NNUE and search architecture
