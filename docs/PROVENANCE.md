@@ -182,4 +182,4 @@ where a license requires it, or by correcting the attribution where a license pe
   list added to `docs/NETWORK.md`; `THIRD_PARTY_LICENSES.md` added and packaged; Fathom relabelled MIT (was "BSD" in two
   comments) and its two local modifications documented; README/ARCHITECTURE corrected on correction history (parked,
   not live) and on the origin of the six opening-book moves (removed for the next release); `CLEAN_ROOM_RULES.md`
-  reworded to what was done.
+  renamed to `ORIGINALITY.md` and reworded to what was done.

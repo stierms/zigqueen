@@ -102,6 +102,6 @@ then judged by match play; training loss alone does not decide promotion.
 
 The engine source contains no copied functions or mechanical translations
 from Stockfish or another engine. The network's weights likewise do not come
-from another engine's weights or logits. [`CLEAN_ROOM_RULES.md`](../CLEAN_ROOM_RULES.md)
+from another engine's weights or logits. [`ORIGINALITY.md`](../ORIGINALITY.md)
 states the repository's implementation boundary and
 [`PROVENANCE.md`](PROVENANCE.md) the full provenance and licensing record.

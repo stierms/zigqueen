@@ -19,5 +19,5 @@
   (release APKs/binaries, the NDK-free cross-compile, OEX packaging).
 - [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md) — building native Windows binaries
   (including from WSL) and the Windows large-pages note.
-- [`../CLEAN_ROOM_RULES.md`](../CLEAN_ROOM_RULES.md) — the clean-room policy
+- [`../ORIGINALITY.md`](../ORIGINALITY.md) — the clean-room policy
   the engine was developed under.

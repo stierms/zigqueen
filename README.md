@@ -6,7 +6,7 @@ zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
 NNUE evaluation and a single-threaded alpha-beta search. The engine code was
 written for this project; no code was copied or translated from other
 engines. What was learned from where is credited in `docs/PROVENANCE.md`
-(rules: `CLEAN_ROOM_RULES.md`). The ZQB9 network is
+(rules: `ORIGINALITY.md`). The ZQB9 network is
 trained from random initialization on publicly published Stockfish NNUE
 training datasets.
 
@@ -102,7 +102,7 @@ NNUE inference checks against an independent reference. Failed experiments
 are part of the record — the git history documents both, and commit
 trailers preserve co-authorship.
 
-`CLEAN_ROOM_RULES.md` documents the originality rules: no code was copied
+`ORIGINALITY.md` documents the originality rules: no code was copied
 or translated from other engines. `docs/PROVENANCE.md` records what was
 learned from which engine or dataset and under which license, including the
 search-shaping parameter set that was taken from Stormphrax's published
@@ -163,7 +163,7 @@ the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDR
 - `docs/ARCHITECTURE.md` — module map, NNUE and search architecture
 - `docs/TUNING.md`, `docs/QUALITY_GATES.md` — validation methodology
 - `docs/WINDOWS_BUILD.md` — Windows builds and large pages
-- `CLEAN_ROOM_RULES.md` — originality rules
+- `ORIGINALITY.md` — originality rules
 - `docs/PROVENANCE.md` — provenance and licensing record (ideas, parameters,
   data, third-party code)
 - `THIRD_PARTY_LICENSES.md` — notices for the vendored components

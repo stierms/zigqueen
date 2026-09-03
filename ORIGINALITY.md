@@ -1,4 +1,4 @@
-# zigqueen clean-room rules
+# zigqueen originality rules
 
 This document records the rules zigqueen was developed under, published for
 provenance transparency: originality questions matter in the chess-engine
