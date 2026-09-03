@@ -34,7 +34,7 @@ https://github.com/stierms/zigqueen/issues.
 | Stockfish NNUE training data (`official-stockfish/master-binpacks`, Hugging Face) | **ODbL-1.0** | Training data for the shipped network (§4). ODbL notice below. |
 | Stockfish test-run datasets published by linrock (`linrock/test80-2023`, `test80-2024`, test78/79/60 collections) | **No license stated** on the dataset cards (checked 2026-09-03) | Training data (§4), used as the NNUE-training community uses them: published by a Stockfish maintainer for that purpose. <!-- AUTHOR: confirm the basis, or ask the publisher --> |
 | Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | One component of the shipped network's training mix (§4). ODbL notice below. |
-| bullet (Jamie Whiting) | MIT | NNUE trainer, used as a personal fork with a full-threats input extension written for zigqueen (§4). Not linked into the engine. |
+| bullet (Jamie Whiting) | MIT | NNUE trainer, used with a full-threats input extension written for zigqueen and published as a patch (§4). Not linked into the engine. |
 | Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, two local modifications (§5). |
 | chessenginesupport-androidlib (gkalab) | Apache-2.0 | Vendored unmodified in `android/oex/…/com/kalab/chess/enginesupport/` for the OEX APK (§5). |
 | Gradle wrapper | Apache-2.0 | `android/oex/gradle/wrapper/gradle-wrapper.jar` (§5). |
@@ -105,7 +105,8 @@ no longer shipped.
   random initialisation. It was never initialised from, fine-tuned from, or distilled logit-wise from another
   engine's network. The weights are zigqueen's.
 - **Trainer.** bullet (MIT), used as a personal fork whose only changes are a HalfKA + full-threats input type, the
-  matching grader and run recipes, written for zigqueen; the fork is not yet published. <!-- AUTHOR: publish the fork or a patch; link -->
+  matching grader and the run recipe, written for zigqueen and published as `docs/trainer/bullet-fullthreats.patch`
+  (against upstream commit `d372d48`; see `docs/trainer/README.md`).
 - **Training data.** Twenty-seven published components, interleaved: `leela96-filt-v2` (split 0); `test60` 2021-11
   and 2021-12; `test78` 2022-01..05 and 2022-06..09; `test79` 2022-04 and 2022-05; `test80` monthly 2022-06 to
   2024-02; `wrongIsRight_nodes5000pv2`. All are Stockfish-project training data (played-out games carrying a

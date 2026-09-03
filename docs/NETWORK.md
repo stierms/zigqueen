@@ -8,7 +8,7 @@ and what was not used to produce its weights.
 | | |
 |---|---|
 | **Training data** | Publicly published Stockfish NNUE training datasets |
-| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set |
+| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set (the extension is published as [`trainer/bullet-fullthreats.patch`](trainer/README.md)) |
 | **Architecture** | 8-bucket mirrored HalfKA + 60,144 full-threat inputs; width 1024; `1024 -> 16 -> 32 -> 1` layer stack in each of 8 output buckets |
 | **Weights** | Trained from random initialisation |
 | **Engine format** | `ZQB9`, 74.6 MB embedded net, default scale 48 |
