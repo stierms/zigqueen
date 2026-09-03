@@ -28,12 +28,17 @@ interleaved:
 - `test80` monthly, 2022-06 to 2024-02;
 - `wrongIsRight_nodes5000pv2`.
 
-Sources: [`official-stockfish/master-binpacks`](https://huggingface.co/official-stockfish/master-binpacks)
-(ODbL-1.0), [`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023)
-and [`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024)
+Sources: [`official-stockfish/master-binpacks`](https://huggingface.co/datasets/official-stockfish/master-binpacks)
+(ODbL-1.0) for `wrongIsRight`; the Hugging Face datasets
+[`linrock/test60`](https://huggingface.co/datasets/linrock/test60),
+[`linrock/test78`](https://huggingface.co/datasets/linrock/test78),
+[`linrock/test79`](https://huggingface.co/datasets/linrock/test79),
+[`linrock/test80-2022`](https://huggingface.co/datasets/linrock/test80-2022),
+[`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023) and
+[`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024)
 (published by a Stockfish maintainer for NNUE training; no license is stated
-on the dataset cards), and the corresponding published test60/test78/test79
-and leela96 collections.
+on the dataset cards) for the test60/78/79/80 components; the download
+source of the `leela96-filt-v2` component was not recorded.
 
 The rows are played-out positions carrying a Stockfish search evaluation and
 game result. Components are checked for unit consistency and interleaved so

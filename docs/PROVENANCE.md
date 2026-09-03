@@ -67,7 +67,8 @@ zigqueen's own measurements; this section will be updated when the replacement s
 - **Feature transformer.** Mirrored HalfKA with 8 king buckets (each perspective's own king; files e–h mirrored onto
   a–d; black's frame rank-flipped), width 1024, i16 accumulators. The bucket layout (rank 1 split a-b/c-d, rank 2
   split, then ranks 3, 4, 5–6, 7–8) is the common 8-bucket layout used by many bullet-trained engines
-  <!-- AUTHOR: origin — bullet example or own choice -->; it is stored in the net header, not hard-coded in the engine.
+  (it is not the layout of bullet's bundled examples, which use ten buckets); it is stored in the net header, not
+  hard-coded in the engine.
 - **Layer stack and PSQT head.** SFNNv5-style: clipped ReLU + pairwise multiply on the accumulator halves,
   `1024 → 16` (i8) → squared-clipped-ReLU → `16 → 32` → `32 → 1`, eight material buckets, plus a per-feature PSQT head
   bucketed alongside the output buckets. These are Stockfish's published network shapes.
@@ -111,10 +112,11 @@ no longer shipped.
   and 2021-12; `test78` 2022-01..05 and 2022-06..09; `test79` 2022-04 and 2022-05; `test80` monthly 2022-06 to
   2024-02; `wrongIsRight_nodes5000pv2`. All are Stockfish-project training data (played-out games carrying a
   Stockfish search score and result; the `leela96` component is LCZero self-play rescored by Stockfish). Sources:
-  `official-stockfish/master-binpacks` (ODbL), `linrock/test80-2023`, `linrock/test80-2024` (no license stated),
-  and the corresponding published test60/test78/test79 and leela96 collections. <!-- AUTHOR: record the download
-  sources of test60/test78/test79/leela96 --> Our own self-play data generator exists but did not contribute to the
-  shipped network.
+  `official-stockfish/master-binpacks` (ODbL) for `wrongIsRight`; the Hugging Face datasets `linrock/test60`,
+  `linrock/test78`, `linrock/test79`, `linrock/test80-2022`, `linrock/test80-2023` and `linrock/test80-2024` (no
+  license stated on any of them) for the test60/78/79/80 components; the download source of the `leela96-filt-v2`
+  component was not recorded. <!-- AUTHOR: leela96 source --> Our own self-play data generator exists but did not
+  contribute to the shipped network.
 - **Notice (ODbL).** Parts of the training data are made available under the Open Database License
   (http://opendatacommons.org/licenses/odbl/1.0/) by the Stockfish project (`official-stockfish/master-binpacks`)
   and, for the Lc0-derived component, by the LCZero project, with the rights in individual contents under the
@@ -127,7 +129,8 @@ no longer shipped.
 ## 5. Third-party code compiled or packaged with zigqueen
 
 - **Fathom** (`deps/fathom`, MIT): Syzygy tablebase prober by Ronald de Man, basil00 and Jon Dart, vendored from
-  `github.com/jdart1/Fathom` <!-- AUTHOR: commit/version -->. Two local changes in `tbprobe.c`, both marked
+  `github.com/jdart1/Fathom` (the unmodified files match upstream commit `c9c6fef`, 2025-12-23). Two local changes in
+  `tbprobe.c`, both marked
   `/* zigqueen: … */`: a table that cannot be mapped into memory is treated as a probe miss instead of terminating the
   engine, and an allocation failure disables tablebases instead of exiting. The MIT notice is kept in every source
   header and reproduced in `THIRD_PARTY_LICENSES.md`, which ships in every binary archive.
