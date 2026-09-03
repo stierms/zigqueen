@@ -10,7 +10,7 @@
         "src",
         "README.md",
         "ARCHITECTURE.md",
-        "CLEAN_ROOM_RULES.md",
+        "ORIGINALITY.md",
         ".gitignore",
     },
 }

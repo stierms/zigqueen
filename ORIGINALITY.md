@@ -69,7 +69,7 @@ implementation of them is not.
 
 ## Rewrite scope
 
-The clean-room scope covers all engine code:
+The rules cover all engine code:
 - board representation
 - move encoding
 - move generation

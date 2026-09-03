@@ -1,6 +1,6 @@
 # zigqueen Performance Principles
 
-`zigqueen` is a clean-room engine, but it is also a performance project.
+`zigqueen` is an independently written engine, but it is also a performance project.
 
 These principles must shape the implementation from day one.
 
