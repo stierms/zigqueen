@@ -10,7 +10,8 @@ engines. What was learned from where is credited in `docs/PROVENANCE.md`
 trained from random initialization on publicly published Stockfish NNUE
 training datasets.
 
-Copyright (C) 2026 stierms — licensed under GPLv3 (see `LICENSE`). The
+Copyright (C) 2026 stierms — licensed under the GNU GPL, version 3 or (at
+your option) any later version (see `LICENSE`). The
 vendored Fathom tablebase prober (`deps/fathom`) is MIT-licensed; all
 third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
@@ -189,6 +190,7 @@ the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDR
 
 ## License
 
-GPLv3 — see `LICENSE`. Third-party components keep their own licenses
+GNU GPL version 3 or (at your option) any later version — see `LICENSE`
+(SPDX: `GPL-3.0-or-later`). Third-party components keep their own licenses
 (Fathom: MIT; the Android OEX support library and Gradle wrapper:
 Apache-2.0); their notices are in `THIRD_PARTY_LICENSES.md`.

@@ -28,7 +28,7 @@ https://github.com/stierms/zigqueen/issues.
 
 | Component / source | License | How zigqueen relates to it |
 |---|---|---|
-| zigqueen itself | GPL-3.0 (`LICENSE`), © 2026 stierms | — |
+| zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
 | Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1). No code. GPL-compatible. |
 | Stockfish 18 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§2, §3). No code. Training data: see next row. |
 | Stockfish NNUE training data (`official-stockfish/master-binpacks`, Hugging Face) | **ODbL-1.0** | Training data for the shipped network (§4). ODbL notice below. |
