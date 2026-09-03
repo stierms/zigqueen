@@ -4,10 +4,9 @@
 
 zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
 NNUE evaluation and a single-threaded alpha-beta search. The engine code was
-written for this project — no code was copied or translated from other
-engines; the ideas and published parameter forms it builds on, and the one
-parameter set taken from another engine, are credited in
-`docs/PROVENANCE.md` (rules: `CLEAN_ROOM_RULES.md`). The ZQB9 network is
+written for this project; no code was copied or translated from other
+engines. What was learned from where is credited in `docs/PROVENANCE.md`
+(rules: `CLEAN_ROOM_RULES.md`). The ZQB9 network is
 trained from random initialization on publicly published Stockfish NNUE
 training datasets.
 
@@ -48,8 +47,8 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 
 - fractional "basin" reductions: interior LMR and the pruning families
   (null move, reverse futility, futility, late-move, history) share one
-  depth-dose scheme whose formulas and default constants follow Stormphrax
-  8.0.0's published parameter set (see `docs/PROVENANCE.md`)
+  depth-dose scheme whose formulas and default constants were taken from
+  Stormphrax 8.0.0's published parameter set (see `docs/PROVENANCE.md`)
 - root late-move reductions: post-PV root moves are scouted at reduced
   depth and re-searched at full depth on a fail-high
 - clustered transposition table with static-eval caching, huge-page backed;

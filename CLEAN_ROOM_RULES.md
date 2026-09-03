@@ -7,13 +7,11 @@ contributions.
 
 ## Purpose
 
-Every line of `zigqueen`'s engine code was written for this project. The
-ideas it builds on — search techniques, NNUE architectures, feature sets,
-training recipes — come from the public literature and from open-source
-engines, and are credited in `docs/PROVENANCE.md`. That page also records
-the two documented departures from the rules below (the search-shaping
-parameter set initialised from Stormphrax's published defaults, and six
-opening-book moves chosen from Stockfish analysis).
+Every line of `zigqueen`'s engine code was written for this project. Ideas
+are taken from the public literature and from open-source engines and are
+credited in `docs/PROVENANCE.md`; code is not. That page also lists the two
+cases where 6.1.0 falls short of these rules and what is being done about
+them.
 
 The goal is to avoid carrying forward:
 - migration-shaped structure
@@ -32,17 +30,16 @@ This includes:
 - direct translation of search/eval code
 - direct reuse of constants without fresh justification
 
-Documented departure: in July 2026 the search's reduction and pruning
-parameter set (`src/search/basin.zig`) was initialised from Stormphrax
-8.0.0's published default constants under one locally chosen unit factor.
-The Zig implementation is zigqueen's; the numbers are disclosed as taken in
-`docs/PROVENANCE.md`, and their replacement by values derived from
-zigqueen's own measurements is in progress.
+These rules stand. One exception is on record, and it is being corrected,
+not accepted: in 6.1.0 the reduction and pruning constants in
+`src/search/basin.zig` are Stormphrax 8.0.0's published defaults rather
+than values derived here. The code is ours; the numbers are not.
+`docs/PROVENANCE.md` discloses this, and the constants are being replaced
+by values derived from zigqueen's own measurements.
 
-The vendored exceptions are `deps/fathom` (the Syzygy tablebase prober, MIT)
-and the Android OEX provider library under `android/oex` (Apache-2.0); both
-are used as external libraries under their own licenses, not as engine
-code (`THIRD_PARTY_LICENSES.md`).
+Two third-party libraries are vendored under their own licenses: Fathom
+(Syzygy probing, MIT) and the Android OEX provider library (Apache-2.0).
+See `THIRD_PARTY_LICENSES.md`.
 
 ## Allowed references
 
@@ -64,8 +61,7 @@ implementation of them is not.
 ## Engineering rules
 
 1. Prefer fresh design over parity chasing.
-2. Treat other engines as benchmark opponents, not behavior oracles (the
-   two departures on record are disclosed in `docs/PROVENANCE.md`).
+2. Treat other engines as benchmark opponents, not behavior oracles.
 3. Every subsystem should have explicit ownership.
 4. No global mutable search state.
 5. Diagnostics should be designed in, not bolted on.

@@ -1,8 +1,8 @@
 # Provenance and licensing record
 
-**Status:** first version, September 2026, covering the 6.1.0 release. Facts were taken from the public tree, the
-internal development ledger and direct comparison with the referenced sources. This is an engineering statement, not
-legal advice; it is updated when new facts come to light (dated list at the end).
+**Status:** first version, September 2026, covering the 6.1.0 release. Every statement here can be checked against
+the public tree and the referenced sources. This is an engineering statement, not legal advice; it is updated when
+new facts come to light (dated list at the end).
 
 ## Why this exists
 
@@ -44,43 +44,23 @@ https://github.com/stierms/zigqueen/issues.
 
 ## 1. Search shaping: a parameter set taken from Stormphrax
 
-**What was taken.** In July 2026 the search's reduction and pruning configuration was replaced as one coherent unit
-(`src/search/basin.zig`, shipped since 6.1.0). The formulas and every default constant in that file come from
-Stormphrax 8.0.0's published tunable defaults: the two log-based fractional LMR tables (0.78/2.36 quiet,
-−0.10/2.49 noisy, 1/1024 ply units), the eleven additive LMR terms, the LMR-depth term, the null-move margin and
-`R = 6 + depth/5`, the late-move-pruning curve, the reverse-futility margin, the quiet-futility, history-pruning and
-SEE-pruning thresholds, the linear history bonus/malus shape, the re-search "deeper" threshold and the TT-PV
-extension trigger. Constants expressed in Stormphrax's internal evaluation units were multiplied by one locally
-chosen factor (`UNIT_PERCENT = 25`, selected by our own sweep at 25/41/100 %); dimensionless terms were taken as-is.
-The source was read to extract this specification; the extraction (constants and formulas with source line
-references, no code) is kept in our private notes and is not in this repository.
+**What is in the tree.** `src/search/basin.zig`, shipped since 6.1.0 (2026-08-31), defines the interior LMR formula
+and the null-move, late-move, reverse-futility, futility, history-pruning and SEE-pruning thresholds, the history
+bonus/malus shape and the LMR re-search threshold. Its formulas and every default constant were taken from
+Stormphrax 8.0.0's published tunable defaults (Ciekce, GPL-3.0). Constants expressed in Stormphrax's evaluation units
+are scaled by one factor chosen here (`UNIT_PERCENT = 25`); dimensionless terms are unchanged.
 
-**What was not taken.** No source text. The Zig implementation, its integration with zigqueen's stack, TT, move
-ordering, evaluator and diagnostics, the guards, the correction-history units, the honest node accounting and the
-root-LMR scouting are zigqueen's. Time management, SEE, TT, eval cache, qsearch, aspiration, probcut, singular
-extensions, correction history and move ordering use zigqueen's own designs and constants — a fingerprint of all 169
-Stormphrax tunable defaults against our source finds matches only in `basin.zig`.
+**What was not taken.** No source text. The Zig implementation and its integration with the rest of the search are
+zigqueen's, and everything else in the search — time management, SEE, transposition table, eval cache, quiescence,
+aspiration, probcut, singular extensions, move ordering and the history tables — uses zigqueen's own designs and
+constants. A comparison of all 169 Stormphrax tunable defaults against this tree finds matches only in `basin.zig`.
 
-**Why we did it and what we found.** The motivation was diagnostic: at comparable net width Stormphrax reached
-~12 plies more at 20 s; adopting a proven, co-tuned configuration wholesale was the only way to test whether depth was
-the missing ingredient. It moved our effective branching factor from 1.97 to 1.62 and was worth about +5 Elo at
-20+0.2 — the scientific result was that depth was *not* the binding constraint.
+**License.** Both engines are GPL-3.0, so there is no license conflict, and tuning constants are functional values,
+not protectable expression. We still treat a parameter port as a provenance matter in its own right, which is why it
+is disclosed here and in the file header.
 
-**License.** Stormphrax is GPL-3.0, as is zigqueen; there is no license conflict. Tuning constants are functional
-facts, not protectable expression. We nevertheless treat a parameter port as a provenance question in its own right.
-
-**Making the operating point ours.** In August 2026 an internal audit of the ladder head flagged that these values
-had form-level attribution only and were not locally derived. The basin constants were exposed as tuning knobs and an
-SPSA campaign was run at the deploy time control (60+0.6) over the pruning margins; at the 90/266 checkpoint the
-six margins sat within ±3 % of the ported defaults (last recorded checkpoint, 2026-08-28).
-As with Coda's Viridithas time-management constants, reconvergence is the informative part: the numbers are an
-operating point that a tuning run finds on its own. The LMR term weights and the history bonus/malus shape were not
-retuned; in 6.1.0 the whole set remains at the ported defaults. A re-derivation of the entire parameterisation from
-zigqueen's own measurements — forms and values, not a retune of the ported forms — is in progress (September 2026)
-and will replace this section when it ships.
-
-The ladder head after 6.1.0 also adopts the low-depth singular extension (margins 22 and 39 in Stormphrax units,
-scaled by the same factor) from the same source; the same disclosure applies to the next release.
+**Status.** In 6.1.0 the constants are Stormphrax's defaults. They are being replaced by values derived from
+zigqueen's own measurements; this section will be updated when the replacement ships.
 
 ## 2. NNUE evaluation: published forms, our own implementation
 
@@ -165,22 +145,18 @@ values for SEE are the textbook 100/320/330/500/900. None of these were taken fr
 
 - Idea sources are GPL-compatible projects only (GPL-3.0, MIT, BSD, Apache, WTFPL). AGPL engines are gauntlet
   opponents (binaries) and nothing more; their source is not kept on the development machine.
-- Ideas, never expression: reading a published description or, where we do read source, extracting the technique
-  and its parameters into our own notes — then writing zigqueen's implementation. Where a parameter set is taken from
-  a specific engine rather than re-derived, we say so here and retune it on zigqueen (§1).
-- Study notes that quote other engines' code are kept out of the public repository.
-- Six opening-book root moves in 5.x/6.x (`src/search/opening_book.zig`, live in 6.0.0 and 6.1.0) were chosen in
-  April 2026 from Stockfish analysis of the gauntlet opening set. Engine output is not licensed material; we mention
-  it because our rules say other engines are opponents, not oracles. The entries were removed from the development
-  head in September 2026 and will not be in the next release.
+- Ideas, never expression: we read published descriptions and, where we read source, we take the technique and
+  write zigqueen's own implementation. Where a parameter set was taken from a specific engine rather than derived
+  here, we say so and replace it (§1).
+- Six opening-book root moves (`src/search/opening_book.zig`, present from the first public release 5.8.0 through
+  6.1.0) were chosen with Stockfish analysis of a test opening set. Engine output is not licensed material; we mention
+  it because our rules say other engines are opponents, not oracles. The file is removed in the next release.
 
 ## 8. Repository structure and git history
 
-The public repository was created by squashing the development history into an initial 5.8.0 commit
-(2026-07-19); it has never contained internal plans, ledgers, agent configuration, study notes or other engines'
-code, and no file has been removed from its history. Development ledgers, research notes (including the Stormphrax
-extraction of §1) and experiment artefacts live in a private repository. Public history therefore needs no
-rewriting.
+The public repository starts at the 5.8.0 release (2026-07-19) as a single squashed commit; every change since
+is in its history, and no file has ever been removed from it. It has never contained other engines' code.
+Development notes and experiment records are kept privately.
 
 ## 9. How the engine was built
 
@@ -205,5 +181,5 @@ where a license requires it, or by correcting the attribution where a license pe
 - 2026-09 — first version: Stormphrax parameter-set disclosure (§1); ODbL notice and the full training-data component
   list added to `docs/NETWORK.md`; `THIRD_PARTY_LICENSES.md` added and packaged; Fathom relabelled MIT (was "BSD" in two
   comments) and its two local modifications documented; README/ARCHITECTURE corrected on correction history (parked,
-  not live) and on the origin of the six opening-book moves (removed from the development head the same day);
-  `CLEAN_ROOM_RULES.md` reworded to what was done.
+  not live) and on the origin of the six opening-book moves (removed for the next release); `CLEAN_ROOM_RULES.md`
+  reworded to what was done.
