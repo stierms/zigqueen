@@ -1,11 +1,13 @@
 //! Basin-hop search-shaping configuration, rebased from the parked
 //! `basin-hop` branch's `UNIT_PERCENT=25` state.
 //!
-//! Provenance: the fractional LMR form and the families of adjustment terms
-//! were derived from Stormphrax's published search design, then independently
-//! implemented for zigqueen. The integration, guards, score-unit calibration,
-//! and compatibility work are zigqueen-specific; no implementation source was
-//! transcribed.
+//! Provenance: the fractional LMR formula, the pruning families below and
+//! their default constants were taken from Stormphrax 8.0.0's published
+//! parameter set (Ciekce, GPL-3.0; https://github.com/Ciekce/Stormphrax),
+//! with eval-denominated margins scaled by `UNIT_PERCENT` and dimensionless
+//! terms taken as-is. The implementation, its integration, guards and
+//! score-unit calibration are zigqueen's; no source text was transcribed.
+//! See docs/PROVENANCE.md, section 1.
 //!
 //! Score units: `u(x) = x * 25 / 100` is the parked branch's empirically chosen
 //! mapping from the published internal-margin constants into zigqueen search

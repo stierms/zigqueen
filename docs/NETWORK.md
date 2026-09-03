@@ -17,16 +17,37 @@ and what was not used to produce its weights.
 ## Training data
 
 The Stockfish project and its contributors publish NNUE training datasets.
-zigqueen trains on selections from those published corpora, including:
+The shipped network was trained on twenty-seven published components,
+interleaved:
 
-- [`official-stockfish/master-binpacks`](https://huggingface.co/official-stockfish/master-binpacks)
-- [`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023)
-- [`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024)
-- the corresponding published test78, test79, and test60 collections
+- `leela96-filt-v2` (split 0) — LCZero self-play positions rescored by
+  Stockfish;
+- `test60` 2021-11 and 2021-12;
+- `test78` 2022-01 to 2022-09;
+- `test79` 2022-04 and 2022-05;
+- `test80` monthly, 2022-06 to 2024-02;
+- `wrongIsRight_nodes5000pv2`.
 
-The rows are played-out self-play positions carrying a search evaluation and
+Sources: [`official-stockfish/master-binpacks`](https://huggingface.co/official-stockfish/master-binpacks)
+(ODbL-1.0), [`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023)
+and [`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024)
+(published by a Stockfish maintainer for NNUE training; no license is stated
+on the dataset cards), and the corresponding published test60/test78/test79
+and leela96 collections.
+
+The rows are played-out positions carrying a Stockfish search evaluation and
 game result. Components are checked for unit consistency and interleaved so
 that one dataset vintage does not dominate a section of the schedule.
+zigqueen's own self-play data generator did not contribute to the shipped
+network.
+
+**Notice (ODbL).** Parts of the training data are made available under the
+Open Database License (http://opendatacommons.org/licenses/odbl/1.0/) by the
+Stockfish project and, for the Lc0-derived component, by the LCZero project,
+with rights in the individual contents under the Database Contents License
+(http://opendatacommons.org/licenses/dbcl/1.0/). The trained network is a
+"Produced Work" under the ODbL; zigqueen distributes the network, never the
+databases.
 
 ## Trainer and training origin
 
@@ -82,4 +103,5 @@ then judged by match play; training loss alone does not decide promotion.
 The engine source contains no copied functions or mechanical translations
 from Stockfish or another engine. The network's weights likewise do not come
 from another engine's weights or logits. [`CLEAN_ROOM_RULES.md`](../CLEAN_ROOM_RULES.md)
-states the repository's implementation boundary.
+states the repository's implementation boundary and
+[`PROVENANCE.md`](PROVENANCE.md) the full provenance and licensing record.

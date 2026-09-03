@@ -162,7 +162,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 }
 
-/// Fathom (Syzygy tablebase probing, deps/fathom, BSD): one C translation unit.
+/// Fathom (Syzygy tablebase probing, deps/fathom, MIT): one C translation unit.
 fn addFathom(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true;
     module.addIncludePath(b.path("deps/fathom"));

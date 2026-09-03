@@ -8,7 +8,8 @@
 #   zigqueen-<version>-windows-x86_64-avx512.zip
 #   zigqueen-<version>-android-armv8.zip
 #   zigqueen-<version>-android-armv8-dotprod.zip
-# Each zip contains the engine binary (NNUE net embedded), LICENSE and README.md.
+# Each zip contains the engine binary (NNUE net embedded), LICENSE,
+# THIRD_PARTY_LICENSES.md and README.md.
 # The android binaries are static aarch64-linux-musl executables (usable in
 # Termux, Chess for Android "install from SD" where allowed, and as the input
 # for the OEX APK packaging under android/oex — see docs/ANDROID.md).
@@ -76,7 +77,7 @@ for os_name in linux windows; do
         name="zigqueen-${VERSION}-${os_name}-x86_64-${variant}"
         staged="$STAGE_DIR/${name}${ext}"
         cp "$built" "$staged"
-        make_zip "$OUT_DIR/${name}.zip" "$staged" "$ROOT/LICENSE" "$ROOT/README.md"
+        make_zip "$OUT_DIR/${name}.zip" "$staged" "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES.md" "$ROOT/README.md"
         echo "packaged $OUT_DIR/${name}.zip" >&2
     done
 done
@@ -91,7 +92,7 @@ for variant in armv8 armv8-dotprod; do
     name="zigqueen-${VERSION}-android-${variant}"
     staged="$STAGE_DIR/${name}"
     cp "$built" "$staged"
-    make_zip "$OUT_DIR/${name}.zip" "$staged" "$ROOT/LICENSE" "$ROOT/README.md"
+    make_zip "$OUT_DIR/${name}.zip" "$staged" "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES.md" "$ROOT/README.md"
     echo "packaged $OUT_DIR/${name}.zip" >&2
 done
 

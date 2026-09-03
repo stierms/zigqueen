@@ -26,7 +26,7 @@ src/
   tools/          offline diagnostics: bench, stability, search/eval profiling,
                   data extraction
   util/           huge-page allocation for large tables
-deps/fathom/      Syzygy tablebase prober (C, vendored, MIT-style license)
+deps/fathom/      Syzygy tablebase prober (C, vendored, MIT license)
 ```
 
 Structural rules:
@@ -110,8 +110,10 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
 - **Pruning/reductions:** interior reductions and the forward-pruning
   families (null move with verification, reverse futility with a prefetched
   hint table, futility, late-move and history pruning, SEE pruning) share
-  one fractional "basin" depth-dose scheme, following designs documented in
-  modern open-source engines; probcut and razoring sit alongside it. At the
+  one fractional "basin" depth-dose scheme. The formulas and default
+  constants of that scheme were taken from Stormphrax 8.0.0's published
+  parameter set and re-implemented in Zig (`docs/PROVENANCE.md`, section 1);
+  probcut and razoring sit alongside it with zigqueen's own constants. At the
   root, post-PV moves are scouted at reduced depth and re-searched at full
   depth on a fail-high.
 - **Extensions:** a singular-extension family, plus desperation-conditioned

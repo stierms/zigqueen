@@ -21,7 +21,7 @@ jobs:
 
       # Builds six raw-binary variants (linux/windows x avx2/avx512 plus
       # Android armv8/armv8-dotprod; Windows via cross-compile) and zips each
-      # with LICENSE + README into release/. Signed OEX APKs are built locally.
+      # with LICENSE, THIRD_PARTY_LICENSES.md + README into release/. Signed OEX APKs are built locally.
       - name: Package release binaries
         run: scripts/package-release.sh
 

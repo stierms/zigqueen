@@ -3,14 +3,17 @@
 <p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
 
 zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
-NNUE evaluation and a single-threaded alpha-beta search. Engine code is a
-clean-room implementation (see `CLEAN_ROOM_RULES.md`); the ZQB9 network is
+NNUE evaluation and a single-threaded alpha-beta search. The engine code was
+written for this project — no code was copied or translated from other
+engines; the ideas and published parameter forms it builds on, and the one
+parameter set taken from another engine, are credited in
+`docs/PROVENANCE.md` (rules: `CLEAN_ROOM_RULES.md`). The ZQB9 network is
 trained from random initialization on publicly published Stockfish NNUE
 training datasets.
 
 Copyright (C) 2026 stierms — licensed under GPLv3 (see `LICENSE`). The
-vendored Fathom tablebase prober (`deps/fathom`) is distributed under its own
-MIT-style license, kept intact in its source headers.
+vendored Fathom tablebase prober (`deps/fathom`) is MIT-licensed; all
+third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
 ## Strength
 
@@ -45,7 +48,8 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 
 - fractional "basin" reductions: interior LMR and the pruning families
   (null move, reverse futility, futility, late-move, history) share one
-  depth-dose scheme
+  depth-dose scheme whose formulas and default constants follow Stormphrax
+  8.0.0's published parameter set (see `docs/PROVENANCE.md`)
 - root late-move reductions: post-PV root moves are scouted at reduced
   depth and re-searched at full depth on a fail-high
 - clustered transposition table with static-eval caching, huge-page backed;
@@ -60,8 +64,9 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 - time management with an instability-armed burst: the hard per-move
   deadline extends only after a completed iteration changed its best move
   or dropped the score
-- six deterministic exact-root book entries retained from the promoted
-  dev.2 engine; SEE-gated quiet checks at the first qsearch ply
+- six exact-root book moves, chosen from Stockfish analysis of the gauntlet
+  opening set (see `docs/PROVENANCE.md`); SEE-gated quiet checks at the
+  first qsearch ply
 
 **Performance** — AVX-512/AVX2 SIMD via Zig `@Vector` (portable, bit-exact),
 LTO, transparent-huge-page self-enable on Linux/WSL2, Windows large pages,
@@ -99,7 +104,10 @@ are part of the record — the git history documents both, and commit
 trailers preserve co-authorship.
 
 `CLEAN_ROOM_RULES.md` documents the originality rules: no code was copied
-or translated from other engines.
+or translated from other engines. `docs/PROVENANCE.md` records what was
+learned from which engine or dataset and under which license, including the
+search-shaping parameter set that was taken from Stormphrax's published
+defaults rather than derived locally.
 
 ## Build
 
@@ -133,7 +141,9 @@ packaged locally from `android/oex/`.
 | `EvalFile` | string | `<builtin>` | Path to an external `.zqb` net; leave at `<builtin>` for the embedded net. |
 
 That is the complete list. Development builds compiled with `-Dtuning=true`
-additionally expose the internal search-tuning scaffold.
+additionally expose the internal search-tuning scaffold; in 6.1.0 those
+knobs drive the legacy reduction/pruning path, which the live "basin"
+substrate bypasses, so they do not tune the shipped search.
 
 ## Platform notes
 
@@ -154,19 +164,32 @@ the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDR
 - `docs/ARCHITECTURE.md` — module map, NNUE and search architecture
 - `docs/TUNING.md`, `docs/QUALITY_GATES.md` — validation methodology
 - `docs/WINDOWS_BUILD.md` — Windows builds and large pages
-- `CLEAN_ROOM_RULES.md` — clean-room policy
+- `CLEAN_ROOM_RULES.md` — originality rules
+- `docs/PROVENANCE.md` — provenance and licensing record (ideas, parameters,
+  data, third-party code)
+- `THIRD_PARTY_LICENSES.md` — notices for the vendored components
 
 ## Acknowledgments
 
 - The [Stockfish](https://stockfishchess.org/) project and its community,
   whose openly published NNUE training datasets made the network possible.
+  Parts of that data are made available under the Open Database License
+  (ODbL-1.0, http://opendatacommons.org/licenses/odbl/1.0/) by the Stockfish
+  project and, for the Lc0-derived component, by the
+  [LCZero](https://lczero.org/) project; see `docs/NETWORK.md`.
+- [Stormphrax](https://github.com/Ciekce/Stormphrax) (Ciekce, GPL-3.0): the
+  search's reduction/pruning formulas and their default constants follow its
+  published parameter set (`docs/PROVENANCE.md`, section 1). No code.
 - [bullet](https://github.com/jw1912/bullet), the NNUE trainer.
-- [Fathom](https://github.com/jdart1/Fathom) for Syzygy probing.
+- [Fathom](https://github.com/jdart1/Fathom) for Syzygy probing (MIT), and
+  [chessenginesupport-androidlib](https://github.com/gkalab/chessenginesupport-androidlib)
+  (Apache-2.0) for the Android OEX provider.
 - The engine-testing ecosystem, especially
   [fastchess](https://github.com/Disservin/fastchess), and the computer
   chess community's published research.
 
 ## License
 
-GPLv3 — see `LICENSE`. `deps/fathom` retains its original MIT-style license
-notice.
+GPLv3 — see `LICENSE`. Third-party components keep their own licenses
+(Fathom: MIT; the Android OEX support library and Gradle wrapper:
+Apache-2.0); their notices are in `THIRD_PARTY_LICENSES.md`.

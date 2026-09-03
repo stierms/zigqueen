@@ -17,7 +17,8 @@ Run before any serious candidate screen (requires Zig 0.15.2 and
 - `scripts/selfplay-vs-baseline.sh` builds HEAD and a baseline ref and runs a
   fixed-game screen (default 192 games).
 - Default TC `3+0.1`; set `CONCURRENCY` to your core count.
-- Openings: `openings/UHO_4060_v4.epd` (or set `OPENINGS_FILE`). The UHO
+- Openings: `UHO_4060_v4.epd` from Stefan Pohl's UHO collection (not shipped
+  in this repository; download it and set `OPENINGS_FILE`). The UHO
   book is White-favoured by construction; every opening is played twice
   with colours reversed.
 - Passing the screen only earns an SPRT; it does not promote.

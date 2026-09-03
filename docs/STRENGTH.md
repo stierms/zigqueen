@@ -28,7 +28,8 @@ overall** (6.0.0, same instrument: 52.3 %).
 - **Date:** 2026-08-30 to 2026-08-31
 - **Time control:** 180s + 1s increment
 - **Games:** 1,620; 60 against each of 27 opponents
-- **Openings:** `UHO_4060_v4`, drawn per opponent (each opponent's match
+- **Openings:** `UHO_4060_v4` (Stefan Pohl's UHO collection, not shipped
+  in this repository), drawn per opponent (each opponent's match
   uses its own seeded random draw of 30 openings, each played with colours
   reversed). Earlier gauntlets (6.0.0 and before) used Hash 64 MB and one
   30-opening draw shared across all opponents; the 6.1.0 run uses Hash 256

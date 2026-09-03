@@ -1,4 +1,4 @@
-//! Syzygy tablebase probing via Fathom (deps/fathom, BSD). Disabled unless a
+//! Syzygy tablebase probing via Fathom (deps/fathom, MIT). Disabled unless a
 //! SyzygyPath is set — with no path, probeWdl always returns null and play is
 //! bit-identical to a TB-less build.
 const std = @import("std");
