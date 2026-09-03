@@ -31,8 +31,8 @@ https://github.com/stierms/zigqueen/issues.
 | zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
 | Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1). No code. GPL-compatible. |
 | Stockfish 18 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§2, §3). No code. Training data: see next row. |
-| Stockfish NNUE training data (`official-stockfish/master-binpacks`, Hugging Face) | **ODbL-1.0** | Training data for the shipped network (§4). ODbL notice below. |
-| Stockfish test-run datasets published by linrock (`linrock/test80-2023`, `test80-2024`, test78/79/60 collections) | **No license stated** on the dataset cards (checked 2026-09-03) | Training data (§4), used as the NNUE-training community uses them: published by a Stockfish maintainer for that purpose. <!-- AUTHOR: confirm the basis, or ask the publisher --> |
+| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03); the underlying fishtest game data is published under ODbL-1.0 (`official-stockfish/master-binpacks`) | Training data for the shipped network (§4): the same published diet Stockfish's master networks train on. ODbL notice below. |
+| `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the 2024 components. |
 | Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | One component of the shipped network's training mix (§4). ODbL notice below. |
 | bullet (Jamie Whiting) | MIT | NNUE trainer, used with a full-threats input extension written for zigqueen and published as a patch (§4). Not linked into the engine. |
 | Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, two local modifications (§5). |
@@ -110,21 +110,23 @@ no longer shipped.
   (against upstream commit `d372d48`; see `docs/trainer/README.md`).
 - **Training data.** Twenty-seven published components, interleaved: `leela96-filt-v2` (split 0); `test60` 2021-11
   and 2021-12; `test78` 2022-01..05 and 2022-06..09; `test79` 2022-04 and 2022-05; `test80` monthly 2022-06 to
-  2024-02; `wrongIsRight_nodes5000pv2`. All are Stockfish-project training data (played-out games carrying a
-  Stockfish search score and result; the `leela96` component is LCZero self-play rescored by Stockfish). Sources:
-  `official-stockfish/master-binpacks` (ODbL) for `wrongIsRight`; the Hugging Face datasets `linrock/test60`,
-  `linrock/test78`, `linrock/test79`, `linrock/test80-2022`, `linrock/test80-2023` and `linrock/test80-2024` (no
-  license stated on any of them) for the test60/78/79/80 components; the download source of the `leela96-filt-v2`
-  component was not recorded. <!-- AUTHOR: leela96 source --> Our own self-play data generator exists but did not
-  contribute to the shipped network.
+  2024-02; `wrongIsRight_nodes5000pv2`. All are the Stockfish project's published *relabelled* collections — the diet
+  its own master networks train on — downloaded from Hugging Face: `vondele/from_kaggle_1_relabel` (leela96),
+  `vondele/linrock_relabel_1` (test60/78/79, test80 2022), `vondele/linrock_relabel_2` (test80 2023),
+  `xushawn/test80-bt4-relabel` (test80 2024) and `vondele/master-binpacks_relabel` (wrongIsRight). The rows are
+  played-out games (Stockfish fishtest runs; the leela96 component is LCZero self-play) carrying a game result and an
+  evaluation label produced by the Stockfish project's `BT4-tf13tune` teacher (an LCZero transformer network); we
+  used the files as published, re-chunked for our loader, with no relabelling of our own. Our own self-play data
+  generator exists but did not contribute to the shipped network.
 - **Notice (ODbL).** Parts of the training data are made available under the Open Database License
   (http://opendatacommons.org/licenses/odbl/1.0/) by the Stockfish project (`official-stockfish/master-binpacks`)
   and, for the Lc0-derived component, by the LCZero project, with the rights in individual contents under the
   Database Contents License (http://opendatacommons.org/licenses/dbcl/1.0/). A trained network is a "Produced Work"
   under ODbL; we distribute the network, never the databases, so the share-alike terms attach to nothing we ship; the
   obligation is this notice.
-- **What Stockfish contributed.** Openly published training data and published architecture descriptions. Nothing
-  else — no code, no weights, no logits.
+- **What Stockfish contributed.** Openly published training data (positions, results and its published relabels) and
+  published architecture descriptions. Nothing else — no code, no weights, no logits of ours were taken from a
+  Stockfish or LCZero network directly; the teacher's evaluations reach us only as the published labels.
 
 ## 5. Third-party code compiled or packaged with zigqueen
 

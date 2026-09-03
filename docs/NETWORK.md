@@ -28,21 +28,30 @@ interleaved:
 - `test80` monthly, 2022-06 to 2024-02;
 - `wrongIsRight_nodes5000pv2`.
 
-Sources: [`official-stockfish/master-binpacks`](https://huggingface.co/datasets/official-stockfish/master-binpacks)
-(ODbL-1.0) for `wrongIsRight`; the Hugging Face datasets
-[`linrock/test60`](https://huggingface.co/datasets/linrock/test60),
-[`linrock/test78`](https://huggingface.co/datasets/linrock/test78),
-[`linrock/test79`](https://huggingface.co/datasets/linrock/test79),
-[`linrock/test80-2022`](https://huggingface.co/datasets/linrock/test80-2022),
-[`linrock/test80-2023`](https://huggingface.co/datasets/linrock/test80-2023) and
-[`linrock/test80-2024`](https://huggingface.co/datasets/linrock/test80-2024)
-(published by a Stockfish maintainer for NNUE training; no license is stated
-on the dataset cards) for the test60/78/79/80 components; the download
-source of the `leela96-filt-v2` component was not recorded.
+All 27 components are the Stockfish project's published *relabelled*
+training collections on Hugging Face, the diet its own master networks are
+trained on (Stockfish's `threats.yaml`):
+[`vondele/from_kaggle_1_relabel`](https://huggingface.co/datasets/vondele/from_kaggle_1_relabel)
+(leela96),
+[`vondele/linrock_relabel_1`](https://huggingface.co/datasets/vondele/linrock_relabel_1)
+(test60, test78, test79, test80 2022),
+[`vondele/linrock_relabel_2`](https://huggingface.co/datasets/vondele/linrock_relabel_2)
+(test80 2023),
+[`xushawn/test80-bt4-relabel`](https://huggingface.co/datasets/xushawn/test80-bt4-relabel)
+(test80 2024; ODbL-1.0) and
+[`vondele/master-binpacks_relabel`](https://huggingface.co/datasets/vondele/master-binpacks_relabel)
+(wrongIsRight). No license is stated on the `vondele` collections; the
+underlying game data comes from Stockfish's fishtest runs
+(`official-stockfish/master-binpacks`, ODbL-1.0) and, for leela96, from
+LCZero self-play (ODbL/DBCL).
 
-The rows are played-out positions carrying a Stockfish search evaluation and
-game result. Components are checked for unit consistency and interleaved so
-that one dataset vintage does not dominate a section of the schedule.
+The rows are played-out positions carrying a game result and an evaluation
+label; the labels in these collections are the Stockfish project's
+relabels, produced by its `BT4-tf13tune` teacher (an LCZero transformer
+network), not the original search scores. zigqueen used the files as
+published, re-chunked for its loader; no relabelling of our own. Components
+are checked for unit consistency and interleaved so that one dataset
+vintage does not dominate a section of the schedule.
 zigqueen's own self-play data generator did not contribute to the shipped
 network.
 
