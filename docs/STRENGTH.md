@@ -1,5 +1,10 @@
 # Strength
 
+**6.1.1** is a compliance release: 6.1.0 without its six built-in opening-book
+entries, plus license texts and documentation. Its play is bit-identical to
+6.1.0 apart from those six positions, so no new gauntlet was run and every
+figure below for 6.1.0 applies to 6.1.1 unchanged.
+
 ## Official CCRL rating for 5.8.3
 
 The latest official listing at release preparation time remains

@@ -1,6 +1,9 @@
 # zigqueen 6.1.1
 
-A maintenance release: 6.1.0 without its six built-in opening-book entries.
+A compliance release, not a strength release: 6.1.0 without its six built-in
+opening-book entries, with the license texts and documentation the project
+owed. Playing strength is unchanged and no new gauntlet was run; the 6.1.0
+figures apply.
 
 - The engine no longer carries a hard-coded table of six root positions with
   fixed replies. Every move is now the product of the search. Apart from

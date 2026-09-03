@@ -19,6 +19,7 @@ third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
 | Engine version | Self-assessment (blitz 180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 |
 |---|---|---|---|
+| v6.1.1 | same as 6.1.0 — compliance release (built-in book entries removed, license texts added); play otherwise identical, no new gauntlet | — | — |
 | v6.1.0 | **~3644** — 1,620-game, 27-opponent anchored gauntlet, 2026-08-31 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v6.0.0 | ~3602 — 1,620-game anchored gauntlet, 2026-08-18/19 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v5.8.3 | ~3590 — 1,620-game anchored gauntlet, 2026-07-26 ([methodology](docs/STRENGTH.md)) | **3569 ±16** (#76–77, [official listing](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — |
