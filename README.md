@@ -17,26 +17,22 @@ third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
 ## Strength
 
-| Version | Self-assessment (180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 | CCI VLTC (2m24s+1.12s) |
+| Version | [Self-assessment](docs/STRENGTH.md) (180+1) | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) (120+1) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) (40 moves in 15 min) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC (144+1.12) |
 |---|---|---|---|---|
 | 6.2.0 | **~3672** — 1,620 games, 27 opponents, 2026-09-09 | — | — | — |
 | 6.1.1 | as 6.1.0 (compliance release, engine bit-identical) | — | — | 3470 ±47 |
 | 6.1.0 | ~3644 — 1,620 games, 2026-08-31 | — | — | 3484 ±41 |
-| 6.0.0 | ~3602 — 1,620 games, 2026-08-19 | — | **3495 ±20** (#79, 490 games) | 3395 ±45 |
-| 5.8.3 | ~3590 — 1,620 games, 2026-07-26 | **3559 ±14** (#79, 1,295 games) | — | 3379 ±33 |
+| 6.0.0 | ~3602 — 1,620 games, 2026-08-19 | — | **3495 ±20** ([#79, 490 games](https://computerchess.org.uk/ccrl/4040/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.0.0%2064-bit)) | 3395 ±45 |
+| 5.8.3 | ~3590 — 1,620 games, 2026-07-26 | **3559 ±14** ([#79, 1,295 games](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — | 3379 ±33 |
 | 5.8.0 | ~3588 — 1,620 games, 2026-07-19 | — | — | — |
 
-Self-assessments are our own gauntlets anchored to CCRL Blitz ratings, not
-official numbers; method and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
-CCRL figures are from the [Blitz](https://computerchess.org.uk/ccrl/404/) and
-[40/15](https://computerchess.org.uk/ccrl/4040/) lists as of 2026-09-09
-([5.8.3 details](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit),
-[6.0.0 details](https://computerchess.org.uk/ccrl/4040/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.0.0%2064-bit)).
-CCI is the [Computer Chess Index](https://computer-chess-index.github.io/cci/)
-([zigqueen page](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md)):
-its own Bayesian-Elo scale on an i5-7500T, where Stockfish 19 is 3555 at
-STC, so the numbers are not comparable to CCRL's. The VLTC column is shown;
-STC and LTC are on the engine page.
+Time controls are seconds per game + increment per move. Self-assessments
+are our own gauntlets anchored to CCRL Blitz ratings, not official numbers;
+method and caveats in [docs/STRENGTH.md](docs/STRENGTH.md). CCRL figures as
+of 2026-09-09. The [Computer Chess Index](https://computer-chess-index.github.io/cci/)
+uses its own Bayesian-Elo scale on an i5-7500T (Stockfish 19 = 3555 at
+STC), so its numbers are not comparable to CCRL's; STC and LTC are on the
+engine page.
 
 ## Features
 
