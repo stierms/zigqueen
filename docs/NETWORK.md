@@ -1,7 +1,7 @@
 # The network: data, training, and provenance
 
 zigqueen has shipped the `zqHalfKA9` full-threats network in the engine's
-`ZQB9` container since 6.0.0; 6.1.0 ships it unchanged. This page records
+`ZQB9` container since 6.0.0. Version 6.2.0 adds a head-only QAT continuation. This page records
 what the network is, how it was trained,
 and what was not used to produce its weights.
 
@@ -10,7 +10,7 @@ and what was not used to produce its weights.
 | **Training data** | Publicly published Stockfish NNUE training datasets |
 | **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set (the extension is published as [`trainer/bullet-fullthreats.patch`](trainer/README.md)) |
 | **Architecture** | 8-bucket mirrored HalfKA + 60,144 full-threat inputs; width 1024; `1024 -> 16 -> 32 -> 1` layer stack in each of 8 output buckets |
-| **Weights** | Trained from random initialisation |
+| **Weights** | Original base trained from random initialisation; local head-only QAT continuation for 6.2.0 |
 | **Engine format** | `ZQB9`, 74.6 MB embedded net, default scale 48 |
 | **Engine inference** | Written from scratch in Zig and checked against independent reference calculations |
 
@@ -20,8 +20,8 @@ The Stockfish project and its contributors publish NNUE training datasets.
 The shipped network was trained on twenty-seven published components,
 interleaved:
 
-- `leela96-filt-v2` (split 0) — LCZero self-play positions rescored by
-  Stockfish;
+- `leela96-filt-v2` (split 0) — LCZero-derived positions from the
+  published relabel collection;
 - `test60` 2021-11 and 2021-12;
 - `test78` 2022-01 to 2022-09;
 - `test79` 2022-04 and 2022-05;
@@ -40,28 +40,26 @@ trained on (Stockfish's `threats.yaml`):
 [`xushawn/test80-bt4-relabel`](https://huggingface.co/datasets/xushawn/test80-bt4-relabel)
 (test80 2024; ODbL-1.0) and
 [`vondele/master-binpacks_relabel`](https://huggingface.co/datasets/vondele/master-binpacks_relabel)
-(wrongIsRight). No license is stated on the `vondele` collections; the
-underlying game data comes from Stockfish's fishtest runs
-(`official-stockfish/master-binpacks`, ODbL-1.0) and, for leela96, from
-LCZero self-play (ODbL/DBCL).
+(wrongIsRight). The `vondele` dataset cards did not state a license at the recorded
+September 3 check. Underlying publisher notices include Stockfish's
+ODbL data and LCZero's ODbL/DBCL data. Twenty-six components have
+LCZero-derived position ancestry; `wrongIsRight` ancestry remains unresolved.
+Publisher teacher metadata is inherited attribution, not a verified
+per-row teacher execution record.
 
-The rows are played-out positions carrying a game result and an evaluation
-label; the labels in these collections are the Stockfish project's
-relabels, produced by its `BT4-tf13tune` teacher (an LCZero transformer
-network), not the original search scores. zigqueen used the files as
-published, re-chunked for its loader; no relabelling of our own. Components
-are checked for unit consistency and interleaved so that one dataset
-vintage does not dominate a section of the schedule.
-zigqueen's own self-play data generator did not contribute to the shipped
-network.
+The original base used the published evaluation labels. The 6.2.0 head
+continuation used a prefix of the locally corrected `r1` corpus. It
+preserves positions, moves and game results while applying recorded
+tablebase and decisive-anchor score replacements. Components are
+interleaved by byte share. This is not a certified family-disjoint or
+globally deduplicated training corpus. Own self-play generation supplied
+no positions to the released network.
 
-**Notice (ODbL).** Parts of the training data are made available under the
-Open Database License (http://opendatacommons.org/licenses/odbl/1.0/) by the
-Stockfish project and, for the Lc0-derived component, by the LCZero project,
-with rights in the individual contents under the Database Contents License
-(http://opendatacommons.org/licenses/dbcl/1.0/). The trained network is a
-"Produced Work" under the ODbL; zigqueen distributes the network, never the
-databases.
+**ODbL notice.** Parts of these data are made available by the Stockfish
+project and LCZero under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/),
+with LCZero contents under [DBCL 1.0](https://opendatacommons.org/licenses/dbcl/1-0/).
+The local alterations, additional contents and replay method are offered
+free of charge in [data-r1/README.md](data-r1/README.md).
 
 ## Trainer and training origin
 
@@ -79,6 +77,27 @@ Its weights were never:
 Stockfish's contribution here is the openly published training data. The
 network weights, feature mapping, trainer extension, quantization, and Zig
 inference path are zigqueen work.
+
+## 6.2.0 head continuation
+
+The base model SHA-256 is
+`c23ef305f8015c9d3e88765c8f43a082ce3cb0e4c8f25a568123df199301a932`.
+The released model SHA-256 is
+`94da6682065a862dac0af63779ee39055553ba507a21ecd7b10bbe15dbab4a16`.
+Both are 74,587,732 bytes. Only nonlinear head tensors change;
+feature-transformer and PSQT contents remain byte-identical.
+
+The recorded continuation used 1,073,741,824 training occurrences,
+65,536 updates of 16,384 rows, learning rate 0.00001, seed 62020727,
+and target `0.9 × sigmoid(score/400) + 0.1 × game_result`.
+It used a common 120-file prefix of the `r1` interleave, a 4 GiB shuffle
+buffer and 16 windows. QAT models the deployed quantization, floored pair
+products and integer head evaluation. Optimizer state was fresh; only
+`l1`, `l2` and `l3` weights/biases were trainable.
+
+The published bullet feature patch describes the original base training,
+not a complete reconstruction of this continuation. Match evidence is
+reported in [STRENGTH.md](STRENGTH.md), separately from training loss.
 
 ## Architecture
 

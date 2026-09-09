@@ -1,4 +1,4 @@
-# zigqueen 6.1.1 — full-threats NNUE chess engine
+# zigqueen 6.2.0 — full-threats NNUE chess engine
 
 <p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
 
@@ -19,14 +19,16 @@ third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
 | Engine version | Self-assessment (blitz 180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 |
 |---|---|---|---|
+| v6.2.0 | **~3672** — completed anchored gauntlet ([methodology and separate AVX2 run](docs/STRENGTH.md)) | — | — |
 | v6.1.1 | same as 6.1.0 — compliance release (internal mini-book removed, license texts added); strength untouched, no new gauntlet | — | — |
 | v6.1.0 | **~3644** — 1,620-game, 27-opponent anchored gauntlet, 2026-08-31 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v6.0.0 | ~3602 — 1,620-game anchored gauntlet, 2026-08-18/19 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v5.8.3 | ~3590 — 1,620-game anchored gauntlet, 2026-07-26 ([methodology](docs/STRENGTH.md)) | **3569 ±16** (#76–77, [official listing](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — |
 | v5.8.0 | ~3588 — 1,620-game anchored gauntlet, 2026-07-19 ([methodology](docs/STRENGTH.md)) | — | — |
 
-The 5.8.3 CCRL result is the latest authoritative public number. The
-self-assessments anchor a private gauntlet to published CCRL ratings;
+The 5.8.3 entry records its historical official CCRL result. The
+self-assessments are our measurements anchored to published CCRL ratings,
+not official ratings for newer releases;
 methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 
 ## Features
@@ -39,6 +41,7 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
   custom incremental non-local update algorithms
 - PSQT head and eight material-bucketed `1024 -> 16 -> 32 -> 1` layer stacks
   with i8 VNNI/dot-product matmul
+- quantization-aware head continuation using deployed integer arithmetic
 - incremental accumulators with lazy materialization and a finny-style
   refresh cache
 - trained with the [bullet](https://github.com/jw1912/bullet) trainer on
@@ -49,8 +52,8 @@ methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 
 - fractional "basin" reductions: interior LMR and the pruning families
   (null move, reverse futility, futility, late-move, history) share one
-  depth-dose scheme whose formulas and default constants were taken from
-  Stormphrax 8.0.0's published parameter set (see `docs/PROVENANCE.md`)
+  depth-dose scheme initially parameterised from Stormphrax 8.0.0;
+  this release includes a local pruning retune (see `docs/PROVENANCE.md`)
 - root late-move reductions: post-PV root moves are scouted at reduced
   depth and re-searched at full depth on a fail-high
 - clustered transposition table with static-eval caching, huge-page backed;
@@ -74,34 +77,30 @@ optional llvm-bolt post-link pass.
 
 ## Development hardware
 
-Everything — engine development, NNUE training, and all strength testing —
-was done on a single desktop machine:
+Development and testing use three privately owned machines:
 
-| | |
-|---|---|
-| CPU | AMD Ryzen 9 9950X3D (16 cores / 32 threads, 128 MB V-cache) |
-| GPU | NVIDIA GeForce RTX 4090 (24 GB) — NNUE training only |
-| RAM | 128 GB |
-| OS | Windows 11 with WSL2 (Ubuntu) — training and testing run under WSL2; Windows binaries are cross-compiled with Zig |
+| Host | CPU | GPU | Physical RAM |
+|---|---|---|---|
+| Main | Ryzen 9 9950X3D, AVX-512 | RTX 4090 | 128 GB |
+| Oldrig | Ryzen 9 5950X, AVX2 | No training GPU | 128 GB |
+| Small | Ryzen 5 7600X3D, AVX-512 | RTX 5080 | 64 GB |
 
-No cluster and no external compute; release binaries are built by GitHub
-Actions so anyone can reproduce them from the tagged source.
+Training and Linux testing run under WSL2. Portable binaries are built
+with Zig; GitHub Actions also builds the tagged release sources.
 
 ## How this engine was built (AI disclosure)
 
-zigqueen was written by [stierms](https://github.com/stierms) together with
-an AI assistant (Anthropic's Claude). Claude wrote most of the source code
-under continuous human direction: stierms set the goals, chose which ideas
-to pursue or abandon, approved every experiment that cost machine time, and
-decided what shipped.
+zigqueen is developed by [stierms](https://github.com/stierms) with AI
+assistants, including Anthropic's Claude and OpenAI's Codex. Assistants
+write and review code and run experiments under the author's direction;
+the author sets goals, grants experiment scope and decides what ships.
 
-Nothing was accepted because it sounded plausible. Strength changes had to
-pass SPRT self-play at two time controls and a gauntlet against outside
-engines; performance changes had to be node-identical at fixed depth;
-correctness rests on perft suites, make/unmake invariants, and bit-exact
-NNUE inference checks against an independent reference. Failed experiments
-are part of the record — the git history documents both, and commit
-trailers preserve co-authorship.
+Correctness checks include perft, make/unmake invariants and NNUE parity
+against independent calculations. Candidates progress through short
+matches, SPRT and external validation. Some small-effect tests remain
+statistically unresolved; release acceptance and its limits are recorded
+in [STRENGTH.md](docs/STRENGTH.md). Performance-only changes are checked
+for fixed-depth search equivalence.
 
 `ORIGINALITY.md` documents the originality rules: no code was copied
 or translated from other engines. `docs/PROVENANCE.md` records what was
@@ -141,9 +140,9 @@ packaged locally from `android/oex/`.
 | `EvalFile` | string | `<builtin>` | Path to an external `.zqb` net; leave at `<builtin>` for the embedded net. |
 
 That is the complete list. Development builds compiled with `-Dtuning=true`
-additionally expose the internal search-tuning scaffold; in 6.1.0 those
-knobs drive the legacy reduction/pruning path, which the live "basin"
-substrate bypasses, so they do not tune the shipped search.
+additionally expose live search-policy parameters. Release and tuning
+builds share the same defaults; changing a tuning option updates an
+engine-owned configuration between searches.
 
 ## Platform notes
 
@@ -159,6 +158,7 @@ the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDR
 
 ## Documentation
 
+- `docs/RELEASE_NOTES_6.2.0.md` — what changed in 6.2.0
 - `docs/RELEASE_NOTES_6.1.1.md` — what changed in 6.1.1
 - `docs/RELEASE_NOTES_6.1.0.md` — what changed in 6.1.0
 - `docs/STRENGTH.md` — gauntlet methodology and per-opponent results
@@ -179,8 +179,8 @@ the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDR
   project and, for the Lc0-derived component, by the
   [LCZero](https://lczero.org/) project; see `docs/NETWORK.md`.
 - [Stormphrax](https://github.com/Ciekce/Stormphrax) (Ciekce, GPL-3.0): the
-  search's reduction/pruning formulas and their default constants follow its
-  published parameter set (`docs/PROVENANCE.md`, section 1). No code.
+  search's reduction/pruning formulas and initial constants follow its
+  published parameter set; selected pruning values have since been retuned locally (`docs/PROVENANCE.md`, section 1). No code.
 - [bullet](https://github.com/jw1912/bullet), the NNUE trainer.
 - [Fathom](https://github.com/jdart1/Fathom) for Syzygy probing (MIT), and
   [chessenginesupport-androidlib](https://github.com/gkalab/chessenginesupport-androidlib)

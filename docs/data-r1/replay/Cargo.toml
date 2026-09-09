@@ -1,0 +1,11 @@
+[package]
+name = "zigqueen-data-replay"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+sfbinpack = "=0.6.2"
+
+[workspace]

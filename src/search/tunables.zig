@@ -16,6 +16,11 @@
 const std = @import("std");
 const types = @import("../core/types.zig");
 
+pub const BASIN_UNIT_PERCENT_DEFAULT: types.Score = 25;
+pub const HINDSIGHT_MARGIN_DEFAULT: types.Score = @divTrunc(202 * BASIN_UNIT_PERCENT_DEFAULT, 100);
+pub const LDSE_MARGIN_DEFAULT: types.Score = @divTrunc(22 * BASIN_UNIT_PERCENT_DEFAULT, 100);
+pub const LDSE_DOUBLE_MARGIN_DEFAULT: types.Score = @divTrunc(39 * BASIN_UNIT_PERCENT_DEFAULT, 100);
+
 pub const Tunables = struct {
     // --- original 19 (SPSA campaigns #1-#3); defaults = current shipped consts ---
     // Pruning margins (centipawns).
@@ -49,6 +54,28 @@ pub const Tunables = struct {
     // --- lever 5 (2026-07-16): LMR shape, centi-units (0.50 / 2.28) ---
     lmr_base_100: types.Score = @import("reductions.zig").LMR_BASE_100_DEFAULT,
     lmr_divisor_100: types.Score = @import("reductions.zig").LMR_DIVISOR_100_DEFAULT,
+
+    // --- shallow-hole mechanism arms (2026-09-02) ---
+    // Every switch defaults to shipped behaviour. Score margins are already
+    // mapped into zigqueen eval units at the default 25% basin unit factor.
+    hindsight_repair: types.Score = 0,
+    hindsight_margin: types.Score = HINDSIGHT_MARGIN_DEFAULT,
+    eval_policy_history: types.Score = 0,
+    eval_policy_scale: types.Score = 40,
+    eval_policy_clamp: types.Score = 1841,
+    eval_policy_offset: types.Score = 503,
+    tt_cutoff_node_role: types.Score = 0,
+    tt_cutoff_halfmove_max: types.Score = 100,
+    singular_neg_ext: types.Score = 0,
+    singular_min_depth: types.Score = 6,
+    singular_max_depth: types.Score = 8,
+    singular_tt_depth_slack: types.Score = 0,
+    singular_weak_gate: types.Score = 1,
+    ldse: types.Score = 1,
+    ldse_margin: types.Score = LDSE_MARGIN_DEFAULT,
+    ldse_double_margin: types.Score = LDSE_DOUBLE_MARGIN_DEFAULT,
+    qsearch_tt_quiet: types.Score = 0,
+    check_extension: types.Score = 1,
 };
 
 /// The live parameters read by the search. Mutated only by UCI `setoption`.
@@ -92,6 +119,26 @@ pub const specs = [_]Spec{
     // lever 5: LMR shape (centi-units; rebuilds the reduction table on set).
     .{ .uci_name = "LmrBase100", .field = "lmr_base_100", .default = 50, .min = 0, .max = 150 },
     .{ .uci_name = "LmrDivisor100", .field = "lmr_divisor_100", .default = 228, .min = 120, .max = 400 },
+    // Shallow-hole arms. Boolean switches are represented as 0/1 spin knobs so
+    // the existing integer-only SPSA/UCI plumbing remains the single mechanism.
+    .{ .uci_name = "HindsightRepair", .field = "hindsight_repair", .default = 0, .min = 0, .max = 1 },
+    .{ .uci_name = "HindsightMargin", .field = "hindsight_margin", .default = HINDSIGHT_MARGIN_DEFAULT, .min = 0, .max = 500 },
+    .{ .uci_name = "EvalPolicyHistory", .field = "eval_policy_history", .default = 0, .min = 0, .max = 1 },
+    .{ .uci_name = "EvalPolicyScale", .field = "eval_policy_scale", .default = 40, .min = 0, .max = 200 },
+    .{ .uci_name = "EvalPolicyClamp", .field = "eval_policy_clamp", .default = 1841, .min = 0, .max = 32000 },
+    .{ .uci_name = "EvalPolicyOffset", .field = "eval_policy_offset", .default = 503, .min = -5000, .max = 5000 },
+    .{ .uci_name = "TtCutoffNodeRole", .field = "tt_cutoff_node_role", .default = 0, .min = 0, .max = 1 },
+    .{ .uci_name = "TtCutoffHalfmoveMax", .field = "tt_cutoff_halfmove_max", .default = 100, .min = 0, .max = 100 },
+    .{ .uci_name = "SingularNegExt", .field = "singular_neg_ext", .default = 0, .min = 0, .max = 1 },
+    .{ .uci_name = "SingularMinDepth", .field = "singular_min_depth", .default = 6, .min = 1, .max = 64 },
+    .{ .uci_name = "SingularMaxDepth", .field = "singular_max_depth", .default = 8, .min = 1, .max = 64 },
+    .{ .uci_name = "SingularTtDepthSlack", .field = "singular_tt_depth_slack", .default = 0, .min = 0, .max = 16 },
+    .{ .uci_name = "SingularWeakGate", .field = "singular_weak_gate", .default = 1, .min = 0, .max = 1 },
+    .{ .uci_name = "Ldse", .field = "ldse", .default = 1, .min = 0, .max = 1 },
+    .{ .uci_name = "LdseMargin", .field = "ldse_margin", .default = LDSE_MARGIN_DEFAULT, .min = 0, .max = 20 },
+    .{ .uci_name = "LdseDoubleMargin", .field = "ldse_double_margin", .default = LDSE_DOUBLE_MARGIN_DEFAULT, .min = 0, .max = 30 },
+    .{ .uci_name = "QsearchTtQuiet", .field = "qsearch_tt_quiet", .default = 0, .min = 0, .max = 1 },
+    .{ .uci_name = "CheckExtension", .field = "check_extension", .default = 1, .min = 0, .max = 1 },
 };
 
 /// Set a tunable by its UCI name (clamped to [min,max]). Returns true when the

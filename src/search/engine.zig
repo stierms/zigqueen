@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const types = @import("../core/types.zig");
 const context_mod = @import("context.zig");
 const eval_backend = @import("../eval/backend.zig");
@@ -73,6 +74,11 @@ pub const SearchResult = struct {
 pub const EvalOptions = eval_backend.Options;
 /// Re-exported so the CLI fallback (main.zig) shares the one source of truth.
 pub const default_nnue_scale_percent = eval_backend.builtin_nnue_scale_percent;
+/// Shared-net plumbing (datagen --threads): the net type and the loader for
+/// the ONE shared copy, re-exported so tools only need this module. Pair with
+/// `Engine.initWithSharedNet`; free with `net.destroy(allocator)` last.
+pub const Net = eval_backend.Net;
+pub const loadDefaultNet = eval_backend.loadDefaultNet;
 
 pub const Engine = struct {
     tt: tt.TranspositionTable,
@@ -83,6 +89,8 @@ pub const Engine = struct {
     eval_cache: eval_cache_mod.EvalCache,
     history: history_mod.HistoryTable = .{},
     evaluator: eval_backend.EngineState,
+    /// Runtime basin state exists only in the tuning flavour.
+    basin_config: if (build_options.tuning) basin.Config else void,
     allocator: std.mem.Allocator = undefined,
     /// Heap-owned search context. The per-ply accumulator stack is ~1 MB at the
     /// 1024-wide net, too large for the call stack (overflows smaller worker /
@@ -102,6 +110,24 @@ pub const Engine = struct {
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, hash_mb: u32, eval_options: EvalOptions) !Engine {
+        var evaluator = try eval_backend.EngineState.init(allocator, eval_options);
+        errdefer evaluator.deinit();
+        return initWithEvaluator(allocator, hash_mb, &evaluator);
+    }
+
+    /// Per-thread search state around a SHARED read-only net (datagen
+    /// --threads): TT/hint/eval-cache/history/context are private per engine,
+    /// only the weight blob is borrowed. The caller owns `net`, must keep it
+    /// alive for this engine's lifetime, and frees it after deinit.
+    pub fn initWithSharedNet(allocator: std.mem.Allocator, hash_mb: u32, net: *eval_backend.Net) !Engine {
+        var evaluator = eval_backend.EngineState.initBorrowedNet(allocator, net, .{});
+        errdefer evaluator.deinit();
+        return initWithEvaluator(allocator, hash_mb, &evaluator);
+    }
+
+    /// Takes ownership of `evaluator` (moved into the returned engine); on
+    /// error the caller's errdefer still owns it.
+    fn initWithEvaluator(allocator: std.mem.Allocator, hash_mb: u32, evaluator: *eval_backend.EngineState) !Engine {
         var tt_table = try tt.TranspositionTable.init(allocator, hash_mb);
         errdefer tt_table.deinit();
         var hint_table = try rfp_hint_mod.HintTable.init(allocator, hintSizeFor(hash_mb));
@@ -126,7 +152,8 @@ pub const Engine = struct {
             .rfp_hint = hint_table,
             .eval_cache = eval_cache,
             .history = history,
-            .evaluator = try eval_backend.EngineState.init(allocator, eval_options),
+            .evaluator = evaluator.*,
+            .basin_config = if (build_options.tuning) basin.Config.init(.{}) else {},
             .allocator = allocator,
             .ctx = ctx,
         };
@@ -175,6 +202,12 @@ pub const Engine = struct {
         self.reset();
     }
 
+    pub fn setBasinParams(self: *Engine, params: basin.Params) void {
+        if (comptime build_options.tuning) {
+            if (self.basin_config.applyParams(params)) self.reset();
+        }
+    }
+
     pub fn loadNnueFile(self: *Engine, path: []const u8) !void {
         try self.evaluator.loadModelFile(path);
         self.reset();
@@ -202,6 +235,17 @@ pub const Engine = struct {
         limits: time.Limits,
         stop_flag: *const std.atomic.Value(bool),
     ) SearchResult {
+        return self.searchWithRootMoves(pos, root_history, limits, stop_flag, null);
+    }
+
+    pub fn searchWithRootMoves(
+        self: *Engine,
+        pos: *const position.Position,
+        root_history: *const repetition.History,
+        limits: time.Limits,
+        stop_flag: *const std.atomic.Value(bool),
+        root_moves: ?*const move_mod.MoveList,
+    ) SearchResult {
         self.tt.newSearch();
         var working = pos.*;
         // Reset the heap-owned context (also zeroes the ~1MB accumulator stack),
@@ -215,11 +259,12 @@ pub const Engine = struct {
         };
         ctx.info_emitter = self.info_emitter;
         ctx.contempt = self.contempt_cp;
+        if (comptime build_options.tuning) ctx.basin_config = &self.basin_config;
         ctx.root_color = working.side_to_move;
         if (ctx.repetition.count == 0) ctx.repetition.push(working.zobrist_key);
         self.evaluator.prepareRoot(&ctx.stack, &working, &ctx.finny, &ctx.ft);
 
-        const fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock));
+        const fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock), root_moves);
         var best = SearchResult{ .best_move = fallback };
 
         if (working.halfmove_clock >= 100 or ctx.repetition.isClaimableCurrentRepetition(working.halfmove_clock)) {
@@ -238,14 +283,16 @@ pub const Engine = struct {
         if (syzygy.probeRoot(&working)) |tbv| {
             if (tbv.win) {
                 if (matchLegalMove(&working, tbv)) |mv| {
-                    best.best_move = mv;
-                    best.score = syzygy.TB_WIN_SCORE - @as(types.Score, @intCast(@min(tbv.dtz, 1000)));
-                    best.depth = 1;
-                    best.seldepth = 1;
-                    best.nodes = 1;
-                    best.pv.push(mv);
-                    best.diagnostics.stats = ctx.stats;
-                    return best;
+                    if (rootMoveAllowed(root_moves, mv)) {
+                        best.best_move = mv;
+                        best.score = syzygy.TB_WIN_SCORE - @as(types.Score, @intCast(@min(tbv.dtz, 1000)));
+                        best.depth = 1;
+                        best.seldepth = 1;
+                        best.nodes = 1;
+                        best.pv.push(mv);
+                        best.diagnostics.stats = ctx.stats;
+                        return best;
+                    }
                 }
             }
         }
@@ -290,6 +337,7 @@ pub const Engine = struct {
                     alpha,
                     beta,
                     reused_root_hints,
+                    root_moves,
                 );
                 iteration_elapsed_ns = if (iteration_timer) |*timer|
                     @max(@as(i128, std.time.ns_per_ms), @as(i128, @intCast(timer.read())))
@@ -485,24 +533,42 @@ fn matchLegalMove(pos: *const position.Position, tbv: syzygy.RootVerdict) ?move_
     return null;
 }
 
-fn fallbackMove(pos: *const position.Position, prefer_repetition_safe: bool, cycle_child_key: ?u64) ?move_mod.Move {
+fn rootMoveAllowed(root_moves: ?*const move_mod.MoveList, mv: move_mod.Move) bool {
+    const allowed = root_moves orelse return true;
+    for (allowed.slice()) |candidate| {
+        if (candidate == mv) return true;
+    }
+    return false;
+}
+
+fn fallbackMove(
+    pos: *const position.Position,
+    prefer_repetition_safe: bool,
+    cycle_child_key: ?u64,
+    root_moves: ?*const move_mod.MoveList,
+) ?move_mod.Move {
     var moves = move_mod.MoveList.init();
     legal.generate(pos, &moves);
     if (moves.count == 0) return null;
 
     if (cycle_child_key) |key| {
         for (moves.slice()) |mv| {
+            if (!rootMoveAllowed(root_moves, mv)) continue;
             if (moveReachesKey(pos, mv, key)) return mv;
         }
     }
 
     if (prefer_repetition_safe) {
         for (moves.slice()) |mv| {
+            if (!rootMoveAllowed(root_moves, mv)) continue;
             if (isRepetitionSafeFallback(pos, mv)) return mv;
         }
     }
 
-    return moves.slice()[0];
+    for (moves.slice()) |mv| {
+        if (rootMoveAllowed(root_moves, mv)) return mv;
+    }
+    return null;
 }
 
 fn moveReachesKey(pos: *const position.Position, mv: move_mod.Move, key: u64) bool {
@@ -1104,9 +1170,9 @@ test "repetition fallback prefers quiet non-pawn moves over first legal pawn pus
     const fen = @import("../core/fen.zig");
 
     const pos = try fen.parse("8/1k6/7p/1pP3pP/pP2K3/P7/8/8 w - - 20 82");
-    try std.testing.expectEqual(move_mod.Move.init(.c5, .c6, .quiet), fallbackMove(&pos, false, null).?);
+    try std.testing.expectEqual(move_mod.Move.init(.c5, .c6, .quiet), fallbackMove(&pos, false, null, null).?);
 
-    const safe = fallbackMove(&pos, true, null).?;
+    const safe = fallbackMove(&pos, true, null, null).?;
     try std.testing.expect(safe != move_mod.Move.init(.c5, .c6, .quiet));
     try std.testing.expect(safe.from == .e4);
     try std.testing.expect(isRepetitionSafeFallback(&pos, safe));

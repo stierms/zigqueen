@@ -59,8 +59,8 @@ option. The deployed generation is **ZQB9**:
   attacker/target-relation inputs. Threat rows are stored as i8 weights and
   maintained in a separate incremental half before the readout combines them
   with the HalfKA accumulator.
-- **PSQT head.** A per-feature scalar head, bucketed alongside the output
-  buckets (Stockfish-style), added outside the nonlinear stack.
+- **PSQT head.** One per-feature scalar head, added outside the eight
+  material-bucketed nonlinear stacks.
 - **Layerstack readout.** An SFNNv5-style output stack per material bucket:
   clipped-ReLU + pairwise multiply on the accumulator halves, then
   `1024 -> 16` l1 (i8 weights, VNNI/dot-product matmul) ->
@@ -110,7 +110,7 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
 - **Pruning/reductions:** interior reductions and the forward-pruning
   families (null move with verification, reverse futility with a prefetched
   hint table, futility, late-move and history pruning, SEE pruning) share
-  one fractional "basin" depth-dose scheme. The formulas and default
+  one fractional "basin" depth-dose scheme. The formulas and initial
   constants of that scheme were taken from Stormphrax 8.0.0's published
   parameter set and re-implemented in Zig (`docs/PROVENANCE.md`, section 1);
   probcut and razoring sit alongside it with zigqueen's own constants. At the

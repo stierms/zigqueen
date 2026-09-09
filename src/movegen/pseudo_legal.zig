@@ -82,7 +82,6 @@ fn generateTacticalFor(comptime side: types.Color, pos: *const position.Position
     generateTacticalLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, false, 0);
 }
 
-
 fn generatePawnMoves(
     comptime side: types.Color,
     pos: *const position.Position,
@@ -191,8 +190,6 @@ fn generateTacticalPawnMoves(
     }
 }
 
-
-
 /// Pseudo-legal QUIET moves that give DIRECT check to the enemy king. No
 /// captures or promotions (generateTactical covers those) and no discovered
 /// checks — deliberate under-generation: every move generated IS a check, but
@@ -268,8 +265,6 @@ fn generateQuietChecksFor(comptime side: types.Color, pos: *const position.Posit
     }
 }
 
-
-
 fn generateLeaperMoves(
     comptime side: types.Color,
     pos: *const position.Position,
@@ -311,12 +306,6 @@ fn generateTacticalLeaperMoves(
         }
     }
 }
-
-
-
-
-
-
 
 fn generateSliderMoves(
     comptime side: types.Color,

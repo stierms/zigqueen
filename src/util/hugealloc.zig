@@ -208,7 +208,7 @@ fn winMapLarge(byte_len: usize) ?[]align(std.heap.page_size_min) u8 {
         windows.MEM_RESERVE | windows.MEM_COMMIT | windows.MEM_LARGE_PAGES,
         windows.PAGE_READWRITE,
     ) catch return null;
-    const base: [*]align(std.heap.page_size_min) u8 = @alignCast(@ptrCast(ptr));
+    const base: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(ptr));
     return base[0..map_len];
 }
 
@@ -221,7 +221,7 @@ fn winMapRegular(byte_len: usize) ?[]align(std.heap.page_size_min) u8 {
         windows.MEM_RESERVE | windows.MEM_COMMIT,
         windows.PAGE_READWRITE,
     ) catch return null;
-    const base: [*]align(std.heap.page_size_min) u8 = @alignCast(@ptrCast(ptr));
+    const base: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(ptr));
     return base[0..byte_len];
 }
 
@@ -285,7 +285,7 @@ pub fn freeAligned(
         .hugetlb, .thp_madvise => if (builtin.os.tag == .linux) {
             const byte_len = backed.items.len * @sizeOf(T);
             const map_len = std.mem.alignForward(usize, byte_len, HUGE_PAGE_BYTES);
-            const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(@ptrCast(backed.items.ptr));
+            const ptr: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(backed.items.ptr));
             std.posix.munmap(ptr[0..map_len]);
         } else unreachable,
         // Windows VirtualAlloc rungs: MEM_RELEASE frees the whole reservation

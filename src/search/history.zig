@@ -320,9 +320,24 @@ pub const HistoryTable = struct {
         adjust(self, side, moved_piece, to, bonus_value);
     }
 
+    pub fn bonusWithPolicy(self: *HistoryTable, policy: *const basin.Params, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
+        adjust(self, side, moved_piece, to, policy.historyBonus(depth));
+    }
+
     pub fn penalize(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
         const penalty: i32 = if (basin.ENABLED) basin.historyMalus(depth) else @as(i32, depth) * @as(i32, depth) + 8;
         adjust(self, side, moved_piece, to, -penalty);
+    }
+
+    pub fn penalizeWithPolicy(self: *HistoryTable, policy: *const basin.Params, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
+        adjust(self, side, moved_piece, to, -policy.historyMalus(depth));
+    }
+
+    /// Apply an already-calibrated signed update to MAIN quiet history only.
+    /// Used by the tuning-only eval-policy arm; continuation history is
+    /// intentionally untouched.
+    pub fn adjustMain(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, delta: i32) void {
+        adjust(self, side, moved_piece, to, delta);
     }
 
     /// Summed continuation-history score for a candidate move (`cur_key`) given
@@ -356,8 +371,16 @@ pub const HistoryTable = struct {
         self.contAdjust(cont, cur_key, if (basin.ENABLED) basin.historyBonus(depth) else @as(i32, depth) * @as(i32, depth) + 8);
     }
 
+    pub fn contBonusWithPolicy(self: *HistoryTable, policy: *const basin.Params, cont: *const ContContext, cur_key: u16, depth: u16) void {
+        self.contAdjust(cont, cur_key, policy.historyBonus(depth));
+    }
+
     pub fn contPenalize(self: *HistoryTable, cont: *const ContContext, cur_key: u16, depth: u16) void {
         self.contAdjust(cont, cur_key, -(if (basin.ENABLED) basin.historyMalus(depth) else @as(i32, depth) * @as(i32, depth) + 8));
+    }
+
+    pub fn contPenalizeWithPolicy(self: *HistoryTable, policy: *const basin.Params, cont: *const ContContext, cur_key: u16, depth: u16) void {
+        self.contAdjust(cont, cur_key, -policy.historyMalus(depth));
     }
 
     fn contAdjust(self: *HistoryTable, cont: *const ContContext, cur_key: u16, delta: i32) void {

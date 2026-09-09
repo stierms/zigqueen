@@ -253,24 +253,20 @@ inline fn toggleLogged(bits: *PerspBits, idx: usize, persp_bit: u32, delta: *Del
     return true;
 }
 
-/// Extract [base, base+len) from the bitset into range-local words.
+/// Extract one range-local word from [base, base+len). The caller scans only
+/// ceil(len/64) live words and masks the final one. This is the same shift and
+/// neighbor merge as the old fixed five-word temporary, but consumes the value
+/// directly: word/bit traversal (and therefore delta-log order) is identical.
 /// Max group: queen 27 targets x 10 victim classes = 270 bits -> 5 words.
 const MAX_GROUP_WORDS = 5;
-fn extractRange(bits: *const PerspBits, base: usize, len: usize) [MAX_GROUP_WORDS]u64 {
-    var out = [_]u64{0} ** MAX_GROUP_WORDS;
-    var i: usize = 0;
-    while (i < len) : (i += 64) {
-        const g = base + i;
-        const w = g >> 6;
-        const off: u6 = @intCast(g & 63);
-        var v = bits[w] >> off;
-        if (off != 0 and w + 1 < WORDS)
-            v |= bits[w + 1] << @intCast(64 - @as(u7, off));
-        out[i >> 6] = v;
-    }
-    const tail: u6 = @intCast(len & 63);
-    if (tail != 0) out[(len - 1) >> 6] &= (@as(u64, 1) << tail) - 1;
-    return out;
+inline fn extractRangeWord(bits: *const PerspBits, base: usize, range_word: usize) u64 {
+    const g = base + range_word * 64;
+    const w = g >> 6;
+    const off: u6 = @intCast(g & 63);
+    var value = bits[w] >> off;
+    if (off != 0 and w + 1 < WORDS)
+        value |= bits[w + 1] << @intCast(64 - @as(u7, off));
+    return value;
 }
 
 /// Recompute one (square, colored-type) group for BOTH perspectives in one pass
@@ -338,9 +334,14 @@ fn recomputeGroupBoth(
     }
 
     if (npairs_w != 0) {
-        const stored = extractRange(wbits, base_w, npairs_w * 2 * nv);
-        for (0..MAX_GROUP_WORDS) |w| {
-            var x = truth_w[w] ^ stored[w];
+        const len = npairs_w * 2 * nv;
+        const word_count = (len + 63) >> 6;
+        const tail: u6 = @intCast(len & 63);
+        for (0..word_count) |w| {
+            var stored = extractRangeWord(wbits, base_w, w);
+            if (w + 1 == word_count and tail != 0)
+                stored &= (@as(u64, 1) << tail) - 1;
+            var x = truth_w[w] ^ stored;
             while (x != 0) : (x &= x - 1) {
                 const rel = (w << 6) + @ctz(x);
                 if (!toggleLogged(wbits, base_w + rel, 0, delta)) return false;
@@ -348,9 +349,14 @@ fn recomputeGroupBoth(
         }
     }
     if (npairs_b != 0) {
-        const stored = extractRange(bbits, base_b, npairs_b * 2 * nv);
-        for (0..MAX_GROUP_WORDS) |w| {
-            var x = truth_b[w] ^ stored[w];
+        const len = npairs_b * 2 * nv;
+        const word_count = (len + 63) >> 6;
+        const tail: u6 = @intCast(len & 63);
+        for (0..word_count) |w| {
+            var stored = extractRangeWord(bbits, base_b, w);
+            if (w + 1 == word_count and tail != 0)
+                stored &= (@as(u64, 1) << tail) - 1;
+            var x = truth_b[w] ^ stored;
             while (x != 0) : (x &= x - 1) {
                 const rel = (w << 6) + @ctz(x);
                 if (!toggleLogged(bbits, base_b + rel, 0x8000_0000, delta)) return false;

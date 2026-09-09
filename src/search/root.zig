@@ -1,4 +1,6 @@
+const piece_values = @import("../core/piece_values.zig");
 const std = @import("std");
+const build_options = @import("build_options");
 const context_mod = @import("context.zig");
 const eval_cache_mod = @import("eval_cache.zig");
 const history_mod = @import("history.zig");
@@ -15,6 +17,7 @@ const qsearch = @import("qsearch.zig");
 const score_mod = @import("score.zig");
 const reductions = @import("reductions.zig");
 const basin = @import("basin.zig");
+const shallow_arms = @import("shallow_arms.zig");
 const see = @import("see.zig");
 const syzygy = @import("syzygy.zig");
 const stats_mod = @import("stats.zig");
@@ -22,6 +25,7 @@ const tt_mod = @import("tt.zig");
 const tt_probe = @import("tt_probe.zig");
 const tt_store = @import("tt_store.zig");
 const types = @import("../core/types.zig");
+const default_basin_policy = basin.Params{};
 
 /// `currmove` info is only emitted once a search is both deep and long enough,
 /// so it stays silent (and costs nothing) during fast games.
@@ -91,9 +95,6 @@ pub const IterationResult = struct {
 // Checks extend only at shallow depth (0 = never). Unconditional extension made
 // EBF position-blind; see the policy comment at the extension site.
 const CHECK_EXTENSION_MAX_DEPTH: u16 = 0;
-const SINGULAR_MIN_DEPTH: u16 = 6;
-const SINGULAR_MAX_DEPTH: u16 = 8;
-const SINGULAR_REQUIRED_DEPTH_SURPLUS: i16 = 0;
 const SINGULAR_MARGIN_BASE: i32 = 8;
 const SINGULAR_MARGIN_PER_PLY: i32 = 4;
 const SINGULAR_EXTENSION_MARGIN: i32 = 16;
@@ -118,11 +119,17 @@ const ROOT_HINT_SCORE_CLAMP: i32 = 200;
 
 const SingularPlan = struct {
     mv: move_mod.Move,
-    extension: u16 = 1,
+    extension: i16 = 1,
     /// Multicut: the singular verification (TT move EXCLUDED) failed high at
     /// singular_beta >= beta — a SECOND move beats beta at reduced depth, so the
     /// node has at least two refutations -> cut immediately with this bound.
     multicut: ?types.Score = null,
+};
+
+const SingularAttempt = struct {
+    /// True only when the excluded-move verification search actually ran.
+    applied: bool = false,
+    plan: ?SingularPlan = null,
 };
 
 const SingularAlternativeQuality = struct {
@@ -148,7 +155,7 @@ pub fn searchDepth(
     pos: *position.Position,
     depth: u16,
 ) IterationResult {
-    return searchDepthWindow(ctx, resources, pos, depth, -qsearch.INF, qsearch.INF, null);
+    return searchDepthWindow(ctx, resources, pos, depth, -qsearch.INF, qsearch.INF, null, null);
 }
 
 pub fn searchDepthWindow(
@@ -159,6 +166,7 @@ pub fn searchDepthWindow(
     alpha_in: types.Score,
     beta_in: types.Score,
     previous_root_hints: ?*const RootMoveHints,
+    allowed_root_moves: ?*const move_mod.MoveList,
 ) IterationResult {
     if (pos.halfmove_clock >= 100 or ctx.repetition.isClaimableCurrentRepetition(pos.halfmove_clock)) {
         return .{
@@ -178,6 +186,7 @@ pub fn searchDepthWindow(
 
     var moves = move_mod.MoveList.init();
     legal.generateHinted(pos, &moves, in_check);
+    filterRootMoves(&moves, allowed_root_moves);
     if (moves.count == 0) {
         return .{
             .score = if (in_check) -score_mod.MATE_SCORE else 0,
@@ -244,6 +253,7 @@ pub fn searchDepthWindow(
         child_entry.prev_move = mv;
         child_entry.prev_piece_type = moved_piece_type;
         child_entry.prev_cont_piece = cont_piece;
+        shallow_arms.setParentLmrReduction(child_entry, 0);
         // Lazy accumulator: record the move only — boards/undo-state are
         // reconstructed at materialization time from the live position.
         resources.evaluator.onMakeMove(&ctx.stack, mv, 0);
@@ -257,17 +267,20 @@ pub fn searchDepthWindow(
             ctx.notePvsScout();
             const full_depth = depth - 1;
             const reduced_depth = if (reduction >= full_depth) 0 else full_depth - reduction;
+            shallow_arms.setParentLmrReduction(child_entry, reduction);
             score = -negamax(ctx, resources, pos, reduced_depth, -alpha - 1, -alpha, 1, true, node_context.NodeContext.fromWindow(-alpha - 1, -alpha, true), null, null);
             // A reduced scout is only a cheap rejection attempt. As in the
             // interior PVS loop, verify every alpha raise at the full depth
             // before it can affect the root score, PV, or root-node hints.
             if (!ctx.stopped and reduction > 0 and score > alpha) {
                 ctx.noteLmrResearch(index, reduction, score, alpha, root_history_score, true, false);
+                shallow_arms.setParentLmrReduction(child_entry, reduction);
                 score = -negamax(ctx, resources, pos, full_depth, -alpha - 1, -alpha, 1, true, node_context.NodeContext.fromWindow(-alpha - 1, -alpha, true), null, null);
                 if (!ctx.stopped) ctx.noteLmrVerificationOutcome(index, reduction, score, alpha, beta, root_history_score, true, false);
             }
             if (!ctx.stopped and score > alpha and score < beta) {
                 ctx.notePvsResearch();
+                shallow_arms.setParentLmrReduction(child_entry, reduction);
                 score = -negamax(ctx, resources, pos, depth - 1, -beta, -alpha, 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null, null);
             }
         }
@@ -290,7 +303,9 @@ pub fn searchDepthWindow(
 
     if (ctx.recordMoveOrder() and root_searched_quiets == 0) ctx.noteStagedMainNoQuietSearched(root_move_counts.quiet);
 
-    if (!ctx.stopped) {
+    // A bound over a restricted root subset is not valid for a later search of
+    // the same position with a different (or absent) `searchmoves` set.
+    if (!ctx.stopped and allowed_root_moves == null) {
         const score = if (best_move == null) 0 else best_score;
         tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, @intCast(depth), alpha_orig, beta_in, score, best_move, tt_mod.STATIC_EVAL_NONE, true);
     }
@@ -302,6 +317,34 @@ pub fn searchDepthWindow(
         .root_hints = root_hints,
         .root_order = root_order,
     };
+}
+
+fn filterRootMoves(moves: *move_mod.MoveList, allowed_root_moves: ?*const move_mod.MoveList) void {
+    const allowed = allowed_root_moves orelse return;
+    var kept: usize = 0;
+    for (moves.slice()) |mv| {
+        if (!containsMove(allowed, mv)) continue;
+        moves.moves[kept] = mv;
+        kept += 1;
+    }
+    moves.count = kept;
+}
+
+test "root move filter preserves generated order" {
+    var generated = move_mod.MoveList.init();
+    generated.add(move_mod.Move.init(.e2, .e4, .double_push));
+    generated.add(move_mod.Move.init(.d2, .d4, .double_push));
+    generated.add(move_mod.Move.init(.g1, .h3, .quiet));
+
+    var allowed = move_mod.MoveList.init();
+    allowed.add(move_mod.Move.init(.g1, .h3, .quiet));
+    allowed.add(move_mod.Move.init(.e2, .e4, .double_push));
+
+    filterRootMoves(&generated, &allowed);
+
+    try std.testing.expectEqual(@as(usize, 2), generated.count);
+    try std.testing.expectEqual(move_mod.Move.init(.e2, .e4, .double_push), generated.slice()[0]);
+    try std.testing.expectEqual(move_mod.Move.init(.g1, .h3, .quiet), generated.slice()[1]);
 }
 
 /// Root LMR deliberately starts one move later than ordinary interior LMR:
@@ -422,6 +465,7 @@ fn negamax(
     if (depth == 0) {
         return qsearch.searchFromHorizon(ctx, resources, pos, alpha_in, beta_in, ply, in_check_hint);
     }
+    const basin_config = if (comptime build_options.tuning) ctx.basin_config else {};
     if (ctx.noteNode()) return 0;
     ctx.observePly(ply);
     if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
@@ -434,7 +478,19 @@ fn negamax(
     // stores) and read back narrowly — no whole-Result temp + wide copy. See
     // the probeInto doc comment for the store-forward-stall history.
     var probe: tt_probe.Result = undefined;
-    tt_probe.probeInto(&probe, ctx, resources.tt, pos.zobrist_key, @intCast(depth), alpha_in, beta_in, excluded_move);
+    tt_probe.probeMainInto(
+        &probe,
+        ctx,
+        resources.tt,
+        pos.zobrist_key,
+        @intCast(depth),
+        alpha_in,
+        beta_in,
+        excluded_move,
+        node_ctx.pv_node,
+        node_ctx.cut_node,
+        pos.halfmove_clock,
+    );
 
     // Syzygy WDL probe (no-op unless SyzygyPath is set): a table hit is ground
     // truth — return it. probeWdl itself gates on piece count, castling, and a
@@ -521,12 +577,42 @@ fn negamax(
         const evaluated = resources.history.correctedEval(pos, raw);
         stack_entry.static_eval = evaluated;
         static_eval = evaluated;
+        if (shallow_arms.evalPolicyEnabled() and ply > 0) {
+            if (stack_entry.prev_piece_type) |previous_piece| {
+                if (stack_entry.prev_move) |previous_move| {
+                    if (ctx.stack.entry(ply - 1).static_eval) |parent_eval| {
+                        const gain = -parent_eval - evaluated;
+                        resources.history.adjustMain(pos.side_to_move.other(), previous_piece, previous_move.to, shallow_arms.evalPolicyBonus(gain));
+                    }
+                }
+            }
+        }
+        if (shallow_arms.hindsightEnabled() and !node_ctx.pv_node and excluded_move == null and ply > 0) {
+            if (ctx.stack.entry(ply - 1).static_eval) |parent_eval| {
+                const adjustment = shallow_arms.hindsightAdjustmentWith(
+                    true,
+                    search_depth,
+                    shallow_arms.parentLmrReduction(stack_entry),
+                    parent_eval + evaluated,
+                    shallow_arms.hindsightMargin(),
+                );
+                if (adjustment > 0 and search_depth < std.math.maxInt(u16)) {
+                    search_depth += 1;
+                    ctx.noteHindsightDepthExtension();
+                } else if (adjustment < 0) {
+                    search_depth -= 1;
+                    ctx.noteHindsightDepthReduction();
+                }
+            }
+        }
         complexity_cp = @intCast(@abs(evaluated - raw));
         improving = isImproving(ctx, ply, evaluated);
+        const basin_rfp_max_depth: u16 = if (comptime build_options.tuning) @intCast(basin_config.params.rfp_max_depth) else basin.RFP_MAX_DEPTH;
+        const basin_rfp_margin = if (comptime build_options.tuning) basin_config.params.rfpMargin(search_depth, improving) else basin.rfpMargin(search_depth, improving);
         const rfp_fires = if (basin.ENABLED)
-            (search_depth <= basin.RFP_MAX_DEPTH and beta - alpha <= 1 and
+            (search_depth <= basin_rfp_max_depth and beta - alpha <= 1 and
                 !score_mod.isMateLike(alpha) and !score_mod.isMateLike(beta) and
-                evaluated - basin.rfpMargin(search_depth, improving) - @divTrunc(complexity_cp, 2) >= beta)
+                evaluated - basin_rfp_margin - @divTrunc(complexity_cp, 2) >= beta)
         else
             pruning.shouldReverseFutilityPrune(search_depth, alpha, beta, in_check, evaluated, improving);
         if (rfp_fires) {
@@ -551,16 +637,21 @@ fn negamax(
             if (entry.bound == .upper and entry.score < beta) break :blk false;
         }
         const evaluated = static_eval orelse break :blk false;
-        break :blk evaluated >= beta + basin.nmpMargin(search_depth, improving);
+        const margin = if (comptime build_options.tuning) basin_config.params.nmpMargin(search_depth, improving) else basin.nmpMargin(search_depth, improving);
+        break :blk evaluated >= beta + margin;
     } else true;
     if (basin_null_ok and ply >= ctx.nmp_min_ply and pruning.shouldTryNullMove(allow_null, pos, search_depth, alpha, beta, in_check, static_eval)) {
-        const reduction = if (basin.ENABLED) basin.nmpReduction(search_depth) else reductions.nullMoveReduction(search_depth);
+        const reduction = if (basin.ENABLED)
+            (if (comptime build_options.tuning) basin_config.params.nmpReduction(search_depth) else basin.nmpReduction(search_depth))
+        else
+            reductions.nullMoveReduction(search_depth);
         ctx.noteNullTry();
         make_unmake.makeNullMove(pos, &stack_entry.state);
         resources.evaluator.onMakeNullMove(&ctx.stack, ply);
         ctx.stack.entry(ply + 1).prev_move = null;
         ctx.stack.entry(ply + 1).prev_piece_type = null;
         ctx.stack.entry(ply + 1).prev_cont_piece = null;
+        shallow_arms.setParentLmrReduction(ctx.stack.entry(ply + 1), 0);
         const null_child_ctx = node_context.NodeContext.fromWindow(-beta, -beta + 1, true);
         const null_depth: u16 = if (basin.ENABLED)
             (if (search_depth > reduction) search_depth - reduction else 0)
@@ -621,47 +712,63 @@ fn negamax(
     }
 
     var moves = move_mod.MoveList.init();
-    // Null-move/razor/probcut all make+unmake in balanced pairs above, so `pos`
-    // is unchanged since `in_check` was computed — the hint is exact.
-    legal.generateHinted(pos, &moves, in_check);
-    if (moves.count == 0) {
-        return if (in_check) -score_mod.MATE_SCORE + @as(types.Score, @intCast(ply)) else ctx.drawScore(pos.side_to_move);
-    }
-
     var scores: [move_mod.MAX_MOVES]i32 = undefined;
     var capture_see_scores: [move_mod.MAX_MOVES]i32 = undefined;
-    const staged_counts = if (ctx.recordMoveOrder()) stagedMoveCounts(&moves) else StagedMoveCounts{};
-    if (ctx.recordMoveOrder()) ctx.noteStagedMainMoveList(moves.count, staged_counts.quiet, staged_counts.tactical, containsMove(&moves, tt_move));
+    var staged_counts = StagedMoveCounts{};
     const countermove = previousQuietCountermove(resources.history, stack_entry, pos.side_to_move);
-    if (ctx.recordMoveOrder() and hasPreviousQuietMove(stack_entry)) {
-        ctx.noteCountermoveTableProbe(countermove, containsMove(&moves, countermove));
-    }
     const cont = continuationContext(ctx, ply, pos.side_to_move);
-    const moved_side = pos.side_to_move; // loop-invariant; child stm = .other()
     // Per-node conthist rows for the loop's LMR history evidence (same hoist
     // as inside scoreMoves — value-identical, reads stay live).
     const cont_rows = resources.history.contRows(&cont);
-    ordering.scoreMoves(
-        pos,
-        &moves,
-        tt_move,
-        .{ .a = stack_entry.killer_a, .b = stack_entry.killer_b },
-        countermove,
-        resources.history,
-        &cont,
-        &scores,
-        &capture_see_scores,
-    );
-    const singular_plan = if (!in_check)
-        trySingularPlan(ctx, resources, pos, search_depth, ply, node_ctx, tt_entry, tt_move, excluded_move, &moves, &capture_see_scores, stack_entry, countermove, beta)
-    else
-        null;
-    if (singular_plan) |plan| {
-        if (plan.multicut) |mc_bound| {
-            if (excluded_move == null) {
-                tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(singularVerificationDepth(search_depth)), mc_bound, tt_move, tt_store.evalToTt(raw_static_eval), node_ttpv);
+
+    // HASH MOVE FIRST (perf r12, lane S). When the TT move is legal and no
+    // singular check needs the full list, it is searched BEFORE anything is
+    // generated: at the nodes where it fails high, generation, legality
+    // filtering, SEE scoring and picking never happen. Exact: the TT move is
+    // always the first pick anyway (score 1e6, unique), it gets the same
+    // capture_see_score (0 — scoreMoves returns before SEE for it) and the
+    // same first-move treatment; when it does not cut off, the list is
+    // generated and scored exactly as before and the picker's first pick is
+    // REPLAYED (the swap that moves the TT move to slot 0 also decides the tie
+    // order among the rest), then the loop resumes at slot 1. Legality comes
+    // from legal.isLegalMoveHinted, proven equal to list membership on every
+    // encoding (legal.zig tests), so an illegal/stale hash move takes the old
+    // path unchanged. Null-move/razor/probcut make+unmake in balanced pairs
+    // above, so `pos` is unchanged since `in_check` was computed — the hint
+    // is exact for both the legality test and generation.
+    const tt_first_move: ?move_mod.Move = blk: {
+        const candidate = tt_move orelse break :blk null;
+        if (excluded_move) |excluded| {
+            if (candidate == excluded) break :blk null;
+        }
+        if (canTrySingular(search_depth, node_ctx, tt_entry, tt_move, excluded_move)) break :blk null;
+        if (pos.kingSquare(pos.side_to_move) == null) break :blk null;
+        if (!legal.isLegalMoveHinted(pos, candidate, in_check)) break :blk null;
+        break :blk candidate;
+    };
+    var list_ready = false;
+    var singular_plan: ?SingularPlan = null;
+    var singular_test_applied = false;
+    if (tt_first_move == null) {
+        legal.generateHinted(pos, &moves, in_check);
+        if (moves.count == 0) {
+            return if (in_check) -score_mod.MATE_SCORE + @as(types.Score, @intCast(ply)) else ctx.drawScore(pos.side_to_move);
+        }
+        scoreGeneratedMoves(ctx, pos, &moves, tt_move, stack_entry, countermove, resources.history, &cont, &scores, &capture_see_scores, &staged_counts);
+        list_ready = true;
+        const singular_attempt = if (!in_check)
+            trySingularPlan(ctx, resources, pos, search_depth, ply, node_ctx, tt_entry, tt_move, excluded_move, &moves, &capture_see_scores, stack_entry, countermove, beta)
+        else
+            SingularAttempt{};
+        singular_test_applied = singular_attempt.applied;
+        singular_plan = singular_attempt.plan;
+        if (singular_plan) |plan| {
+            if (plan.multicut) |mc_bound| {
+                if (excluded_move == null) {
+                    tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(singularVerificationDepth(search_depth)), mc_bound, tt_move, tt_store.evalToTt(raw_static_eval), node_ttpv);
+                }
+                return mc_bound;
             }
-            return mc_bound;
         }
     }
 
@@ -675,10 +782,35 @@ fn negamax(
     var searched_quiet_count: usize = 0;
     var moves_searched: usize = 0;
 
+    // Per-node gives-check context, built lazily on the first move that asks
+    // (legal.CheckInfo): O(1) per move afterwards, exact.
+    var check_info = legal.CheckInfo{};
     var move_picker = ordering.MovePicker.init(&moves, &scores, &capture_see_scores);
-    for (0..moves.count) |index| {
-        const mv = move_picker.next(index);
-        const capture_see_score = move_picker.captureSee(index);
+    var index: usize = 0;
+    var tt_stage = tt_first_move != null;
+    while (true) : ({
+        if (tt_stage) tt_stage = false else index += 1;
+    }) {
+        var mv: move_mod.Move = undefined;
+        var capture_see_score: i32 = 0;
+        if (tt_stage) {
+            mv = tt_first_move.?;
+        } else {
+            if (!list_ready) {
+                // The hash move did not cut off: generate + score exactly as
+                // the eager path does, replay the first pick (the TT move,
+                // by construction the unique 1e6 score) and continue at slot 1.
+                legal.generateHinted(pos, &moves, in_check);
+                scoreGeneratedMoves(ctx, pos, &moves, tt_move, stack_entry, countermove, resources.history, &cont, &scores, &capture_see_scores, &staged_counts);
+                const first = move_picker.next(0);
+                std.debug.assert(first == tt_first_move.?);
+                list_ready = true;
+                index = 1;
+            }
+            if (index >= moves.count) break;
+            mv = move_picker.next(index);
+            capture_see_score = move_picker.captureSee(index);
+        }
         if (excluded_move) |excluded| {
             if (mv == excluded) continue;
         }
@@ -708,6 +840,12 @@ fn negamax(
             break :blk @as(i32, quiet_row[mv.to.index()]) +
                 cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
         } else 0;
+        const basin_history_score: i32 = if (comptime build_options.tuning or basin.defaults.lmr_noisy_history_coeff != 423) blk: {
+            if (is_quiet) break :blk quiet_history_score;
+            const noisy_row: *const [64]i16 = &resources.history.quietPieceRows()[@intFromEnum(moving_piece)];
+            break :blk @as(i32, noisy_row[mv.to.index()]) +
+                cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
+        } else quiet_history_score;
         const move_order_sample: ?stats_mod.MoveOrderSample = if (ctx.recordMoveOrder()) .{
             .bucket = classifyMoveOrderBucket(mv, tt_move, stack_entry.killer_a, stack_entry.killer_b, countermove, capture_see_score, quiet_history_score),
             .node_type = stats_mod.moveOrderNodeType(node_ctx.pv_node, node_ctx.cut_node),
@@ -715,37 +853,35 @@ fn negamax(
             .history_score = quiet_history_score,
         } else null;
         var gives_check_hint: ?bool = null;
-        const basin_lmr_depth = if (basin.ENABLED) basin.lmrDepth(search_depth, move_number, node_ttpv) else 0;
+        const basin_lmr_depth = if (basin.ENABLED)
+            (if (comptime build_options.tuning) basin_config.lmrDepth(search_depth, move_number, node_ttpv) else basin.lmrDepth(search_depth, move_number, node_ttpv))
+        else
+            0;
         // Use the basin effective depth for the parked substrate's SEE family.
         if (basin.ENABLED and can_prune_move and !in_check and !isKillerMove(stack_entry, mv) and
             !score_mod.isMateLike(best_score) and best_score > -qsearch.INF + 1024)
         {
             if (is_capture) {
-                if (capture_see_score < 0 and capture_see_score < basin.seePruneThresholdNoisy(search_depth)) {
+                const threshold = if (comptime build_options.tuning) basin_config.params.seePruneThresholdNoisy(search_depth) else basin.seePruneThresholdNoisy(search_depth);
+                if (capture_see_score < 0 and capture_see_score < threshold) {
                     ctx.noteQuietFutilityPrune();
                     continue;
-                }
-            } else if (basin.SEE_PRUNE_QUIETS and !is_promotion and basin_lmr_depth <= 6) {
-                if (see.quietScore(pos, mv) < basin.seePruneThresholdQuiet(basin_lmr_depth)) {
-                    const gives_check = gives_check_hint orelse quietMoveGivesCheck(pos, mv);
-                    gives_check_hint = gives_check;
-                    if (!gives_check) {
-                        ctx.noteQuietFutilityPrune();
-                        continue;
-                    }
                 }
             }
         }
         const basin_futility_fires = if (basin.ENABLED) blk: {
             if (!can_prune_move) break :blk false;
             if (!is_quiet or in_check or isKillerMove(stack_entry, mv)) break :blk false;
-            if (basin_lmr_depth > basin.FUTILITY_LMRDEPTH_MAX) break :blk false;
-            if (@abs(alpha) >= basin.FUTILITY_ALPHA_CAP) break :blk false;
+            const max_lmr_depth = if (comptime build_options.tuning) basin_config.params.futility_lmr_depth_max else basin.FUTILITY_LMRDEPTH_MAX;
+            const alpha_cap = if (comptime build_options.tuning) basin_config.params.futility_alpha_cap else basin.FUTILITY_ALPHA_CAP;
+            if (basin_lmr_depth > max_lmr_depth) break :blk false;
+            if (@abs(alpha) >= alpha_cap) break :blk false;
             const evaluated = static_eval orelse break :blk false;
-            break :blk evaluated + basin.futilityMargin(search_depth) + @divTrunc(quiet_history_score, 404) <= alpha;
+            const margin = if (comptime build_options.tuning) basin_config.params.futilityMargin(search_depth) else basin.futilityMargin(search_depth);
+            break :blk evaluated + margin + @divTrunc(quiet_history_score, 404) <= alpha;
         } else false;
         if (basin_futility_fires) {
-            const gives_check = gives_check_hint orelse quietMoveGivesCheck(pos, mv);
+            const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
             gives_check_hint = gives_check;
             if (!gives_check) {
                 ctx.noteQuietFutilityPrune();
@@ -754,7 +890,7 @@ fn negamax(
             }
         }
         if (!basin.ENABLED and can_prune_move and pruning.shouldPruneQuietMove(search_depth, move_index, mv, alpha, beta, in_check, static_eval, improving, stack_entry.killer_a, stack_entry.killer_b)) {
-            const gives_check = quietMoveGivesCheck(pos, mv);
+            const gives_check = nodeGivesCheck(&check_info, pos, mv);
             gives_check_hint = gives_check;
             if (!gives_check) {
                 ctx.noteQuietFutilityPrune();
@@ -763,12 +899,12 @@ fn negamax(
             }
         }
         const lmp_fires = if (basin.ENABLED)
-            (can_prune_move and is_quiet and !in_check and beta - alpha <= 1 and move_index >= basin.lmpThreshold(search_depth, improving) and
+            (can_prune_move and is_quiet and !in_check and beta - alpha <= 1 and move_index >= (if (comptime build_options.tuning) basin_config.params.lmpThreshold(search_depth, improving) else basin.lmpThreshold(search_depth, improving)) and
                 !isKillerMove(stack_entry, mv))
         else
             (can_prune_move and pruning.shouldLatePrune(search_depth, move_index, mv, alpha, beta, in_check, improving, stack_entry.killer_a, stack_entry.killer_b));
         if (lmp_fires) {
-            const gives_check = gives_check_hint orelse quietMoveGivesCheck(pos, mv);
+            const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
             gives_check_hint = gives_check;
             if (!gives_check) {
                 ctx.noteLatePrune();
@@ -778,12 +914,12 @@ fn negamax(
         }
         const history_prune_fires = if (basin.ENABLED)
             (can_prune_move and is_quiet and !in_check and beta - alpha <= 1 and move_index >= 3 and !isKillerMove(stack_entry, mv) and
-                basin_lmr_depth <= basin.HISTORY_PRUNE_LMRDEPTH_MAX and
-                quiet_history_score < basin.historyPruneThreshold(search_depth))
+                basin_lmr_depth <= (if (comptime build_options.tuning) basin_config.params.history_prune_lmr_depth_max else basin.HISTORY_PRUNE_LMRDEPTH_MAX) and
+                quiet_history_score < (if (comptime build_options.tuning) basin_config.params.historyPruneThreshold(search_depth) else basin.historyPruneThreshold(search_depth)))
         else
             (can_prune_move and pruning.shouldHistoryPruneQuiet(search_depth, move_index, mv, alpha, beta, in_check, quiet_history_score, stack_entry.killer_a, stack_entry.killer_b));
         if (is_quiet and history_prune_fires) {
-            const gives_check = gives_check_hint orelse quietMoveGivesCheck(pos, mv);
+            const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
             gives_check_hint = gives_check;
             if (!gives_check) {
                 ctx.noteLatePrune();
@@ -791,17 +927,38 @@ fn negamax(
                 continue;
             }
         }
-        if (can_prune_move and is_quiet and pruning.seeQuietPruneGate(search_depth, move_index, alpha, beta, in_check) and
-            !isKillerMove(stack_entry, mv))
-        {
-            // SEE is expensive, so it is only computed once the cheap gate passes.
-            if (see.quietScore(pos, mv) < pruning.seeQuietPruneMargin(search_depth)) {
-                const gives_check = gives_check_hint orelse quietMoveGivesCheck(pos, mv);
-                gives_check_hint = gives_check;
-                if (!gives_check) {
-                    ctx.noteLatePrune();
-                    outcome_flags.late_move_prune = true;
-                    continue;
+        if (can_prune_move and is_quiet and !isKillerMove(stack_entry, mv) and !(gives_check_hint orelse false)) {
+            const basin_see_gate = basin.ENABLED and basin.SEE_PRUNE_QUIETS and !in_check and
+                !score_mod.isMateLike(best_score) and best_score > -qsearch.INF + 1024 and basin_lmr_depth <= 6;
+            const legacy_see_gate = pruning.seeQuietPruneGate(search_depth, move_index, alpha, beta, in_check);
+            if (basin_see_gate or legacy_see_gate) {
+                // The outer SEE fold is max(0, mover_value - reply), so a
+                // quiet move cannot score below minus its material value.
+                const floor = -piece_values.value(cont_piece);
+                const basin_threshold = if (basin_see_gate)
+                    (if (comptime build_options.tuning) basin_config.params.seePruneThresholdQuiet(basin_lmr_depth) else basin.seePruneThresholdQuiet(basin_lmr_depth))
+                else
+                    floor;
+                const legacy_threshold = if (legacy_see_gate) pruning.seeQuietPruneMargin(search_depth) else floor;
+                if (basin_threshold > floor or legacy_threshold > floor) {
+                    const union_threshold = @max(basin_threshold, legacy_threshold);
+                    if (see.quietBelow(pos, mv, union_threshold)) {
+                        const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
+                        gives_check_hint = gives_check;
+                        if (!gives_check) {
+                            if (comptime context_mod.stats_enabled) {
+                                const basin_see_prune = basin_see_gate and
+                                    (basin_threshold >= legacy_threshold or see.quietBelow(pos, mv, basin_threshold));
+                                if (basin_see_prune) {
+                                    ctx.noteQuietFutilityPrune();
+                                } else {
+                                    ctx.noteLatePrune();
+                                    outcome_flags.late_move_prune = true;
+                                }
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -817,14 +974,11 @@ fn negamax(
         if (ctx.recordMoveOrder() and is_quiet) searched_quiet_count += 1;
         // The returned key keeps the prefetch/push chain on the register value
         // instead of a load waiting on makeMove's own zobrist store.
+        // gives_check (= the child's in_check) from the per-node context: the
+        // post-make isInCheck this replaced was the same predicate, one attack
+        // query per searched move; the context answers in two bitboard tests.
+        const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
         const child_key = make_unmake.makeMove(pos, mv, &stack_entry.state);
-        // gives_check: post-make isInCheck when no hint exists — in sparse
-        // positions this beats the mask-op predicate (R7 timing: predicate
-        // here cost +5% endgame); the predicate stays at the PRUNING sites
-        // where it eliminates whole make/unmake round trips. The checked side
-        // comes from the pre-move register value (mover's opponent), not a
-        // reload of the byte makeMove just stored.
-        const gives_check = gives_check_hint orelse legal.isInCheck(pos, moved_side.other());
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
         resources.rfp_hint.prefetch(child_key); // and the RFP-hint cluster (probed per negamax node)
         ctx.repetition.push(child_key);
@@ -841,17 +995,44 @@ fn negamax(
         // So: extend at shallow depth always (tactical net) and at ANY depth when
         // the checker is failing low (this line needs a rescue); never otherwise.
         const checker_desperate = (static_eval orelse alpha) <= alpha;
-        var extension: u16 = if (gives_check and (search_depth <= CHECK_EXTENSION_MAX_DEPTH or checker_desperate)) 1 else 0;
-        if (extension > 0) ctx.noteCheckExtension();
-        if (extension == 0) {
-            if (singular_plan) |plan| {
-                if (plan.mv == mv) {
-                    extension = plan.extension;
-                    ctx.noteSingularExtension();
+        const check_extension: i16 = if (shallow_arms.checkExtensionEnabled() and gives_check and (search_depth <= CHECK_EXTENSION_MAX_DEPTH or checker_desperate)) 1 else 0;
+        var extension = check_extension;
+        var check_extension_selected = check_extension > 0;
+        if (singular_plan) |plan| {
+            if (plan.mv == mv and (plan.extension < 0 or extension == 0)) {
+                extension = plan.extension;
+                check_extension_selected = false;
+                if (extension > 0) ctx.noteSingularExtension();
+            }
+        }
+        if (singular_plan == null) {
+            if (tt_move) |candidate| {
+                if (candidate == mv) {
+                    if (tt_entry) |entry| {
+                        if (static_eval) |evaluated| {
+                            const ldse_extension = shallow_arms.ldseExtension(
+                                singular_test_applied,
+                                search_depth,
+                                in_check,
+                                evaluated,
+                                alpha,
+                                entry.bound == .lower,
+                                node_ctx.pv_node,
+                                entry.depth,
+                            );
+                            if (ldse_extension > extension) {
+                                extension = ldse_extension;
+                                check_extension_selected = false;
+                            }
+                        }
+                    }
                 }
             }
         }
-        const child_base_depth = search_depth - 1 + extension;
+        if (check_extension_selected) ctx.noteCheckExtension();
+        const negative_extension = extension < 0;
+        const child_base_depth = shallow_arms.childDepth(search_depth, extension);
+        const negative_child_ctx = node_context.NodeContext{ .pv_node = false, .cut_node = true };
 
         // Lazy accumulator: record the move only (a couple of byte stores). The
         // old ~210B Position snapshot — the store-forward-stall family in the
@@ -863,11 +1044,12 @@ fn negamax(
         var reduction: u16 = 0;
         var score: types.Score = undefined;
         if (move_index == 0) {
-            score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, node_ctx.firstChild(), null, gives_check);
+            shallow_arms.setParentLmrReduction(child_entry, 0);
+            score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.firstChild(), null, gives_check);
         } else {
             if (basin.ENABLED) {
                 const ttpv_fail_low = node_ttpv and (if (tt_entry) |entry| entry.score <= alpha else false);
-                const r1024 = basin.lmrReduction1024(.{
+                const lmr_inputs = basin.LmrInputs{
                     .depth = search_depth,
                     .move_number = move_number,
                     .is_noisy = !is_quiet,
@@ -877,16 +1059,18 @@ fn negamax(
                     .gives_check = gives_check,
                     .tt_move_is_noisy = if (tt_move) |move| move.isCapture() else false,
                     .alpha_raises = alpha_raises,
-                    .history = quiet_history_score,
+                    .history = basin_history_score,
                     .ttpv = node_ttpv,
                     .ttpv_fail_low = ttpv_fail_low,
                     .complexity = complexity_cp,
-                });
+                };
+                const r1024 = if (comptime build_options.tuning) basin_config.lmrReduction1024(lmr_inputs) else basin.lmrReduction1024(lmr_inputs);
                 const reduction_plies = @divTrunc(r1024, 1024);
                 const reduced: u16 = if (child_base_depth == 0) 0 else blk: {
                     var target = std.math.clamp(@as(i32, child_base_depth) - reduction_plies, 1, @as(i32, child_base_depth));
                     if (node_ctx.pv_node) target += 1;
-                    if (node_ttpv and r1024 < -886) target += 1;
+                    const tt_pv_brake = if (comptime build_options.tuning) basin_config.params.lmr_tt_pv_brake else basin.defaults.lmr_tt_pv_brake;
+                    if (node_ttpv and r1024 < tt_pv_brake) target += 1;
                     break :blk @intCast(std.math.clamp(target, 1, @as(i32, child_base_depth)));
                 };
                 reduction = child_base_depth - reduced;
@@ -895,17 +1079,20 @@ fn negamax(
                     if (move_order_sample) |sample| ctx.noteMoveOrderLmrReduction(sample);
                 }
                 ctx.notePvsScout();
-                score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null, gives_check);
+                shallow_arms.setParentLmrReduction(child_entry, reduction);
+                score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.scoutChild(), null, gives_check);
                 if (!ctx.stopped and reduction > 0 and score > alpha) {
                     var research_depth: i32 = child_base_depth;
-                    if (score > best_score + basin.deeperThreshold(child_base_depth)) research_depth += 1;
+                    const deeper_threshold = if (comptime build_options.tuning) basin_config.params.deeperThreshold(child_base_depth) else basin.deeperThreshold(child_base_depth);
+                    if (score > best_score + deeper_threshold) research_depth += 1;
                     if (score < best_score + child_base_depth) research_depth -= 1;
                     const verified_depth: u16 = @intCast(std.math.clamp(research_depth, 1, @as(i32, child_base_depth) + 1));
                     ctx.noteLmrResearch(move_index, reduction, score, alpha, quiet_history_score, node_ctx.pv_node, node_ctx.cut_node);
                     if (move_order_sample) |sample| ctx.noteMoveOrderLmrResearch(sample);
                     outcome_flags.lmr_research = true;
                     if (verified_depth > reduced) {
-                        score = -negamax(ctx, resources, pos, verified_depth, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null, gives_check);
+                        shallow_arms.setParentLmrReduction(child_entry, reduction);
+                        score = -negamax(ctx, resources, pos, verified_depth, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.scoutChild(), null, gives_check);
                     }
                     if (!ctx.stopped) {
                         if (score <= alpha) {
@@ -923,12 +1110,14 @@ fn negamax(
                 }
                 ctx.notePvsScout();
                 const reduced = if (reduction >= child_base_depth) 0 else child_base_depth - reduction;
-                score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null, gives_check);
+                shallow_arms.setParentLmrReduction(child_entry, reduction);
+                score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.scoutChild(), null, gives_check);
                 if (!ctx.stopped and reduction > 0 and score > alpha) {
                     ctx.noteLmrResearch(move_index, reduction, score, alpha, quiet_history_score, node_ctx.pv_node, node_ctx.cut_node);
                     if (move_order_sample) |sample| ctx.noteMoveOrderLmrResearch(sample);
                     outcome_flags.lmr_research = true;
-                    score = -negamax(ctx, resources, pos, child_base_depth, -alpha - 1, -alpha, ply + 1, true, node_ctx.scoutChild(), null, gives_check);
+                    shallow_arms.setParentLmrReduction(child_entry, reduction);
+                    score = -negamax(ctx, resources, pos, child_base_depth, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.scoutChild(), null, gives_check);
                     if (!ctx.stopped) {
                         if (score <= alpha) {
                             outcome_flags.lmr_verification_fail_low = true;
@@ -940,7 +1129,8 @@ fn negamax(
             }
             if (!ctx.stopped and score > alpha and score < beta) {
                 ctx.notePvsResearch();
-                score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null, gives_check);
+                shallow_arms.setParentLmrReduction(child_entry, reduction);
+                score = -negamax(ctx, resources, pos, child_base_depth, -beta, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_context.NodeContext.fromWindow(-beta, -alpha, false), null, gives_check);
             }
         }
 
@@ -973,7 +1163,7 @@ fn negamax(
             }
             if (excluded_move == null) {
                 if (moved_piece_type) |quiet_piece_type| {
-                    applyQuietCutoffLearning(resources.history, stack_entry, &cont, pos.side_to_move, mv, quiet_piece_type, quiets_tried[0..quiet_count], quiet_pieces_tried[0..quiet_count], search_depth);
+                    applyQuietCutoffLearning(resources.history, if (comptime build_options.tuning) &basin_config.params else {}, stack_entry, &cont, pos.side_to_move, mv, quiet_piece_type, quiets_tried[0..quiet_count], quiet_pieces_tried[0..quiet_count], search_depth);
                 }
             }
             break;
@@ -1010,19 +1200,46 @@ fn negamax(
     return best_score;
 }
 
-fn quietMoveGivesCheck(pos: *position.Position, mv: move_mod.Move) bool {
-    // Both branches are EXACT (equivalence-tested), so dispatching by board
-    // density is behavior-free. Dense boards: the attack-geometry predicate
-    // wins (eliminates the make/unmake round trip). Sparse boards: the live
-    // make round trip is cheaper than the predicate's mask assembly (R7
-    // timing: predicate-everywhere cost +2.5% endgame).
-    if (@popCount(pos.occupancy()) >= 14) return legal.givesCheck(pos, mv);
-    const mover = pos.side_to_move;
-    var state = make_unmake.StateInfo{};
-    _ = make_unmake.makeMove(pos, mv, &state);
-    const gives_check = legal.isInCheck(pos, mover.other());
-    make_unmake.unmakeMove(pos, mv, &state);
-    return gives_check;
+/// The eager path's scoring block, shared with the lazy (hash-move-first)
+/// path so both produce byte-identical scores and statistics.
+fn scoreGeneratedMoves(
+    ctx: *context_mod.SearchContext,
+    pos: *const position.Position,
+    moves: *const move_mod.MoveList,
+    tt_move: ?move_mod.Move,
+    stack_entry: anytype,
+    countermove: ?move_mod.Move,
+    history: *const @import("history.zig").HistoryTable,
+    cont: *const @import("history.zig").ContContext,
+    scores: *[move_mod.MAX_MOVES]i32,
+    capture_see_scores: *[move_mod.MAX_MOVES]i32,
+    staged_counts: *StagedMoveCounts,
+) void {
+    if (ctx.recordMoveOrder()) {
+        staged_counts.* = stagedMoveCounts(moves);
+        ctx.noteStagedMainMoveList(moves.count, staged_counts.quiet, staged_counts.tactical, containsMove(moves, tt_move));
+        if (hasPreviousQuietMove(stack_entry)) {
+            ctx.noteCountermoveTableProbe(countermove, containsMove(moves, countermove));
+        }
+    }
+    ordering.scoreMoves(
+        pos,
+        moves,
+        tt_move,
+        .{ .a = stack_entry.killer_a, .b = stack_entry.killer_b },
+        countermove,
+        history,
+        cont,
+        scores,
+        capture_see_scores,
+    );
+}
+
+fn nodeGivesCheck(info: *legal.CheckInfo, pos: *const position.Position, mv: move_mod.Move) bool {
+    // Replaces the per-move predicate / make-unmake round trip (R7's density
+    // dispatch): one lazily built per-node context, exact (see legal.CheckInfo).
+    info.ensure(pos);
+    return info.givesCheck(pos, mv);
 }
 
 fn stagedMoveCounts(moves: *const move_mod.MoveList) StagedMoveCounts {
@@ -1054,14 +1271,15 @@ fn canTrySingular(
 ) bool {
     if (excluded_move != null) return false;
     if (node_ctx.pv_node or !node_ctx.cut_node) return false;
-    if (search_depth < SINGULAR_MIN_DEPTH or search_depth > SINGULAR_MAX_DEPTH) return false;
+    if (search_depth < shallow_arms.singularMinDepth() or search_depth > shallow_arms.singularMaxDepth()) return false;
 
     const entry = tt_entry orelse return false;
     const mv = tt_move orelse return false;
     if (entry.bound != .lower) return false;
     if (mv.isPromotion()) return false;
     if (score_mod.isMateLike(entry.score)) return false;
-    return entry.depth >= @as(i16, @intCast(search_depth));
+    const required_depth = @as(i16, @intCast(search_depth)) - shallow_arms.singularTtDepthSlack();
+    return entry.depth >= @max(required_depth, 0);
 }
 
 /// ProbCut: at a non-PV node, if a good capture's REDUCED-depth search already beats
@@ -1106,9 +1324,15 @@ fn tryProbCut(
         if (mv.isCapture() and !mv.isPromotion() and picker.captureSee(index) < required_gain) continue;
 
         const entry = ctx.stack.entry(ply);
+        const child_entry = ctx.stack.entry(ply + 1);
+        const moving_piece = pos.pieceAt(mv.from);
         const child_key = make_unmake.makeMove(pos, mv, &entry.state);
         resources.tt.prefetch(child_key);
         ctx.repetition.push(child_key);
+        child_entry.prev_move = mv;
+        child_entry.prev_piece_type = null;
+        child_entry.prev_cont_piece = moving_piece.pieceType();
+        shallow_arms.setParentLmrReduction(child_entry, 0);
         resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
         // cheap qsearch pre-verification, then the reduced-depth confirmation
         var score = -qsearch.search(ctx, resources, pos, -probcut_beta, -probcut_beta + 1, ply + 1, null);
@@ -1142,14 +1366,14 @@ fn trySingularPlan(
     stack_entry: anytype,
     countermove: ?move_mod.Move,
     beta: types.Score,
-) ?SingularPlan {
-    if (!canTrySingular(search_depth, node_ctx, tt_entry, tt_move, excluded_move)) return null;
+) SingularAttempt {
+    if (!canTrySingular(search_depth, node_ctx, tt_entry, tt_move, excluded_move)) return .{};
 
-    const entry = tt_entry orelse return null;
-    const candidate = tt_move orelse return null;
+    const entry = tt_entry orelse return .{};
+    const candidate = tt_move orelse return .{};
 
-    const required_depth: i16 = @intCast(search_depth);
-    if (entry.depth < required_depth + SINGULAR_REQUIRED_DEPTH_SURPLUS) return null;
+    const required_depth = @as(i16, @intCast(search_depth)) - shallow_arms.singularTtDepthSlack();
+    if (entry.depth < @max(required_depth, 0)) return .{};
 
     const alternative_quality = classifySingularAlternatives(
         pos,
@@ -1160,14 +1384,16 @@ fn trySingularPlan(
         countermove,
         resources.history,
     );
-    if (!alternative_quality.isWeak()) return null;
-    ctx.noteSingularWeakAlternativeCandidate();
+    if (shallow_arms.singularWeakGateEnabled()) {
+        if (!alternative_quality.isWeak()) return .{};
+        ctx.noteSingularWeakAlternativeCandidate();
+    }
 
     const margin = singularMargin(search_depth);
     const singular_beta = std.math.clamp(entry.score - margin, -qsearch.INF, qsearch.INF);
     const verification_alpha = singular_beta - 1;
     const verification_depth = singularVerificationDepth(search_depth);
-    if (verification_depth == 0) return null;
+    if (verification_depth == 0) return .{};
 
     ctx.noteSingularVerification();
     const verification_score = negamax(
@@ -1183,21 +1409,25 @@ fn trySingularPlan(
         candidate,
         false,
     );
-    if (ctx.stopped) return null;
+    if (ctx.stopped) return .{ .applied = true };
     if (verification_score < singular_beta) {
         ctx.noteSingularVerified();
         if (verification_score <= singular_beta - SINGULAR_EXTENSION_MARGIN) {
-            return .{ .mv = candidate };
+            return .{ .applied = true, .plan = .{ .mv = candidate } };
         }
-        return null;
+        return .{ .applied = true };
     }
     // Verification failed high WITHOUT the TT move: a second refutation exists. If the
     // verification bound already clears beta, cut the node (multicut). Mate-band scores
     // are excluded — bounds near mate don't compose across the reduced-depth verify.
     if (MULTICUT_ENABLED and singular_beta >= beta and !score_mod.isMateLike(singular_beta)) {
-        return .{ .mv = candidate, .extension = 0, .multicut = singular_beta };
+        return .{ .applied = true, .plan = .{ .mv = candidate, .extension = 0, .multicut = singular_beta } };
     }
-    return null;
+    const negative_extension = shallow_arms.singularNegativeExtension(entry.score, beta, node_ctx.cut_node);
+    if (negative_extension < 0) {
+        return .{ .applied = true, .plan = .{ .mv = candidate, .extension = negative_extension } };
+    }
+    return .{ .applied = true };
 }
 
 fn classifySingularAlternatives(
@@ -1304,6 +1534,7 @@ fn hasPreviousQuietMove(stack_entry: anytype) bool {
 
 fn applyQuietCutoffLearning(
     history: *history_mod.HistoryTable,
+    basin_policy: if (build_options.tuning) *const basin.Params else void,
     stack_entry: anytype,
     cont: *const history_mod.ContContext,
     side: types.Color,
@@ -1314,11 +1545,19 @@ fn applyQuietCutoffLearning(
     depth: u16,
 ) void {
     rememberKiller(stack_entry, mv);
-    history.bonus(side, moved_piece_type, mv.to, depth);
-    history.contBonus(cont, history_mod.contKey(side, moved_piece_type, mv.to), depth);
-    penalizeFailedQuiets(history, side, quiets, quiet_pieces, depth);
+    if (comptime build_options.tuning) {
+        history.bonusWithPolicy(basin_policy, side, moved_piece_type, mv.to, depth);
+        history.contBonusWithPolicy(basin_policy, cont, history_mod.contKey(side, moved_piece_type, mv.to), depth);
+    } else {
+        history.bonus(side, moved_piece_type, mv.to, depth);
+        history.contBonus(cont, history_mod.contKey(side, moved_piece_type, mv.to), depth);
+    }
+    penalizeFailedQuiets(history, basin_policy, side, quiets, quiet_pieces, depth);
     for (quiets, quiet_pieces) |quiet, quiet_piece| {
-        history.contPenalize(cont, history_mod.contKey(side, quiet_piece, quiet.to), depth);
+        if (comptime build_options.tuning)
+            history.contPenalizeWithPolicy(basin_policy, cont, history_mod.contKey(side, quiet_piece, quiet.to), depth)
+        else
+            history.contPenalize(cont, history_mod.contKey(side, quiet_piece, quiet.to), depth);
     }
 
     const previous_move = stack_entry.prev_move orelse return;
@@ -1376,6 +1615,7 @@ fn rememberKiller(entry: anytype, mv: move_mod.Move) void {
 
 fn penalizeFailedQuiets(
     history: anytype,
+    basin_policy: if (build_options.tuning) *const basin.Params else void,
     side: types.Color,
     quiets: []const move_mod.Move,
     quiet_pieces: []const piece.PieceType,
@@ -1383,7 +1623,10 @@ fn penalizeFailedQuiets(
 ) void {
     std.debug.assert(quiets.len == quiet_pieces.len);
     for (quiets, quiet_pieces) |quiet, quiet_piece| {
-        history.penalize(side, quiet_piece, quiet.to, depth);
+        if (comptime build_options.tuning)
+            history.penalizeWithPolicy(basin_policy, side, quiet_piece, quiet.to, depth)
+        else
+            history.penalize(side, quiet_piece, quiet.to, depth);
     }
 }
 
@@ -1397,7 +1640,7 @@ test "penalize failed quiets updates only the provided piece-to entries" {
     };
     const quiet_pieces = [_]piece.PieceType{ .pawn, .knight };
 
-    penalizeFailedQuiets(&history_table, .white, &quiets, &quiet_pieces, 5);
+    penalizeFailedQuiets(&history_table, if (comptime build_options.tuning) &default_basin_policy else {}, .white, &quiets, &quiet_pieces, 5);
 
     try std.testing.expect(history_table.score(.white, .pawn, .a3) < 0);
     try std.testing.expect(history_table.score(.white, .knight, .f3) < 0);
@@ -1428,10 +1671,12 @@ test "depth-zero negamax counts one honest horizon node" {
     const rfp_hint_mod = @import("rfp_hint.zig");
     const time = @import("time.zig");
 
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
     var stop_flag = std.atomic.Value(bool).init(false);
     var ctx = context_mod.SearchContext{
         .repetition = .{},
         .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
     };
     var history_table = history.HistoryTable{};
     var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
@@ -1472,10 +1717,12 @@ test "reverse futility does not publish a heuristic tt bound" {
     const rfp_hint_mod = @import("rfp_hint.zig");
     const time = @import("time.zig");
 
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
     var stop_flag = std.atomic.Value(bool).init(false);
     var ctx = context_mod.SearchContext{
         .repetition = .{},
         .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
     };
     var history_table = history.HistoryTable{};
     var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
@@ -1502,10 +1749,12 @@ test "reverse futility hint reuses on second probe without evaluating" {
     const rfp_hint_mod = @import("rfp_hint.zig");
     const time = @import("time.zig");
 
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
     var stop_flag = std.atomic.Value(bool).init(false);
     var ctx = context_mod.SearchContext{
         .repetition = .{},
         .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
     };
     var history_table = history.HistoryTable{};
     var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
@@ -1538,10 +1787,12 @@ test "basin futility searches a first quiet move before pruning" {
     const rfp_hint_mod = @import("rfp_hint.zig");
     const time = @import("time.zig");
 
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
     var stop_flag = std.atomic.Value(bool).init(false);
     var ctx = context_mod.SearchContext{
         .repetition = .{},
         .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
     };
     var history_table = history.HistoryTable{};
     var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
@@ -1573,10 +1824,12 @@ test "ProbCut stores raw rather than corrected static eval" {
     const rfp_hint_mod = @import("rfp_hint.zig");
     const time = @import("time.zig");
 
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
     var stop_flag = std.atomic.Value(bool).init(false);
     var ctx = context_mod.SearchContext{
         .repetition = .{},
         .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
     };
     var history_table = history.HistoryTable{};
     var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
@@ -1633,7 +1886,7 @@ test "quiet cutoff learning updates killer history and countermove" {
     const tried_pieces = [_]piece.PieceType{.knight};
     const cont = history.ContContext{};
 
-    applyQuietCutoffLearning(&history_table, &stack_entry, &cont, .black, cutoff_move, .knight, &tried_quiets, &tried_pieces, 4);
+    applyQuietCutoffLearning(&history_table, if (comptime build_options.tuning) &default_basin_policy else {}, &stack_entry, &cont, .black, cutoff_move, .knight, &tried_quiets, &tried_pieces, 4);
 
     try std.testing.expectEqual(cutoff_move, stack_entry.killer_a.?);
     try std.testing.expect(history_table.score(.black, .knight, .f6) > 0);
@@ -1712,10 +1965,12 @@ test "root search depth one returns a move in start position" {
     const rfp_hint_mod = @import("rfp_hint.zig");
     const tt = @import("tt.zig");
 
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
     var stop_flag = std.atomic.Value(bool).init(false);
     var ctx = context_mod.SearchContext{
         .repetition = .{},
         .control = .{ .stop_flag = &stop_flag, .limits = .{ .depth = 1 } },
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
     };
     var history_table = history.HistoryTable{};
     var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});

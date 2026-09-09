@@ -32,6 +32,8 @@ pub fn write(writer: anytype, result: *const search_engine.SearchResult, elapsed
     try writer.print("iir_cut_reductions {d}\n", .{stats.iir_cut_reductions});
     try writer.print("iir_all_reductions {d}\n", .{stats.iir_all_reductions});
     try writer.print("check_extensions {d}\n", .{stats.check_extensions});
+    try writer.print("hindsight_depth_extensions {d}\n", .{stats.hindsight_depth_extensions});
+    try writer.print("hindsight_depth_reductions {d}\n", .{stats.hindsight_depth_reductions});
     try writer.print("rfp_hint_probes {d}\n", .{stats.rfp_hint_probes});
     try writer.print("rfp_hint_cutoffs {d}\n", .{stats.rfp_hint_cutoffs});
     try writer.print("rfp_hint_cutoffs_depth_1 {d}\n", .{stats.rfp_hint_cutoffs_depth_1});

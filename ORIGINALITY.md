@@ -9,9 +9,8 @@ contributions.
 
 Every line of `zigqueen`'s engine code was written for this project. Ideas
 are taken from the public literature and from open-source engines and are
-credited in `docs/PROVENANCE.md`; code is not. That page also lists the two
-cases where 6.1.0 falls short of these rules and what is being done about
-them.
+credited in `docs/PROVENANCE.md`; code is not. That page records historical exceptions, removals and the
+measured retunes shipped since the initial parameter port.
 
 The goal is to avoid carrying forward:
 - migration-shaped structure
@@ -33,9 +32,11 @@ This includes:
 These rules stand. One exception is on record, and it is being corrected,
 not accepted: in 6.1.0 the reduction and pruning constants in
 `src/search/basin.zig` are Stormphrax 8.0.0's published defaults rather
-than values derived here. The code is ours; the numbers are not.
-`docs/PROVENANCE.md` discloses this, and the constants are being replaced
-by values derived from zigqueen's own measurements.
+than values derived here. The original code is ours; the initial numbers were not. In 6.2.0 a local
+12-coordinate SPSA experiment changes 11 pruning values; the remaining
+inherited defaults and formula lineage still require attribution.
+`docs/PROVENANCE.md` records the exact before/after values. Retuning does
+not erase the original source or make all remaining values independent.
 
 Two third-party libraries are vendored under their own licenses: Fathom
 (Syzygy probing, MIT) and the Android OEX provider library (Apache-2.0).

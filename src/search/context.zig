@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const basin = @import("basin.zig");
 const core_types = @import("../core/types.zig");
 const move_mod = @import("../core/move.zig");
 const eval_backend = @import("../eval/backend.zig");
@@ -63,6 +64,8 @@ pub const SearchContext = struct {
     nodes: u64 = 0,
     seldepth: u16 = 0,
     stopped: bool = false,
+    /// Immutable during one search. Absent from the release flavour.
+    basin_config: if (build_options.tuning) *const basin.Config else void = if (build_options.tuning) undefined else {},
     /// Null-move verification (SF nmp_min_ply): while a verification search runs,
     /// null move is disabled for all plies below this marker so verify subtrees
     /// cannot recursively null-cut / re-verify (depth-efficiency v2).
@@ -156,6 +159,16 @@ pub const SearchContext = struct {
     pub fn noteCheckExtension(self: *SearchContext) void {
         if (comptime !stats_enabled) return;
         self.stats.check_extensions += 1;
+    }
+
+    pub fn noteHindsightDepthExtension(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.hindsight_depth_extensions += 1;
+    }
+
+    pub fn noteHindsightDepthReduction(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.hindsight_depth_reductions += 1;
     }
 
     pub fn noteRfpHintProbe(self: *SearchContext) void {

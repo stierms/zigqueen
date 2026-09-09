@@ -60,6 +60,35 @@ pub fn quietScore(pos: *const position.Position, mv: move_mod.Move) i32 {
     return -seeGain(pos, occupied, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
 }
 
+/// Exact threshold predicate for quietScore, using the same attacker sequence.
+/// For G=max(0,V-reply), G>K is equivalent to !(reply>V-K-1) when
+/// 0<=K<V. Carry that inversion until a material bound or empty tail decides it.
+pub fn quietBelow(pos: *const position.Position, mv: move_mod.Move, threshold: i32) bool {
+    // quietScore is nonpositive, including its capture/empty-source sentinels.
+    if (threshold > 0) return true;
+    if (mv.isCapture()) return false;
+    const moving_piece = pos.pieceAt(mv.from);
+    if (moving_piece == .none) return false;
+    const mover_after_type = if (mv.promotionPieceType()) |promotion| promotion else moving_piece.pieceType();
+    var victim_value = piece_values.value(mover_after_type);
+    // This also handles minInt(i32) before negating the threshold.
+    if (threshold <= -victim_value) return false;
+
+    var bound = -threshold;
+    var inverted = false;
+    var occupied = (pos.occupied & ~bitboard.bit(mv.from)) | bitboard.bit(mv.to);
+    var side = pos.side_to_move.other();
+    while (true) {
+        if (bound >= victim_value) return inverted;
+        const attacker = leastValuableAttacker(pos, occupied, side, mv.to) orelse return inverted;
+        bound = victim_value - bound - 1;
+        victim_value = piece_values.value(attacker.piece_type);
+        occupied &= ~bitboard.bit(attacker.from);
+        side = side.other();
+        inverted = !inverted;
+    }
+}
+
 fn seeGain(pos: *const position.Position, start_occupied: bitboard.Bitboard, side: types.Color, target: square.Square, victim_value: i32) i32 {
     var gains: [32]i32 = undefined;
     var ply: usize = 0;
@@ -84,7 +113,7 @@ fn seeGain(pos: *const position.Position, start_occupied: bitboard.Bitboard, sid
     return gain;
 }
 
-fn leastValuableAttacker(pos: *const position.Position, occupied: bitboard.Bitboard, side: types.Color, target: square.Square) ?Attacker {
+inline fn leastValuableAttacker(pos: *const position.Position, occupied: bitboard.Bitboard, side: types.Color, target: square.Square) ?Attacker {
     const row = pos.pieceRow(side);
 
     var candidates = row[pieceTypeIndex(.pawn)] & occupied & pawnAttackers(side, target);
@@ -258,6 +287,23 @@ fn expectSeeMatchesReference(pos: *position.Position) !usize {
     for (moves.slice()) |mv| {
         try @import("std").testing.expectEqual(captureScoreReference(pos, mv), captureScore(pos, mv));
         try @import("std").testing.expectEqual(quietScoreReference(pos, mv), quietScore(pos, mv));
+        if (!mv.isCapture() and !mv.isPromotion()) {
+            const floor = -piece_values.value(pos.pieceAt(mv.from).pieceType());
+            const reference = quietScoreReference(pos, mv);
+            try @import("std").testing.expect(reference >= floor);
+            for ([_]i32{ floor - 1, floor, floor + 1, 0 }) |threshold| {
+                try @import("std").testing.expectEqual(reference < threshold, threshold > floor and quietScore(pos, mv) < threshold);
+            }
+        }
+        const reference_quiet = quietScoreReference(pos, mv);
+        for ([_]i32{
+            @import("std").math.minInt(i32), -901,                -900,                            -501, -500,
+            -331,                            -330,                -321,                            -320, -101,
+            -100,                            -1,                  0,                               1,    reference_quiet - 1,
+            reference_quiet,                 reference_quiet + 1, @import("std").math.maxInt(i32),
+        }) |threshold| {
+            try @import("std").testing.expectEqual(reference_quiet < threshold, quietBelow(pos, mv, threshold));
+        }
     }
     return moves.count;
 }

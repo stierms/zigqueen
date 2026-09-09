@@ -29,10 +29,10 @@ Run before any serious candidate screen (requires Zig 0.15.2 and
 - Bounds `elo0=0`, `elo1=5`, `alpha=beta=0.05`. H1 reached: accept
   (subject to the second leg). H0 reached, or unresolved at the cap and
   non-positive: reject.
-- Accepted changes are confirmed with a second SPRT leg at a
-  deploy-relevant TC (`60+0.6`, tablebases on) — H1 at both legs or no
-  merge. Fast-TC gains that buy depth or trade speed for eval can compress
-  or invert at longer time controls; the second leg is what catches that.
+- A longer, deployment-relevant test checks transfer of fast-TC gains.
+  An unresolved test is not an H1 pass. Any explicit acceptance of
+  neutral-to-positive unresolved evidence must retain that status and
+  document the release-level external validation; see `STRENGTH.md`.
 - Time-management candidates additionally pass a fast-TC screen with an
   any-time-loss veto.
 

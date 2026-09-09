@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const move_mod = @import("../core/move.zig");
 const piece = @import("../core/piece.zig");
 const position = @import("../core/position.zig");
@@ -36,6 +37,9 @@ pub const StackEntry = struct {
     /// used to key continuation history. Null only after a null move / at root.
     prev_cont_piece: ?piece.PieceType = null,
     static_eval: ?types.Score = null,
+    /// LMR reduction used by the parent to reach this child. The release
+    /// flavour stores no field bytes; shallow_arms' accessors compile away.
+    parent_lmr_reduction: if (build_options.tuning) u16 else void = if (build_options.tuning) 0 else {},
 };
 
 pub const SearchStack = struct {

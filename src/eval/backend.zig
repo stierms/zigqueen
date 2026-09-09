@@ -66,6 +66,17 @@ pub const Options = struct {
     eval_file_path: ?[]const u8 = null,
 };
 
+/// Re-exported so callers that share one net across engines (datagen --threads)
+/// can name the type without importing nnue768.
+pub const Net = nnue768.Net;
+
+/// Load the embedded default net as a standalone caller-owned object — the
+/// single shared copy behind `EngineState.initBorrowedNet`. Free with
+/// `net.destroy(allocator)` after every borrowing engine is deinited.
+pub fn loadDefaultNet(allocator: std.mem.Allocator) !*Net {
+    return nnue768.loadDefault(allocator);
+}
+
 pub const EngineState = struct {
     allocator: std.mem.Allocator,
     nnue_scale_percent: u16 = builtin_nnue_scale_percent,
@@ -74,6 +85,10 @@ pub const EngineState = struct {
     scale_explicit: bool = false,
     /// The active net (a `ZQB1` Chess768 net). Always set after `init`.
     net: ?*nnue768.Net = null,
+    /// False when `net` is borrowed (one shared read-only copy across worker
+    /// threads, datagen --threads): unload/deinit then leave it alive for the
+    /// owner. Weights are immutable after load, so sharing is race-free.
+    owns_net: bool = true,
     /// Owned path of a file-loaded net; null when using the embedded default.
     net_path: ?[]u8 = null,
 
@@ -87,6 +102,22 @@ pub const EngineState = struct {
         };
         errdefer state.deinit();
         try state.loadModelFile(options.eval_file_path orelse builtin_eval_file);
+        return state;
+    }
+
+    /// Borrow an already-loaded net instead of owning a private copy (the
+    /// datagen --threads seam: N per-thread engines around ONE 74.6MB weight
+    /// blob). The caller keeps ownership and must outlive this state; deinit
+    /// never destroys a borrowed net. Scale adoption matches `init`'s.
+    pub fn initBorrowedNet(allocator: std.mem.Allocator, net: *nnue768.Net, options: Options) EngineState {
+        var state = EngineState{
+            .allocator = allocator,
+            .nnue_scale_percent = options.nnue_scale_percent,
+            .scale_explicit = options.nnue_scale_percent != builtin_nnue_scale_percent,
+            .net = net,
+            .owns_net = false,
+        };
+        state.adoptNetScale();
         return state;
     }
 
@@ -323,8 +354,10 @@ pub const EngineState = struct {
 
     fn unload(self: *EngineState) void {
         if (self.net) |net| {
-            net.destroy(self.allocator);
+            if (self.owns_net) net.destroy(self.allocator);
             self.net = null;
+            // Any net installed after this point (loadModelFile) is owned.
+            self.owns_net = true;
         }
         if (self.net_path) |p| {
             self.allocator.free(p);
@@ -346,6 +379,24 @@ test "engine state loads the builtin default net and evaluates out-of-the-box" {
     const up_queen = try fen.parse("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     try std.testing.expect(@abs(nnue768.evaluate(state.net.?, &start, default_nnue_scale_percent)) < 120);
     try std.testing.expect(nnue768.evaluate(state.net.?, &up_queen, default_nnue_scale_percent) > 300);
+}
+
+test "borrowed net is shared (not copied) and survives engine-state deinit" {
+    const fen = @import("../core/fen.zig");
+    const allocator = std.testing.allocator;
+    const net = try loadDefaultNet(allocator);
+    defer net.destroy(allocator);
+
+    var a = EngineState.initBorrowedNet(allocator, net, .{});
+    var b = EngineState.initBorrowedNet(allocator, net, .{});
+    try std.testing.expect(a.net.? == b.net.?); // same object, no per-state copy
+    try std.testing.expectEqual(builtin_nnue_scale_percent, a.nnueScalePercent());
+    a.deinit();
+    b.deinit();
+
+    // The owner's copy must still be alive and usable after both borrowers die.
+    const start = try fen.startpos();
+    try std.testing.expect(@abs(nnue768.evaluate(net, &start, builtin_nnue_scale_percent)) < 400);
 }
 
 test "nnue scale percent rescales the evaluation magnitude" {

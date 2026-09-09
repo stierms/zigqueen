@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const eval_backend = @import("../eval/backend.zig");
+const basin = @import("../search/basin.zig");
 const tunables = @import("../search/tunables.zig");
 
 const max_string_option_len = 512;
@@ -19,6 +20,7 @@ pub const Options = struct {
     eval_file_len: usize = 0,
     syzygy_path_storage: [max_string_option_len]u8 = [_]u8{0} ** max_string_option_len,
     syzygy_path_len: usize = 0,
+    basin_params: if (build_options.tuning) basin.Params else void = if (build_options.tuning) .{} else {},
 
     pub fn writeUciOptions(self: *const Options, sink: anytype) !void {
         var hash_buffer: [96]u8 = undefined;
@@ -54,6 +56,11 @@ pub const Options = struct {
         if (comptime build_options.tuning) {
             inline for (tunables.specs) |spec| {
                 var buffer: [160]u8 = undefined;
+                const line = try std.fmt.bufPrint(&buffer, "option name {s} type spin default {d} min {d} max {d}\n", .{ spec.uci_name, spec.default, spec.min, spec.max });
+                try sink.writeAll(line);
+            }
+            inline for (basin.specs) |spec| {
+                var buffer: [192]u8 = undefined;
                 const line = try std.fmt.bufPrint(&buffer, "option name {s} type spin default {d} min {d} max {d}\n", .{ spec.uci_name, spec.default, spec.min, spec.max });
                 try sink.writeAll(line);
             }
@@ -163,6 +170,7 @@ pub const Options = struct {
         if (comptime build_options.tuning) {
             if (value.len != 0) {
                 if (std.fmt.parseInt(i32, value, 10)) |parsed| {
+                    if (basin.setParam(&self.basin_params, name, parsed)) return .applied;
                     if (tunables.set(name, parsed)) return .applied;
                 } else |_| {}
             }
@@ -193,6 +201,11 @@ pub const Options = struct {
             .nnue_scale_percent = self.nnue_scale_percent,
             .eval_file_path = self.evalFilePath(),
         };
+    }
+
+    pub fn basinParamsChanged(self: *const Options, previous: Options) bool {
+        if (comptime build_options.tuning) return !std.meta.eql(self.basin_params, previous.basin_params);
+        return false;
     }
 
     fn setEvalFilePath(self: *Options, value: []const u8) !void {
@@ -269,6 +282,17 @@ test "tuning setoption dispatch follows the build flavour" {
     } else {
         try std.testing.expectEqual(ApplyOptionResult.ignored, result);
         try std.testing.expectEqual(TunablesDefaults.razor_base, tunables.active.razor_base);
+    }
+}
+
+test "basin tuning setoption dispatch follows the build flavour" {
+    var options = Options{};
+    const result = try options.applySetOptionLine("setoption name BasinRfpLinear value 91");
+    if (build_options.tuning) {
+        try std.testing.expectEqual(ApplyOptionResult.applied, result);
+        try std.testing.expectEqual(@as(i32, 91), options.basin_params.rfp_linear);
+    } else {
+        try std.testing.expectEqual(ApplyOptionResult.ignored, result);
     }
 }
 

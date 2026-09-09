@@ -1,8 +1,8 @@
 # Provenance and licensing record
 
-**Status:** first version, September 2026, covering the 6.1.0 release. Every statement here can be checked against
-the public tree and the referenced sources. This is an engineering statement, not legal advice; it is updated when
-new facts come to light (dated list at the end).
+**Updated September 9, 2026 for 6.2.0.** This record distinguishes inherited
+ideas and initial parameters, local implementations and retunes, trained
+weights, data transformations and redistributed third-party code.
 
 ## Why this exists
 
@@ -19,8 +19,8 @@ https://github.com/stierms/zigqueen/issues.
 - **No copied code, no copied weights.** Source text — code, names, structure, comments — is the thing that must not
   be taken from another engine. zigqueen's engine code was written for zigqueen; where we say a subsystem "follows"
   another engine we mean the idea or the published parameter form, and we say which.
-- **Published forms are shared property.** Search techniques, NNUE architectures, feature-set definitions, training
-  recipes and tuning constants are ideas and functional facts; re-implementing them is normal and expected. When we
+- **Distinguish concepts from implementation.** Published descriptions inform our work;
+  they do not authorise copying implementation text or ignoring a source license. When we
   took not just the form but the *numbers* from a specific engine, we say so below and say what we did about it.
 - **Attribution in the docs**, and license notices wherever a license asks for them.
 
@@ -31,36 +31,58 @@ https://github.com/stierms/zigqueen/issues.
 | zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
 | Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1). No code. GPL-compatible. |
 | Stockfish 18 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§2, §3). No code. Training data: see next row. |
-| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03); the underlying fishtest game data is published under ODbL-1.0 (`official-stockfish/master-binpacks`) | Training data for the shipped network (§4): the same published diet Stockfish's master networks train on. ODbL notice below. |
+| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the shipped network (§4): published collections with local score alterations in the QAT continuation. Notice and alteration offer below. |
 | `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the 2024 components. |
-| Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | One component of the shipped network's training mix (§4). ODbL notice below. |
+| Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | LCZero-derived components of the training mix (§4). ODbL notice below. |
 | bullet (Jamie Whiting) | MIT | NNUE trainer, used with a full-threats input extension written for zigqueen and published as a patch (§4). Not linked into the engine. |
 | Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, two local modifications (§5). |
 | chessenginesupport-androidlib (gkalab) | Apache-2.0 | Vendored unmodified in `android/oex/…/com/kalab/chess/enginesupport/` for the OEX APK (§5). |
 | Gradle wrapper | Apache-2.0 | `android/oex/gradle/wrapper/gradle-wrapper.jar` (§5). |
 | Opening books used for testing (UHO, Stefan Pohl) | not redistributed | Used to run gauntlets only. |
 | Coda (Adam Twiss) | GPL-3.0 | Studied as the model for this document; no code or constants. |
-| AGPL engines (Reckless, PlentyChess, Viridithas ≥ v21, …) | AGPL-3.0 | **Not used as a source.** No AGPL engine source has been on the development machine; only binaries are used as gauntlet opponents (§7). |
+| AGPL engines (Reckless, PlentyChess, Viridithas ≥ v21, …) | AGPL-3.0 | Opponents and published conceptual research; no AGPL engine implementation is incorporated in the release (§7). |
 
 ## 1. Search shaping: a parameter set taken from Stormphrax
 
 **What is in the tree.** `src/search/basin.zig`, shipped since 6.1.0 (2026-08-31), defines the interior LMR formula
 and the null-move, late-move, reverse-futility, futility, history-pruning and SEE-pruning thresholds, the history
-bonus/malus shape and the LMR re-search threshold. Its formulas and every default constant were taken from
+bonus/malus shape and the LMR re-search threshold. Its formulas and initial default constants were taken from
 Stormphrax 8.0.0's published tunable defaults (Ciekce, GPL-3.0). Constants expressed in Stormphrax's evaluation units
 are scaled by one factor chosen here (`UNIT_PERCENT = 25`); dimensionless terms are unchanged.
 
 **What was not taken.** No source text. The Zig implementation and its integration with the rest of the search are
 zigqueen's, and everything else in the search — time management, SEE, transposition table, eval cache, quiescence,
 aspiration, probcut, singular extensions, move ordering and the history tables — uses zigqueen's own designs and
-constants. A comparison of all 169 Stormphrax tunable defaults against this tree finds matches only in `basin.zig`.
+constants. The historical parameter port is confined to this policy module; the local
+retune is recorded below.
 
-**License.** Both engines are GPL-3.0, so there is no license conflict, and tuning constants are functional values,
-not protectable expression. We still treat a parameter port as a provenance matter in its own right, which is why it
-is disclosed here and in the file header.
+**Local retuning in 6.2.0.** A zigqueen SPSA experiment selected the following
+12 pruning coordinates; 11 endpoint values differ from the original
+defaults. These are raw policy values before any `UNIT_PERCENT` scaling:
 
-**Status.** In 6.1.0 the constants are Stormphrax's defaults. They are being replaced by values derived from
-zigqueen's own measurements; this section will be updated when the replacement ships.
+| Parameter | Original default | 6.2.0 |
+|---|---:|---:|
+| `nmp_margin_base` | 213 | 219 |
+| `nmp_margin_depth_coeff` | 1281 | 1327 |
+| `nmp_margin_improving_coeff` | 41 | 39 |
+| `rfp_linear` | 85 | 84 |
+| `rfp_quadratic` | 7 | 7 |
+| `rfp_improving_coeff` | 75 | 70 |
+| `history_prune_linear` | -2242 | -2482 |
+| `history_prune_base` | -1315 | -1313 |
+| `futility_base` | 274 | 237 |
+| `futility_per_depth` | 68 | 71 |
+| `see_quiet_coeff` | -20 | -21 |
+| `see_noisy_per_depth` | -111 | -116 |
+
+The before/after values can be checked in the public release history.
+The experiment used zigqueen match results, not another engine's updated
+parameter values. The initial parameter choice and formula lineage remain
+Stormphrax's; unchanged LMR/history and other defaults are still inherited.
+This is a partial local retune, not a claim that the complete policy was
+independently derived. The Zig implementation, integration, guards and
+score-unit calibration remain zigqueen work. Both projects publish under
+GPL terms; this attribution is retained independently of the retune.
 
 ## 2. NNUE evaluation: published forms, our own implementation
 
@@ -71,7 +93,7 @@ zigqueen's own measurements; this section will be updated when the replacement s
   hard-coded in the engine.
 - **Layer stack and PSQT head.** SFNNv5-style: clipped ReLU + pairwise multiply on the accumulator halves,
   `1024 → 16` (i8) → squared-clipped-ReLU → `16 → 32` → `32 → 1`, eight material buckets, plus a per-feature PSQT head
-  bucketed alongside the output buckets. These are Stockfish's published network shapes.
+  shared across the eight nonlinear output buckets. These are Stockfish's published network shapes.
 - **Inference.** Written in Zig with portable `@Vector` SIMD (AVX-512 / AVX2 / NEON with a scalar fallback;
   bit-exact across targets). The incremental machinery — lazy accumulator materialisation, the accumulator-refresh
   ("finny") cache, the threat-delta engine with barrier records for king-orientation changes — is zigqueen's design.
@@ -102,31 +124,40 @@ no longer shipped.
 
 ## 4. The network: weights and data
 
-- **Weights.** The shipped `ZQB9` network (embedded, 74.6 MB) was trained by the author on a single desktop GPU from
-  random initialisation. It was never initialised from, fine-tuned from, or distilled logit-wise from another
-  engine's network. The weights are zigqueen's.
-- **Trainer.** bullet (MIT), used as a personal fork whose only changes are a HalfKA + full-threats input type, the
-  matching grader and the run recipe, written for zigqueen and published as `docs/trainer/bullet-fullthreats.patch`
-  (against upstream commit `d372d48`; see `docs/trainer/README.md`).
-- **Training data.** Twenty-seven published components, interleaved: `leela96-filt-v2` (split 0); `test60` 2021-11
-  and 2021-12; `test78` 2022-01..05 and 2022-06..09; `test79` 2022-04 and 2022-05; `test80` monthly 2022-06 to
-  2024-02; `wrongIsRight_nodes5000pv2`. All are the Stockfish project's published *relabelled* collections — the diet
-  its own master networks train on — downloaded from Hugging Face: `vondele/from_kaggle_1_relabel` (leela96),
-  `vondele/linrock_relabel_1` (test60/78/79, test80 2022), `vondele/linrock_relabel_2` (test80 2023),
-  `xushawn/test80-bt4-relabel` (test80 2024) and `vondele/master-binpacks_relabel` (wrongIsRight). The rows are
-  played-out games (Stockfish fishtest runs; the leela96 component is LCZero self-play) carrying a game result and an
-  evaluation label produced by the Stockfish project's `BT4-tf13tune` teacher (an LCZero transformer network); we
-  used the files as published, re-chunked for our loader, with no relabelling of our own. Our own self-play data
-  generator exists but did not contribute to the shipped network.
-- **Notice (ODbL).** Parts of the training data are made available under the Open Database License
-  (http://opendatacommons.org/licenses/odbl/1.0/) by the Stockfish project (`official-stockfish/master-binpacks`)
-  and, for the Lc0-derived component, by the LCZero project, with the rights in individual contents under the
-  Database Contents License (http://opendatacommons.org/licenses/dbcl/1.0/). A trained network is a "Produced Work"
-  under ODbL; we distribute the network, never the databases, so the share-alike terms attach to nothing we ship; the
-  obligation is this notice.
-- **What Stockfish contributed.** Openly published training data (positions, results and its published relabels) and
-  published architecture descriptions. Nothing else — no code, no weights, no logits of ours were taken from a
-  Stockfish or LCZero network directly; the teacher's evaluations reach us only as the published labels.
+- **Weights.** The original full-threat base was trained from random
+  initialisation on the author's RTX 4090. The 6.2.0 network adds a QAT
+  continuation on the RTX 5080, training only its nonlinear heads. Feature
+  transformer and PSQT bytes are unchanged. No third-party network weights
+  were used for initialisation, fine-tuning or logit distillation.
+- **Trainer.** bullet (MIT) with locally written feature mapping, loading,
+  recipe and deployed-arithmetic training extensions. The published
+  `docs/trainer/bullet-fullthreats.patch` documents the original base
+  extension against `d372d48`; it does not include the later QAT extension.
+  [NETWORK.md](NETWORK.md) records the continuation recipe and model hashes.
+- **Data.** Twenty-seven published components, with exact source families
+  listed in [NETWORK.md](NETWORK.md). Publisher metadata identifies
+  Stockfish-project relabels, including BT4 teacher labels. Twenty-six
+  components have LCZero-derived position ancestry; the generation ancestry
+  of `wrongIsRight_nodes5000pv2` remains unresolved in our audit. We have
+  not reconstructed each row's upstream teacher execution or certified
+  source-family independence.
+- **Local changes.** The original base used the published-label corpus.
+  The later QAT continuation used a prefix of its local `r1` version:
+  selected tablebase and decisive-anchor score replacements, preserving
+  position, move and game-result fields. The previous statement that the
+  shipped model involved no local relabelling was incomplete for 6.2.0.
+  Own self-play generation did not supply positions to this release.
+- **ODbL notice and alterations.** Parts of the training data are made
+  available by the Stockfish project and LCZero under the
+  [Open Database License 1.0](https://opendatacommons.org/licenses/odbl/1-0/),
+  with LCZero individual contents under
+  [DBCL 1.0](https://opendatacommons.org/licenses/dbcl/1-0/).
+  We retain attribution for the trained network and provide the recorded
+  local alterations, additional score contents and replay method free of
+  charge in [data-r1/README.md](data-r1/README.md). Database alterations are
+  offered under ODbL-1.0, with our individual additional contents under
+  DBCL-1.0. We do not rely on the earlier assertion that distributing only
+  a trained network always removes derivative-database obligations.
 
 ## 5. Third-party code compiled or packaged with zigqueen
 
@@ -149,44 +180,44 @@ values for SEE are the textbook 100/320/330/500/900. None of these were taken fr
 
 ## 7. Reference-engine policy
 
-- Idea sources are GPL-compatible projects only (GPL-3.0, MIT, BSD, Apache, WTFPL). AGPL engines are gauntlet
-  opponents (binaries) and nothing more; their source is not kept on the development machine.
-- Ideas, never expression: we read published descriptions and, where we read source, we take the technique and
-  write zigqueen's own implementation. Where a parameter set was taken from a specific engine rather than derived
-  here, we say so and replace it (§1).
+- Published conceptual research may inform independent implementations;
+  an engine's license is not permission to copy its code into this project.
+  The strict no-copy rule includes the author's earlier private engines.
+- We do not claim that AGPL source has never existed anywhere on a
+  development machine. Historical research workspaces are distinct from
+  code incorporated in this release. No AGPL engine implementation is
+  vendored, linked or translated into zigqueen's released engine.
+- Parameter origins are disclosed even when later tuned locally (§1).
 - Six opening-book root moves (`src/search/opening_book.zig`, present from the first public release 5.8.0 through
-  6.1.0) were chosen with Stockfish analysis of a test opening set. Engine output is not licensed material; we mention
-  it because our rules say other engines are opponents, not oracles. Removed in 6.1.1, which is 6.1.0 without those
+  6.1.0) were chosen with Stockfish analysis of a test opening set. We record that use
+  because our rules say other engines are opponents, not oracles. Removed in 6.1.1, which is 6.1.0 without those
   entries and otherwise identical.
 
 ## 8. Repository structure and git history
 
-The public repository starts at the 5.8.0 release (2026-07-19) as a single squashed commit; every change since
-is in its history, and no file has ever been removed from it. It has never contained other engines' code.
-Development notes and experiment records are kept privately.
+The public repository starts at 5.8.0 as a release snapshot. Subsequent
+public commits record changes, including removals; the six-move book was
+removed in 6.1.1. Releases are prepared on that public history, without
+publishing the private development history or experiment workspaces.
+The licensed vendored components are listed above.
 
 ## 9. How the engine was built
 
-See README, "How this engine was built (AI disclosure)": Claude wrote most of the source under the author's
-continuous direction; the author set goals, chose and approved experiments, and decided what shipped; strength
-changes required SPRT at two time controls plus an external gauntlet; performance changes had to be node-identical;
-commit trailers preserve co-authorship. The originality rules the code was developed under are the ones on this
-page.
+The author develops zigqueen with AI assistants, including Claude and
+Codex. Assistants write and review code under human direction; the author
+sets scope and decides releases. Correctness gates precede match testing.
+The ladder uses screening, SPRT and external validation; not every accepted
+small effect reached an SPRT boundary. [STRENGTH.md](STRENGTH.md) records
+the evidence and acceptance limits for this release.
 
-## Position
+Corrections supported by specific source or artifact evidence are welcome
+at https://github.com/stierms/zigqueen/issues.
 
-We believe zigqueen carries no copied code and no copied weights, that every third-party component it ships is
-GPL-compatible and now carries its notice, and that the one place where we took another engine's numbers rather
-than only its idea — the search-shaping parameter set from Stormphrax — is disclosed above, license-compatible, and
-still at the ported defaults in 6.1.0 while its locally derived replacement is being built. If anyone believes
-specific third-party expression
-remains in zigqueen, please open an issue with the specifics; we will review it promptly and fix it — by removal
-where a license requires it, or by correcting the attribution where a license permits reuse with credit.
+## Record updates
 
-*Changes since first publication:*
-
-- 2026-09 — first version: Stormphrax parameter-set disclosure (§1); ODbL notice and the full training-data component
-  list added to `docs/NETWORK.md`; `THIRD_PARTY_LICENSES.md` added and packaged; Fathom relabelled MIT (was "BSD" in two
-  comments) and its two local modifications documented; README/ARCHITECTURE corrected on correction history (parked,
-  not live) and on the origin of the six opening-book moves (removed in 6.1.1); `CLEAN_ROOM_RULES.md` renamed to
-  `ORIGINALITY.md` and reworded to what was done; training-data sources and labels corrected (§4).
+- September 2026: initial parameter, architecture, training-data and
+  vendored-license disclosure; internal opening book removed in 6.1.1.
+- September 9, 2026: exact local pruning retunes; QAT model lineage and
+  local data alteration offer; corrected single-PSQT description and
+  overly broad claims about training labels, workstation contents,
+  repository removals and universal SPRT acceptance.

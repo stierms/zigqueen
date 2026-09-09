@@ -15,7 +15,7 @@ const Slider = enum {
     rook,
 };
 
-// Clean-room generated locally by brute-force search over relevant occupancies.
+// Independently generated locally by brute-force search over relevant occupancies.
 pub const BISHOP_MAGIC_NUMBERS = [64]u64{
     0x8204410821011200,
     0x0020085100408110,

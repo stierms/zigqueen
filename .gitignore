@@ -23,3 +23,7 @@ tmp/
 *.rej
 .DS_Store
 Thumbs.db
+
+# Optional data replay build products
+docs/data-r1/replay/target/
+!docs/data-r1/replay/Cargo.lock

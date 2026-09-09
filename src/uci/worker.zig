@@ -1,4 +1,5 @@
 const std = @import("std");
+const move_mod = @import("../core/move.zig");
 const engine_mod = @import("../search/engine.zig");
 const position = @import("../core/position.zig");
 const repetition = @import("../search/repetition.zig");
@@ -31,6 +32,7 @@ pub const SearchRequest = struct {
     position: position.Position,
     history: repetition.History,
     limits: search_time.GoLimits,
+    root_moves: ?move_mod.MoveList = null,
     move_overhead_ms: u32 = @intCast(search_time.DEFAULT_MOVE_OVERHEAD_MS),
 };
 
@@ -93,6 +95,11 @@ pub const Worker = struct {
     pub fn setContempt(self: *Worker, contempt_cp: i32) void {
         self.stopAndWait();
         self.engine.setContempt(contempt_cp);
+    }
+
+    pub fn setBasinParams(self: *Worker, params: @import("../search/basin.zig").Params) void {
+        self.stopAndWait();
+        self.engine.setBasinParams(params);
     }
 
     pub fn setSyzygyPath(self: *Worker, path: []const u8) bool {
@@ -180,7 +187,8 @@ pub const Worker = struct {
         self.info_streamed = false;
         self.engine.info_emitter = .{ .ctx = self, .emit_fn = emitInfo };
 
-        const result = self.engine.search(&request.position, &request.history, controller_limits, &self.stop_requested);
+        const root_moves = if (request.root_moves) |*moves| moves else null;
+        const result = self.engine.searchWithRootMoves(&request.position, &request.history, controller_limits, &self.stop_requested, root_moves);
         const elapsed_ns: u64 = if (timer) |*search_timer| search_timer.read() else 0;
         const elapsed_ms: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_ms));
         const reported_depth = if (result.depth != 0) result.depth else request.limits.depth orelse 1;

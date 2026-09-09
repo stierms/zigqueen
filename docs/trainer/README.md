@@ -1,6 +1,6 @@
 # Trainer extension (bullet patch)
 
-The ZQB9 network was trained with [bullet](https://github.com/jw1912/bullet)
+The original full-threat ZQB9 base network was trained with [bullet](https://github.com/jw1912/bullet)
 (MIT) plus a project-specific extension that teaches bullet zigqueen's
 HalfKA + full-threats input mapping. `bullet-fullthreats.patch` is that
 extension as a single patch against upstream bullet commit `d372d48`:
@@ -12,7 +12,7 @@ extension as a single patch against upstream bullet commit `d372d48`:
   `value/dataloader.rs`, `value/loader.rs` to register the input type and
   the data mixing used by the recipe;
 - `examples/zqHalfKA9_fullthreats_w1024_relabel26.rs` (new): the training
-  recipe of the shipped network (architecture, schedule, and the data
+  recipe of the original base network (architecture, schedule, and the data
   components listed in `../NETWORK.md`; data paths are local);
 - `tools/fullthreats_grader.py` (new): the reference grader that checks the
   trainer's feature indices against the engine's tables.
@@ -28,3 +28,9 @@ then add an `[[example]]` entry for `zqHalfKA9_fullthreats_w1024_relabel26`
 to `crates/bullet_lib/Cargo.toml` and run it with cargo as any bullet
 example. The patch is offered as documentation of provenance and for
 reproducibility; it carries bullet's MIT license for the modified files.
+
+The 6.2.0 network additionally uses a head-only QAT continuation. This
+original feature-extension patch does not reproduce that later trainer
+change. Its scope, numerical contract and recorded recipe are documented
+in [NETWORK.md](../NETWORK.md). The recorded local data score alterations
+and replay method are offered in [data-r1/README.md](../data-r1/README.md).

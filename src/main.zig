@@ -19,6 +19,7 @@ const position = @import("core/position.zig");
 const pseudo = @import("movegen/pseudo_legal.zig");
 const root_trace = @import("tools/root_trace.zig");
 const raw_search_probe = @import("tools/raw_search_probe.zig");
+const relabel = @import("tools/relabel.zig");
 const search_engine = @import("search/engine.zig");
 const search_profile = @import("tools/search_profile.zig");
 const search_profile_sequence = @import("tools/search_profile_sequence.zig");
@@ -138,9 +139,158 @@ pub fn main() !void {
         const games_text = args.next() orelse return error.InvalidCommand;
         const games = try std.fmt.parseInt(u64, games_text, 10);
         const out_path = args.next() orelse return error.InvalidCommand;
-        const nodes_per_move = if (args.next()) |text| try std.fmt.parseInt(u64, text, 10) else datagen.default_nodes_per_move;
-        const random_plies = if (args.next()) |text| try std.fmt.parseInt(u32, text, 10) else datagen.default_random_plies;
-        try datagen.run(stdout, seed, games, out_path, nodes_per_move, random_plies);
+        var nodes_per_move: u64 = datagen.default_nodes_per_move;
+        var random_plies: u32 = datagen.default_random_plies;
+        var hash_mb: u32 = datagen.default_hash_mb;
+        var threads: u32 = 1;
+        // Tablebases are REQUIRED (2026-08-13 gate): datagen.runThreaded
+        // refuses to start unless one of these is set. There is deliberately no
+        // default path and no env-var fallback — the launcher must say it.
+        var tb_options = datagen.TbOptions{};
+        var positional: usize = 0;
+        while (args.next()) |text| {
+            if (std.mem.eql(u8, text, "--threads")) {
+                const count_text = args.next() orelse return error.InvalidCommand;
+                threads = try std.fmt.parseInt(u32, count_text, 10);
+                continue;
+            }
+            if (std.mem.eql(u8, text, "--hash")) {
+                const hash_text = args.next() orelse return error.InvalidCommand;
+                hash_mb = try std.fmt.parseInt(u32, hash_text, 10);
+                continue;
+            }
+            if (std.mem.eql(u8, text, "--syzygy")) {
+                tb_options.path = args.next() orelse return error.InvalidCommand;
+                continue;
+            }
+            if (std.mem.eql(u8, text, "--allow-no-syzygy")) {
+                tb_options.allow_none = true;
+                continue;
+            }
+            switch (positional) {
+                0 => nodes_per_move = try std.fmt.parseInt(u64, text, 10),
+                1 => random_plies = try std.fmt.parseInt(u32, text, 10),
+                else => return error.InvalidCommand,
+            }
+            positional += 1;
+        }
+        try datagen.runThreaded(stdout, seed, games, out_path, nodes_per_move, random_plies, hash_mb, threads, tb_options);
+        try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "relabel")) {
+        const input_path = args.next() orelse return error.InvalidCommand;
+        var opts = relabel.Options{
+            .input_path = input_path,
+            .out_path = "relabel.csv",
+            .nodes = 6000,
+            .hash_mb = 4,
+            .threads = 1,
+            .tag = "relabel",
+            .warm = false,
+        };
+        while (args.next()) |text| {
+            if (std.mem.eql(u8, text, "--nodes")) {
+                opts.nodes = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidCommand, 10);
+            } else if (std.mem.eql(u8, text, "--hash")) {
+                opts.hash_mb = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidCommand, 10);
+            } else if (std.mem.eql(u8, text, "--threads")) {
+                opts.threads = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidCommand, 10);
+            } else if (std.mem.eql(u8, text, "--out")) {
+                opts.out_path = args.next() orelse return error.InvalidCommand;
+            } else if (std.mem.eql(u8, text, "--tag")) {
+                opts.tag = args.next() orelse return error.InvalidCommand;
+            } else if (std.mem.eql(u8, text, "--warm")) {
+                opts.warm = true;
+            } else if (std.mem.eql(u8, text, "--header")) {
+                try stdout.print("{s}", .{relabel.csv_header});
+            } else return error.InvalidCommand;
+        }
+        try stdout.flush();
+        try relabel.run(stdout, opts);
+        try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "result_backfill")) {
+        const result_backfill = @import("tools/result_backfill.zig");
+        const allocator = std.heap.page_allocator;
+        // <list-file> holds "<path>\t<max_lines>" per line (max_lines 0 = whole file)
+        const list_path = args.next() orelse return error.InvalidCommand;
+        var out_dir: []const u8 = "";
+        var threads: u32 = 1;
+        var opts = result_backfill.Options{
+            .input_path = "",
+            .output_path = "",
+            .tb_path = "",
+            .max_lines = 0,
+            .hmc_cutoff = 90,
+            .dry_run = true,
+        };
+        while (args.next()) |text| {
+            if (std.mem.eql(u8, text, "--out-dir")) {
+                out_dir = args.next() orelse return error.InvalidCommand;
+                opts.dry_run = false;
+            } else if (std.mem.eql(u8, text, "--tb")) {
+                opts.tb_path = args.next() orelse return error.InvalidCommand;
+            } else if (std.mem.eql(u8, text, "--threads")) {
+                threads = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidCommand, 10);
+            } else if (std.mem.eql(u8, text, "--hmc-cutoff")) {
+                opts.hmc_cutoff = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidCommand, 10);
+            } else return error.InvalidCommand;
+        }
+        const list = try std.fs.cwd().readFileAlloc(allocator, list_path, 64 << 20);
+        defer allocator.free(list);
+        var paths = std.ArrayList([]const u8){};
+        defer paths.deinit(allocator);
+        var caps = std.ArrayList(u64){};
+        defer caps.deinit(allocator);
+        var it = std.mem.splitScalar(u8, list, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \r\t");
+            if (line.len == 0 or line[0] == '#') continue;
+            const tab = std.mem.indexOfScalar(u8, line, '\t');
+            if (tab) |t| {
+                try paths.append(allocator, line[0..t]);
+                try caps.append(allocator, try std.fmt.parseInt(u64, std.mem.trim(u8, line[t + 1 ..], " "), 10));
+            } else {
+                try paths.append(allocator, line);
+                try caps.append(allocator, 0);
+            }
+        }
+        try result_backfill.run(stdout, paths.items, out_dir, opts, caps.items, threads);
+        try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "tb_rescore")) {
+        const tb_rescore = @import("tools/tb_rescore.zig");
+        const input_path = args.next() orelse return error.InvalidCommand;
+        var opts = tb_rescore.Options{
+            .input_path = input_path,
+            .output_path = "",
+            .tb_path = "",
+            .threads = 1,
+            .win_cp = 10_000,
+            .keep_result = false,
+            .dry_run = true,
+        };
+        while (args.next()) |text| {
+            if (std.mem.eql(u8, text, "--out")) {
+                opts.output_path = args.next() orelse return error.InvalidCommand;
+                opts.dry_run = false;
+            } else if (std.mem.eql(u8, text, "--tb")) {
+                opts.tb_path = args.next() orelse return error.InvalidCommand;
+            } else if (std.mem.eql(u8, text, "--threads")) {
+                opts.threads = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidCommand, 10);
+            } else if (std.mem.eql(u8, text, "--win-cp")) {
+                opts.win_cp = try std.fmt.parseInt(i16, args.next() orelse return error.InvalidCommand, 10);
+            } else if (std.mem.eql(u8, text, "--keep-result")) {
+                opts.keep_result = true;
+            } else return error.InvalidCommand;
+        }
+        try tb_rescore.run(stdout, opts);
         try stdout.flush();
         return;
     }

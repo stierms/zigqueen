@@ -6,6 +6,8 @@
   sources, trainer, and what was and was not taken from other projects.
 - [`STRENGTH.md`](STRENGTH.md) — anchored gauntlet results and the
   self-assessment methodology.
+- [`RELEASE_VALIDATION_6.2.0.md`](RELEASE_VALIDATION_6.2.0.md) — release checks and artifact identity.
+- [`RELEASE_NOTES_6.2.0.md`](RELEASE_NOTES_6.2.0.md) — current release.
 - [`RELEASE_NOTES_6.1.1.md`](RELEASE_NOTES_6.1.1.md) — what changed in
   6.1.1.
 - [`RELEASE_NOTES_6.1.0.md`](RELEASE_NOTES_6.1.0.md) — what changed in

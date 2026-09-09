@@ -14,7 +14,7 @@ pub const NodeContext = struct {
     }
 
     pub fn firstChild(self: NodeContext) NodeContext {
-        if (self.pv_node) return .{ .pv_node = false, .cut_node = false };
+        if (self.pv_node) return .{ .pv_node = true, .cut_node = false };
         return .{ .pv_node = false, .cut_node = !self.cut_node };
     }
 
@@ -45,7 +45,7 @@ test "node context derives pv and cut status from the search window" {
 
 test "node context child helpers preserve the intended pv cut and all mapping" {
     const pv = NodeContext.fromWindow(-20, 20, false);
-    try std.testing.expectEqual(NodeContext{ .pv_node = false, .cut_node = false }, pv.firstChild());
+    try std.testing.expectEqual(NodeContext{ .pv_node = true, .cut_node = false }, pv.firstChild());
     try std.testing.expectEqual(NodeContext{ .pv_node = false, .cut_node = true }, pv.scoutChild());
 
     const cut = NodeContext.fromWindow(19, 20, true);

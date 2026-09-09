@@ -250,9 +250,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-## Training data (not redistributed)
+## Training-data attribution and local alterations
 
-The shipped network was trained on published Stockfish-project datasets; parts of that
-data are made available under the Open Database License (ODbL-1.0). The required notice
-is in `docs/NETWORK.md` and `docs/PROVENANCE.md`. zigqueen distributes the trained
-network, never the databases.
+Parts of the embedded network's training data are made available by the
+Stockfish project and LCZero under the Open Database License 1.0:
+https://opendatacommons.org/licenses/odbl/1-0/
+LCZero individual contents are under DBCL 1.0:
+https://opendatacommons.org/licenses/dbcl/1-0/
+
+The recorded local score alterations, additional contents and replay
+method are offered free of charge under ODbL-1.0 (our individual added
+contents: DBCL-1.0) at:
+https://github.com/stierms/zigqueen/blob/v6.2.0/docs/data-r1/README.md
+Data sources, scope and model lineage:
+https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md
+
+The optional source-only replay utility uses sfbinpack 0.6.2 (GPL-3.0),
+https://github.com/Disservin/binpack-rust. It is not linked into the engine
+or Android applications. Cargo fetches it under its own license.

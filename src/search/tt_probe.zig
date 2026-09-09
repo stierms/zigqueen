@@ -2,6 +2,7 @@ const std = @import("std");
 const context_mod = @import("context.zig");
 const move_mod = @import("../core/move.zig");
 const score_mod = @import("score.zig");
+const shallow_arms = @import("shallow_arms.zig");
 const tt = @import("tt.zig");
 const types = @import("../core/types.zig");
 
@@ -33,6 +34,41 @@ pub inline fn probeInto(
     beta_in: types.Score,
     excluded_move: ?move_mod.Move,
 ) void {
+    probeIntoImpl(result, ctx, table, key, required_depth, alpha_in, beta_in, excluded_move, false, false, 0, false);
+}
+
+/// Main-search probe with the tuning-only node-role and rule-50 trust gates.
+/// Bound tightening remains active even when a would-be cutoff is declined.
+pub inline fn probeMainInto(
+    result: *Result,
+    ctx: *context_mod.SearchContext,
+    table: *const tt.TranspositionTable,
+    key: u64,
+    required_depth: i16,
+    alpha_in: types.Score,
+    beta_in: types.Score,
+    excluded_move: ?move_mod.Move,
+    pv_node: bool,
+    cut_node: bool,
+    halfmove_clock: u16,
+) void {
+    probeIntoImpl(result, ctx, table, key, required_depth, alpha_in, beta_in, excluded_move, pv_node, cut_node, halfmove_clock, true);
+}
+
+inline fn probeIntoImpl(
+    result: *Result,
+    ctx: *context_mod.SearchContext,
+    table: *const tt.TranspositionTable,
+    key: u64,
+    required_depth: i16,
+    alpha_in: types.Score,
+    beta_in: types.Score,
+    excluded_move: ?move_mod.Move,
+    pv_node: bool,
+    cut_node: bool,
+    halfmove_clock: u16,
+    comptime main_search: bool,
+) void {
     result.entry = null;
     result.alpha = alpha_in;
     result.beta = beta_in;
@@ -63,6 +99,11 @@ pub inline fn probeInto(
 
     switch (entry.bound) {
         .exact => {
+            if (main_search and !shallow_arms.allowMainTtCutoff(entry.score, alpha_in, pv_node, cut_node, halfmove_clock)) {
+                ctx.noteTtOrderingOnlyHit();
+                ctx.noteTtOrderingOnlyGeneration(current_generation);
+                return;
+            }
             ctx.noteTtExactCutoff();
             ctx.noteTtCutoffGeneration(current_generation);
             result.cutoff = entry.score;
@@ -85,6 +126,16 @@ pub inline fn probeInto(
             ctx.noteTtOrderingOnlyHit();
             ctx.noteTtOrderingOnlyGeneration(current_generation);
         }
+        return;
+    }
+
+    if (main_search and !shallow_arms.allowMainTtCutoff(entry.score, alpha_in, pv_node, cut_node, halfmove_clock)) {
+        // A rejected would-be cutoff cannot pass a closed window to negamax.
+        // Preserve ordinary non-cutting tightening, but restore the caller's
+        // window when this entry alone would otherwise close it.
+        result.alpha = alpha_in;
+        result.beta = beta_in;
+        ctx.noteTtBoundNoCutoffHit();
         return;
     }
 
@@ -198,6 +249,34 @@ test "tt probe applies lower and upper bounds before reporting cutoffs" {
     const upper = probe(&ctx, &table, 0x3001, 4, 35, 40, null);
     try std.testing.expectEqual(@as(?types.Score, 30), upper.cutoff);
     if (context_mod.stats_enabled) try std.testing.expectEqual(@as(u64, 1), ctx.stats.tt_upper_cutoffs);
+}
+
+test "node-role trust rejects a lower cutoff without leaking a closed window" {
+    const build_options = @import("build_options");
+    if (!build_options.tuning) return;
+
+    const time = @import("time.zig");
+    const tunables = @import("tunables.zig");
+    tunables.reset();
+    defer tunables.reset();
+    try std.testing.expect(tunables.set("TtCutoffNodeRole", 1));
+
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var ctx = context_mod.SearchContext{
+        .repetition = .{},
+        .control = time.Controller.init(&stop_flag, .{}),
+    };
+    var table = try tt.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+
+    table.store(0x3500, 4, 50, .lower, null);
+    var result: Result = undefined;
+    probeMainInto(&result, &ctx, &table, 0x3500, 4, 40, 45, null, false, false, 0);
+
+    try std.testing.expect(result.entry != null);
+    try std.testing.expect(result.cutoff == null);
+    try std.testing.expectEqual(@as(types.Score, 40), result.alpha);
+    try std.testing.expectEqual(@as(types.Score, 45), result.beta);
 }
 
 test "tt probe ignores entries whose stored move is the excluded move" {

@@ -11,6 +11,7 @@ const ply_limit = @import("ply_limit.zig");
 const position = @import("../core/position.zig");
 const score_mod = @import("score.zig");
 const see = @import("see.zig");
+const shallow_arms = @import("shallow_arms.zig");
 const tt_mod = @import("tt.zig");
 const tt_probe = @import("tt_probe.zig");
 const tt_store = @import("tt_store.zig");
@@ -113,6 +114,8 @@ fn searchDepth(
         }
     }
 
+    const tt_quiet_move = selectTtQuietMove(pos, tt_entry, alpha_in, beta, in_check, shallow_arms.qsearchTtQuietEnabled());
+
     var moves = move_mod.MoveList.init();
     if (in_check) {
         legal.generateHinted(pos, &moves, true);
@@ -120,7 +123,7 @@ fn searchDepth(
         legal.generateCapturesAndPromotionsHinted(pos, &moves, false);
         if (ctx.recordMoveOrder()) ctx.noteQsearchTacticalList(moves.count);
     }
-    if (moves.count == 0) {
+    if (moves.count == 0 and tt_quiet_move == null) {
         if (in_check) return -MATE_SCORE + @as(types.Score, @intCast(ply));
         if (stand_pat) |static_eval| {
             const best_static = @max(alpha, static_eval);
@@ -130,7 +133,8 @@ fn searchDepth(
         return alpha;
     }
 
-    if (shouldDeltaPruneNode(pos, stand_pat, alpha, in_check, &moves)) {
+    const delta_prune = shouldDeltaPruneNode(pos, stand_pat, alpha, in_check, &moves);
+    if (tt_quiet_move == null and delta_prune) {
         return alpha;
     }
     if (stand_pat) |static_eval| {
@@ -151,6 +155,31 @@ fn searchDepth(
 
     var best = alpha;
     var best_move: ?move_mod.Move = null;
+    if (tt_quiet_move) |mv| {
+        const entry = ctx.stack.entry(ply);
+        const child_key = make_unmake.makeMove(pos, mv, &entry.state);
+        resources.tt.prefetch(child_key);
+        ctx.repetition.push(child_key);
+        resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
+        const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null, false);
+        ctx.repetition.pop();
+        make_unmake.unmakeMove(pos, mv, &entry.state);
+
+        if (ctx.stopped) return 0;
+        if (score >= beta_local) {
+            ctx.noteBetaCutoff(0);
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
+            return beta_local;
+        }
+        if (score > best) {
+            best = score;
+            best_move = mv;
+        }
+        // The arm delays the old node-level delta cutoff just long enough to
+        // search the TT-backed quiet. The tactical tail remains pruned exactly
+        // when it was before the arm.
+        if (delta_prune) return best;
+    }
     var move_picker = ordering.MovePicker.init(&moves, &scores, &capture_see_scores);
     for (0..moves.count) |index| {
         const mv = move_picker.next(index);
@@ -181,8 +210,9 @@ fn searchDepth(
 
         if (ctx.stopped) return 0;
         if (score >= beta_local) {
-            ctx.noteBetaCutoff(index);
-            if (is_capture and !is_promotion) ctx.noteCaptureCutoff(index, capture_see_score, true);
+            const move_index = index + @intFromBool(tt_quiet_move != null);
+            ctx.noteBetaCutoff(move_index);
+            if (is_capture and !is_promotion) ctx.noteCaptureCutoff(move_index, capture_see_score, true);
             tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
             return beta_local;
         }
@@ -199,7 +229,10 @@ fn searchDepth(
         var check_moves = move_mod.MoveList.init();
         legal.generateQuietChecksHinted(pos, &check_moves, false);
         for (check_moves.slice()) |mv| {
-            if (see.quietScore(pos, mv) < 0) continue;
+            if (tt_quiet_move) |searched| {
+                if (mv == searched) continue;
+            }
+            if (see.quietBelow(pos, mv, 0)) continue;
             const entry = ctx.stack.entry(ply);
             const child_key = make_unmake.makeMove(pos, mv, &entry.state);
             resources.tt.prefetch(child_key);
@@ -222,6 +255,24 @@ fn searchDepth(
 
     tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best, best_move, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
     return best;
+}
+
+fn selectTtQuietMove(
+    pos: *const position.Position,
+    tt_entry: ?*const tt_mod.Entry,
+    alpha: types.Score,
+    beta: types.Score,
+    in_check: bool,
+    enabled: bool,
+) ?move_mod.Move {
+    if (!enabled) return null;
+    const entry = tt_entry orelse return null;
+    const candidate = tt_mod.moveFromEntry(entry.*) orelse return null;
+    const is_quiet = !candidate.isCapture() and !candidate.isPromotion();
+    const pv_node = beta - alpha > 1;
+    const is_legal = is_quiet and legal.isLegalMoveHinted(pos, candidate, in_check);
+    if (!shallow_arms.qsearchTtQuietAllowedWith(true, pv_node, in_check, entry.bound == .upper, is_quiet, is_legal)) return null;
+    return candidate;
 }
 
 fn shouldDeltaPruneNode(
@@ -255,6 +306,19 @@ test "qsearch delta pruning triggers in obviously hopeless middlegame nodes" {
     legal.generate(&pos, &moves);
 
     try @import("std").testing.expect(shouldDeltaPruneNode(&pos, 0, 1500, false, &moves));
+}
+
+test "qsearch TT quiet selector accepts one legal lower-bound quiet only when armed" {
+    const fen = @import("../core/fen.zig");
+
+    const pos = try fen.startpos();
+    const quiet = move_mod.Move.init(.e2, .e4, .double_push);
+    var entry = tt_mod.Entry{ .move_bits = @bitCast(quiet), .bound = .lower };
+
+    try std.testing.expect(selectTtQuietMove(&pos, &entry, 0, 1, false, false) == null);
+    try std.testing.expectEqual(quiet, selectTtQuietMove(&pos, &entry, 0, 1, false, true).?);
+    entry.bound = .upper;
+    try std.testing.expect(selectTtQuietMove(&pos, &entry, 0, 1, false, true) == null);
 }
 
 test "qsearch delta pruning stays off in late endgames" {

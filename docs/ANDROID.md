@@ -2,7 +2,9 @@
 
 zigqueen runs on 64-bit Android as a native UCI engine. The NNUE evaluation
 uses portable integer SIMD, so the ARM build is **bit-identical** to the x86
-builds — verified by matching fixed-depth node counts on-device.
+builds by design. Release checks compare fixed-depth node counts and
+evaluations; 6.2.0 ARM execution is checked under QEMU, not claimed as
+a fresh physical-device test.
 
 ## Just want the engine?
 
@@ -15,9 +17,10 @@ Each release ships ready-made artifacts:
 - **`zigqueen-<version>-android-armv8[-dotprod].zip`** — the raw static
   binaries, for Termux or GUIs that can still execute imported files.
 
-Pick `dotprod` on SoCs from ~2018 onward (it uses the `udot`/`usdot` NNUE
-kernels); `armv8` runs on any 64-bit device. If `dotprod` crashes instantly
-with an illegal-instruction error, your SoC is older — use `armv8`.
+The `dotprod` build requires both ARM dot-product and i8mm instruction
+extensions (`udot`/`usdot`); dot-product support alone is insufficient.
+Choose `armv8` when those CPU features are unknown. An illegal-instruction
+error means the selected binary requires unsupported CPU instructions.
 
 Expect very roughly a third of a modern desktop core's speed on a current
 flagship, with thermal throttling in long sessions.

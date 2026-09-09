@@ -314,6 +314,107 @@ pub fn givesCheck(pos: *const position.Position, mv: move_mod.Move) bool {
     );
 }
 
+/// The module-level predicate, reachable from inside `CheckInfo` (whose own
+/// `givesCheck` shadows the name).
+const fullGivesCheck = givesCheck;
+
+/// Per-node gives-check context (perf r12, lane S). `givesCheck` above rebuilds
+/// five piece bitboards and re-runs the attack query for EVERY move it is asked
+/// about; negamax asks at up to six pruning sites per quiet move plus once per
+/// searched move (the child's in_check hint). This precomputes, ONCE per node,
+/// the squares from which each mover piece type attacks the opponent's king and
+/// the mover's discovered-check candidates (the sole blocker between a mover
+/// slider and that king — the pin computation with the roles swapped), so an
+/// ordinary move is answered by two bitboard tests.
+///
+/// EXACT relative to `givesCheck` and the make/isInCheck/unmake oracle (the
+/// equivalence tests below run it beside `givesCheck` on every suite):
+///   - direct check: the moved piece attacks the king from `to` iff `to` lies in
+///     the king's attack set of that piece type under PRE-move occupancy. Slider
+///     attack sets are symmetric in their endpoints, `to`'s own occupancy is
+///     irrelevant (a set includes the first blocker square), and the vacated
+///     `from` could only matter if it sat strictly between `to` and the king on
+///     an otherwise open line — which would mean the mover already checked the
+///     king before moving, impossible with the mover to move.
+///   - discovered check: exactly when `from` is a discovered-check candidate and
+///     `to` leaves the candidate's line to the king (`isCollinear`); a piece that
+///     stays on the line keeps blocking (or checks directly, caught above). A
+///     piece arriving on `to` can only BLOCK a mover slider, never unblock one,
+///     and no mover slider checks the king before the move, so `to` cannot
+///     change any other attacker's verdict.
+///   - the mover's king never checks directly (matches `givesCheck`).
+///   - castling, en passant and promotions change the geometry in ways these
+///     masks do not encode (rook hop, two vacated squares, a new piece type
+///     whose own line may run through the vacated `from`): they fall back to
+///     `givesCheck`, exact for them. Rare moves, so the fallback costs nothing.
+pub const CheckInfo = struct {
+    ready: bool = false,
+    has_king: bool = false,
+    enemy_king: square.Square = .a1,
+    pawn: bitboard.Bitboard = 0,
+    knight: bitboard.Bitboard = 0,
+    bishop: bitboard.Bitboard = 0,
+    rook: bitboard.Bitboard = 0,
+    queen: bitboard.Bitboard = 0,
+    blockers: bitboard.Bitboard = 0,
+
+    pub fn init(pos: *const position.Position) CheckInfo {
+        const side = pos.side_to_move;
+        const enemy_king = pos.kingSquare(side.other()) orelse return .{ .ready = true };
+        const occupied = pos.occupancy();
+        const bishop_attacks = attacks.bishopAttacksOnTheFly(enemy_king, occupied);
+        const rook_attacks = attacks.rookAttacksOnTheFly(enemy_king, occupied);
+        return .{
+            .ready = true,
+            .has_king = true,
+            .enemy_king = enemy_king,
+            // Squares from which a MOVER pawn attacks the king = the squares an
+            // opponent-coloured pawn standing on the king square would attack.
+            .pawn = attacks.pawnAttacksFrom(side.other(), enemy_king),
+            .knight = attacks.knightAttacksFrom(enemy_king),
+            .bishop = bishop_attacks,
+            .rook = rook_attacks,
+            .queen = bishop_attacks | rook_attacks,
+            .blockers = computePinnedPieces(
+                occupied,
+                pos.occupancyFor(side),
+                pos.pieceBitboard(side, .bishop) | pos.pieceBitboard(side, .queen),
+                pos.pieceBitboard(side, .rook) | pos.pieceBitboard(side, .queen),
+                enemy_king,
+            ),
+        };
+    }
+
+    /// Lazily builds the context on first use, then answers from it. (A
+    /// variant that deferred the two slider lookups behind an empty-board ray
+    /// test measured −0.2% on oldrig against this eager form's +1.5%: the
+    /// extra per-query branches cost more than the lookups they skipped.)
+    pub inline fn ensure(self: *CheckInfo, pos: *const position.Position) void {
+        if (!self.ready) self.* = init(pos);
+    }
+
+    pub inline fn givesCheck(self: *const CheckInfo, pos: *const position.Position, mv: move_mod.Move) bool {
+        switch (mv.flag) {
+            .quiet, .double_push, .capture => {
+                if (!self.has_king) return false;
+                const direct_squares = switch (pos.pieceAt(mv.from).pieceType()) {
+                    .pawn => self.pawn,
+                    .knight => self.knight,
+                    .bishop => self.bishop,
+                    .rook => self.rook,
+                    .queen => self.queen,
+                    .king => 0,
+                    .none => unreachable,
+                };
+                if ((direct_squares & bitboard.bit(mv.to)) != 0) return true;
+                if ((self.blockers & bitboard.bit(mv.from)) == 0) return false;
+                return !isCollinear(self.enemy_king, mv.from, mv.to);
+            },
+            else => return fullGivesCheck(pos, mv),
+        }
+    }
+};
+
 fn filterGeneratedNoPins(pos: *const position.Position, list: *move_mod.MoveList, ctx: *const LegalityContext, comptime tactical_only: bool) void {
     const generated = list.count; // hoisted; see generateHinted
 
@@ -365,6 +466,127 @@ pub fn isLegalMove(pos: *const position.Position, mv: move_mod.Move) bool {
     var ctx: LegalityContext = undefined;
     initLegalityContext(pos, null, &ctx);
     const moving_type = moving_piece.pieceType();
+    return switch (legalityDisposition(mv, moving_type, &ctx)) {
+        .accept => true,
+        .reject => false,
+        .needs_full_check => isLegalPseudoMove(pos, mv, moving_type, &ctx),
+    };
+}
+
+/// Pseudo-legality of an ARBITRARY move (a hash-table move, say) WITHOUT
+/// generating: true iff `pseudo.generate` would emit exactly this move (same
+/// from, to and flag). Mirrors the generators clause by clause — pawn pushes,
+/// double pushes, captures, en passant, promotions, castling with its full
+/// generator-side conditions, and the leaper/slider target sets including
+/// pseudo captures of the opponent king (the legality layer rejects those, as
+/// it does for generated moves). `known_in_check`, when non-null, must equal
+/// `isInCheck(pos, pos.side_to_move)` and only spares the castling clause its
+/// attack query. The exhaustive test below checks every (from, to, flag)
+/// encoding against list containment on the whole suite (perf r12, lane S).
+pub fn isPseudoLegalMoveFast(pos: *const position.Position, mv: move_mod.Move, known_in_check: ?bool) bool {
+    const side = pos.side_to_move;
+    const moving_piece = pos.pieceAt(mv.from);
+    if (moving_piece == .none or moving_piece.color().? != side) return false;
+    const moving_type = moving_piece.pieceType();
+    const to_mask = bitboard.bit(mv.to);
+    const opp_occ = pos.occupancyFor(side.other());
+    const forward: i8 = if (side == .white) 1 else -1;
+    const start_rank: u3 = if (side == .white) 1 else 6;
+    const promotion_from_rank: u3 = if (side == .white) 6 else 1;
+    switch (mv.flag) {
+        .castle => return castlingMoveIsGenerated(pos, mv, known_in_check),
+        .en_passant => {
+            if (moving_type != .pawn) return false;
+            const ep_square = pos.en_passant orelse return false;
+            if (ep_square != mv.to) return false;
+            return (attacks.pawnAttacksFrom(side, mv.from) & to_mask) != 0;
+        },
+        .double_push => {
+            if (moving_type != .pawn or mv.from.rank() != start_rank) return false;
+            const one_step = square.Square.fromCoords(mv.from.file(), @intCast(@as(i8, mv.from.rank()) + forward));
+            const two_step = square.Square.fromCoords(mv.from.file(), @intCast(@as(i8, mv.from.rank()) + 2 * forward));
+            return mv.to == two_step and !pos.isSquareOccupied(one_step) and !pos.isSquareOccupied(two_step);
+        },
+        .quiet, .capture => {
+            const wants_capture = mv.flag == .capture;
+            if (moving_type == .pawn) {
+                if (mv.from.rank() == promotion_from_rank) return false; // those moves carry promotion flags
+                if (wants_capture) return (attacks.pawnAttacksFrom(side, mv.from) & opp_occ & to_mask) != 0;
+                const one_step_rank = @as(i8, mv.from.rank()) + forward;
+                if (one_step_rank < 0 or one_step_rank >= 8) return false;
+                const one_step = square.Square.fromCoords(mv.from.file(), @intCast(one_step_rank));
+                return mv.to == one_step and !pos.isSquareOccupied(one_step);
+            }
+            const targets = switch (moving_type) {
+                .knight => attacks.knightAttacksFrom(mv.from),
+                .bishop => attacks.bishopAttacksOnTheFly(mv.from, pos.occupancy()),
+                .rook => attacks.rookAttacksOnTheFly(mv.from, pos.occupancy()),
+                .queen => attacks.queenAttacksOnTheFly(mv.from, pos.occupancy()),
+                .king => attacks.kingAttacksFrom(mv.from),
+                else => unreachable,
+            };
+            if ((targets & to_mask) == 0) return false;
+            if ((pos.occupancyFor(side) & to_mask) != 0) return false;
+            return ((opp_occ & to_mask) != 0) == wants_capture;
+        },
+        .promo_knight, .promo_bishop, .promo_rook, .promo_queen => {
+            if (moving_type != .pawn or mv.from.rank() != promotion_from_rank) return false;
+            const one_step = square.Square.fromCoords(mv.from.file(), @intCast(@as(i8, mv.from.rank()) + forward));
+            return mv.to == one_step and !pos.isSquareOccupied(one_step);
+        },
+        .promo_knight_capture, .promo_bishop_capture, .promo_rook_capture, .promo_queen_capture => {
+            if (moving_type != .pawn or mv.from.rank() != promotion_from_rank) return false;
+            return (attacks.pawnAttacksFrom(side, mv.from) & opp_occ & to_mask) != 0;
+        },
+    }
+}
+
+/// The castling clause of `isPseudoLegalMoveFast`: exactly the conditions
+/// `pseudo.generateCastlingMoves` tests before emitting the move.
+fn castlingMoveIsGenerated(pos: *const position.Position, mv: move_mod.Move, known_in_check: ?bool) bool {
+    const side = pos.side_to_move;
+    const king_from: square.Square = if (side == .white) .e1 else .e8;
+    if (mv.from != king_from) return false;
+    if (pos.pieceAt(king_from) != piece.Piece.make(side, .king)) return false;
+    const in_check = known_in_check orelse attacks.isInCheck(pos, side);
+    if (in_check) return false;
+    const opponent = side.other();
+    const rook = piece.Piece.make(side, .rook);
+    if (side == .white) {
+        if (mv.to == .g1) {
+            return pos.castling_rights.white_king_side and pos.pieceAt(.h1) == rook and
+                !pos.isSquareOccupied(.f1) and !pos.isSquareOccupied(.g1) and
+                !attacks.isSquareAttacked(pos, .f1, opponent) and !attacks.isSquareAttacked(pos, .g1, opponent);
+        }
+        if (mv.to == .c1) {
+            return pos.castling_rights.white_queen_side and pos.pieceAt(.a1) == rook and
+                !pos.isSquareOccupied(.b1) and !pos.isSquareOccupied(.c1) and !pos.isSquareOccupied(.d1) and
+                !attacks.isSquareAttacked(pos, .d1, opponent) and !attacks.isSquareAttacked(pos, .c1, opponent);
+        }
+        return false;
+    }
+    if (mv.to == .g8) {
+        return pos.castling_rights.black_king_side and pos.pieceAt(.h8) == rook and
+            !pos.isSquareOccupied(.f8) and !pos.isSquareOccupied(.g8) and
+            !attacks.isSquareAttacked(pos, .f8, opponent) and !attacks.isSquareAttacked(pos, .g8, opponent);
+    }
+    if (mv.to == .c8) {
+        return pos.castling_rights.black_queen_side and pos.pieceAt(.a8) == rook and
+            !pos.isSquareOccupied(.b8) and !pos.isSquareOccupied(.c8) and !pos.isSquareOccupied(.d8) and
+            !attacks.isSquareAttacked(pos, .d8, opponent) and !attacks.isSquareAttacked(pos, .c8, opponent);
+    }
+    return false;
+}
+
+/// `isLegalMove` without generating: true iff `generate` would emit `mv`.
+/// Same legality layer as the generated path (`legalityDisposition` +
+/// `isLegalPseudoMove`), so the verdict is identical to list containment.
+/// `known_in_check` (when non-null) must equal `isInCheck(pos, pos.side_to_move)`.
+pub fn isLegalMoveHinted(pos: *const position.Position, mv: move_mod.Move, known_in_check: ?bool) bool {
+    if (!isPseudoLegalMoveFast(pos, mv, known_in_check)) return false;
+    var ctx: LegalityContext = undefined;
+    initLegalityContext(pos, known_in_check, &ctx);
+    const moving_type = pos.pieceAt(mv.from).pieceType();
     return switch (legalityDisposition(mv, moving_type, &ctx)) {
         .accept => true,
         .reject => false,
@@ -920,15 +1142,17 @@ test "generateQuietChecks finds rook checks in a simple endgame" {
 fn expectGivesCheckMatchesOracle(pos: *position.Position) !void {
     var list = move_mod.MoveList.init();
     generate(pos, &list);
+    const info = CheckInfo.init(pos);
     for (list.slice()) |mv| {
         const predicted = givesCheck(pos, mv);
+        const predicted_info = info.givesCheck(pos, mv);
         var state = make_unmake.StateInfo{};
         _ = make_unmake.makeMove(pos, mv, &state);
         const actual = isInCheck(pos, pos.side_to_move);
         make_unmake.unmakeMove(pos, mv, &state);
-        if (predicted != actual) {
+        if (predicted != actual or predicted_info != actual) {
             var buf: [5]u8 = undefined;
-            std.debug.print("givesCheck mismatch: move {s} predicted {} oracle {}\n", .{ mv.toUci(&buf), predicted, actual });
+            std.debug.print("givesCheck mismatch: move {s} predicted {} info {} oracle {}\n", .{ mv.toUci(&buf), predicted, predicted_info, actual });
             return error.TestUnexpectedResult;
         }
     }
@@ -1009,15 +1233,17 @@ test "givesCheck matches make/unmake oracle on every legal move of a diverse sui
 fn walkGivesCheckEquivalence(pos: *position.Position, depth: usize) !void {
     var list = move_mod.MoveList.init();
     generate(pos, &list);
+    const info = CheckInfo.init(pos);
     for (list.slice()) |mv| {
         const predicted = givesCheck(pos, mv);
+        const predicted_info = info.givesCheck(pos, mv);
         var state = make_unmake.StateInfo{};
         _ = make_unmake.makeMove(pos, mv, &state);
         const actual = isInCheck(pos, pos.side_to_move);
-        if (predicted != actual) {
+        if (predicted != actual or predicted_info != actual) {
             make_unmake.unmakeMove(pos, mv, &state);
             var buf: [5]u8 = undefined;
-            std.debug.print("givesCheck walk mismatch: move {s} predicted {} oracle {}\n", .{ mv.toUci(&buf), predicted, actual });
+            std.debug.print("givesCheck walk mismatch: move {s} predicted {} info {} oracle {}\n", .{ mv.toUci(&buf), predicted, predicted_info, actual });
             return error.TestUnexpectedResult;
         }
         if (depth > 1) try walkGivesCheckEquivalence(pos, depth - 1);
@@ -1037,5 +1263,116 @@ test "givesCheck matches oracle across a 3-ply walk of rich positions" {
     for (fens) |fen_text| {
         var pos = try fen.parse(fen_text);
         try walkGivesCheckEquivalence(&pos, 3);
+    }
+}
+
+/// Every (from, to, flag) encoding — 64 x 64 x 13 — against list containment:
+/// the fast pseudo-legality test must equal `pseudo.generate` membership and
+/// the hinted legality test must equal `generate` membership, with and without
+/// the in-check hint.
+fn expectFastLegalityMatchesLists(pos: *position.Position) !void {
+    var pseudo_list = move_mod.MoveList.init();
+    pseudo.generate(pos, &pseudo_list);
+    var legal_list = move_mod.MoveList.init();
+    generate(pos, &legal_list);
+    const in_check = isInCheck(pos, pos.side_to_move);
+    var from_index: u7 = 0;
+    while (from_index < 64) : (from_index += 1) {
+        var to_index: u7 = 0;
+        while (to_index < 64) : (to_index += 1) {
+            var flag_index: u5 = 0;
+            while (flag_index <= @intFromEnum(move_mod.MoveFlag.promo_queen_capture)) : (flag_index += 1) {
+                const mv = move_mod.Move.init(square.Square.fromIndex(@intCast(from_index)), square.Square.fromIndex(@intCast(to_index)), @enumFromInt(flag_index));
+                const in_pseudo = testContainsMove(&pseudo_list, mv);
+                const in_legal = testContainsMove(&legal_list, mv);
+                if (isPseudoLegalMoveFast(pos, mv, null) != in_pseudo or isPseudoLegalMoveFast(pos, mv, in_check) != in_pseudo or
+                    isLegalMoveHinted(pos, mv, null) != in_legal or isLegalMoveHinted(pos, mv, in_check) != in_legal)
+                {
+                    var buf: [5]u8 = undefined;
+                    std.debug.print("fast legality mismatch: move {s} flag {d} pseudo {} legal {}\n", .{ mv.toUci(&buf), flag_index, in_pseudo, in_legal });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
+test "fast pseudo-legality and hinted legality match the generators on every encoding of the diverse suite" {
+    const fen = @import("../core/fen.zig");
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 b - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        "5k2/8/8/8/8/8/8/4K2R w K - 0 1",
+        "3k4/8/8/8/8/8/8/R3K3 w Q - 0 1",
+        "4k2r/8/8/8/8/8/8/5K2 b k - 0 1",
+        "r3k3/8/8/8/8/8/8/3K4 b q - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R b - - 0 1",
+        "3k4/8/8/3pP3/8/8/8/3RK3 w - d6 0 1",
+        "6k1/8/8/3pP3/8/8/B7/4K3 w - d6 0 1",
+        "8/8/8/R2pP2k/8/8/8/4K3 w - d6 0 1",
+        "8/8/8/8/K2Pp2r/8/8/6k1 b - d3 0 1",
+        "8/2k5/8/3pP3/8/8/8/4K3 w - d6 0 1",
+        "4k3/8/8/8/3Pp3/8/2K5/8 b - d3 0 1",
+        "8/8/8/K2pP2q/8/8/8/6k1 w - d6 0 1",
+        "8/3kP3/8/8/8/8/8/4K3 w - - 0 1",
+        "3n3k/4P3/8/8/8/8/8/4K3 w - - 0 1",
+        "8/RP5k/8/8/8/8/8/4K3 w - - 0 1",
+        "2n5/RP5k/8/8/8/8/8/4K3 w - - 0 1",
+        "4k3/8/8/8/8/8/6p1/4K2R b K - 0 1",
+        "3k4/8/8/8/3B4/8/8/3RK3 w - - 0 1",
+        "4k3/8/8/8/8/8/4K3/4R3 w - - 0 1",
+        "3q3k/8/8/8/8/8/8/K7 b - - 0 1",
+        "k7/8/8/8/3n4/8/8/K7 b - - 0 1",
+        "8/8/8/4k3/8/8/3PK3/8 w - - 0 1",
+        "4r1k1/8/8/8/8/8/4R3/4K3 w - - 0 1",
+        "4k3/8/8/8/7b/8/8/4K3 w - - 0 1",
+        "8/2k5/3p4/p2P1p2/P2P1P2/8/8/4K3 w - - 0 1",
+        "8/8/4k3/8/4K3/8/8/8 w - - 0 1",
+        // Castling with the transit square attacked / the king in check / rook missing.
+        "4k3/8/8/8/8/8/5r2/4K2R w K - 0 1",
+        "4k3/8/8/8/8/8/4r3/4K2R w K - 0 1",
+        "4k3/8/8/8/8/8/8/4K3 w KQ - 0 1",
+        "r3k2r/8/8/8/8/8/8/2R1K2R b kq - 0 1",
+        "r3k2r/8/8/8/8/8/8/R3KR2 b kq - 0 1",
+    };
+    for (fens) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        try expectFastLegalityMatchesLists(&pos);
+    }
+}
+
+fn walkFastLegality(pos: *position.Position, depth: usize) !void {
+    try expectFastLegalityMatchesLists(pos);
+    if (depth == 0) return;
+    var list = move_mod.MoveList.init();
+    generate(pos, &list);
+    for (list.slice()) |mv| {
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(pos, mv, &state);
+        try walkFastLegality(pos, depth - 1);
+        make_unmake.unmakeMove(pos, mv, &state);
+    }
+}
+
+test "fast legality matches the generators across a 2-ply walk of rich positions" {
+    const fen = @import("../core/fen.zig");
+    const fens = [_][]const u8{
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    };
+    for (fens) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        try walkFastLegality(&pos, 2);
     }
 }

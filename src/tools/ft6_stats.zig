@@ -159,17 +159,16 @@ pub fn run(stdout: anytype, depth: u8) !void {
             "groups recomputed : mean {d:.2}  p50 {d}  p95 {d}  max {d}\n" ++
             "undo-log headroom : observed max {d} of {d} cap\n",
         .{
-            n,                    ctx.refreshes,
-            mf,                   pct(g_full[0..n], 50),
-            pct(g_full[0..n], 95), pct(g_full[0..n], 99),
-            g_full[n - 1],
-            ml,                   pct(g_lean[0..n], 50),
-            pct(g_lean[0..n], 95), pct(g_lean[0..n], 99),
-            g_lean[n - 1],
-            mf / ml,
-            mg,                   pct(g_groups[0..n], 50),
-            pct(g_groups[0..n], 95), g_groups[n - 1],
-            ctx.overflow_max,     fullthreats.Delta.MAX_TOGGLES,
+            n,                             ctx.refreshes,
+            mf,                            pct(g_full[0..n], 50),
+            pct(g_full[0..n], 95),         pct(g_full[0..n], 99),
+            g_full[n - 1],                 ml,
+            pct(g_lean[0..n], 50),         pct(g_lean[0..n], 95),
+            pct(g_lean[0..n], 99),         g_lean[n - 1],
+            mf / ml,                       mg,
+            pct(g_groups[0..n], 50),       pct(g_groups[0..n], 95),
+            g_groups[n - 1],               ctx.overflow_max,
+            fullthreats.Delta.MAX_TOGGLES,
         },
     );
 }

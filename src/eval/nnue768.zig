@@ -1760,8 +1760,12 @@ fn PendingThreatRowsT(comptime T: type) type {
     return struct {
         const Self = @This();
         const MAX = 32;
-        adds: [MAX][]const T = undefined,
-        subs: [MAX][]const T = undefined,
+        // Every logged row has the same `h`, carried once by the flush call.
+        // Keep only its address: push order and every indexed row value are
+        // unchanged, so wrapping add/sub order and the resulting i16 lanes are
+        // bit-identical while the hot logs use an 8-byte rather than 16-byte stride.
+        adds: [MAX][*]const T = undefined,
+        subs: [MAX][*]const T = undefined,
         na: usize = 0,
         ns: usize = 0,
 
@@ -1784,13 +1788,13 @@ fn PendingThreatRowsT(comptime T: type) type {
             // Overflow flush is COLD (32 pending rows mid-delta): keep it an out-of-line
             // call so the big fused-pass body never inlines into the push sites.
             if (self.na == MAX) @call(.never_inline, flush, .{ self, half, h });
-            self.adds[self.na] = row;
+            self.adds[self.na] = row.ptr;
             self.na += 1;
         }
 
         inline fn pushSub(self: *Self, half: *[MAX_HIDDEN]i16, h: usize, row: []const T) void {
             if (self.ns == MAX) @call(.never_inline, flush, .{ self, half, h });
-            self.subs[self.ns] = row;
+            self.subs[self.ns] = row.ptr;
             self.ns += 1;
         }
 
@@ -1851,7 +1855,7 @@ fn PendingThreatRowsT(comptime T: type) type {
                 @call(.never_inline, flushInto, .{ self, dst, src.*, h });
                 src.* = dst;
             }
-            self.adds[self.na] = row;
+            self.adds[self.na] = row.ptr;
             self.na += 1;
         }
 
@@ -1860,7 +1864,7 @@ fn PendingThreatRowsT(comptime T: type) type {
                 @call(.never_inline, flushInto, .{ self, dst, src.*, h });
                 src.* = dst;
             }
-            self.subs[self.ns] = row;
+            self.subs[self.ns] = row.ptr;
             self.ns += 1;
         }
 
