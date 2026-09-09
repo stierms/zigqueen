@@ -1,9 +1,9 @@
 # The network: data, training, and provenance
 
 zigqueen has shipped the `zqHalfKA9` full-threats network in the engine's
-`ZQB9` container since 6.0.0. Version 6.2.0 adds a head-only QAT continuation. This page records
-what the network is, how it was trained,
-and what was not used to produce its weights.
+`ZQB9` container since 6.0.0; 6.2.0 continues its head layers with
+quantization-aware training. This page records what the network is, how it
+was trained, and what was not used to produce its weights.
 
 | | |
 |---|---|
@@ -47,13 +47,12 @@ LCZero-derived position ancestry; `wrongIsRight` ancestry remains unresolved.
 Publisher teacher metadata is inherited attribution, not a verified
 per-row teacher execution record.
 
-The original base used the published evaluation labels. The 6.2.0 head
-continuation used a prefix of the locally corrected `r1` corpus. It
-preserves positions, moves and game results while applying recorded
-tablebase and decisive-anchor score replacements. Components are
-interleaved by byte share. This is not a certified family-disjoint or
-globally deduplicated training corpus. Own self-play generation supplied
-no positions to the released network.
+The 6.0.0 base was trained on the published labels. The 6.2.0 head
+continuation used a prefix of a locally corrected copy (`r1`): positions,
+moves and game results unchanged, tablebase and decisive-anchor scores
+replaced where recorded. Components are interleaved by byte share. The
+corpus is not deduplicated or certified family-disjoint. No self-play
+positions went into the released network.
 
 **ODbL notice.** Parts of these data are made available by the Stockfish
 project and LCZero under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/),
@@ -80,24 +79,20 @@ inference path are zigqueen work.
 
 ## 6.2.0 head continuation
 
-The base model SHA-256 is
-`c23ef305f8015c9d3e88765c8f43a082ce3cb0e4c8f25a568123df199301a932`.
-The released model SHA-256 is
-`94da6682065a862dac0af63779ee39055553ba507a21ecd7b10bbe15dbab4a16`.
-Both are 74,587,732 bytes. Only nonlinear head tensors change;
-feature-transformer and PSQT contents remain byte-identical.
+| | |
+|---|---|
+| Base model (6.0.0) | SHA-256 `c23ef305f8015c9d3e88765c8f43a082ce3cb0e4c8f25a568123df199301a932` |
+| Released model | SHA-256 `94da6682065a862dac0af63779ee39055553ba507a21ecd7b10bbe15dbab4a16` |
+| Size | 74,587,732 bytes, both |
+| Changed | dense head tensors only (`l1`, `l2`, `l3` weights and biases); feature transformer and PSQT byte-identical |
+| Data | 120-file prefix of the `r1` interleave, 1,073,741,824 positions, 4 GiB shuffle buffer, 16 windows |
+| Schedule | 65,536 updates × 16,384 rows, learning rate 1e-5, seed 62020727, fresh optimizer state |
+| Target | `0.9 × sigmoid(score/400) + 0.1 × game_result` |
+| QAT | forward pass models the deployed quantization, floored pair products and integer head evaluation |
 
-The recorded continuation used 1,073,741,824 training occurrences,
-65,536 updates of 16,384 rows, learning rate 0.00001, seed 62020727,
-and target `0.9 × sigmoid(score/400) + 0.1 × game_result`.
-It used a common 120-file prefix of the `r1` interleave, a 4 GiB shuffle
-buffer and 16 windows. QAT models the deployed quantization, floored pair
-products and integer head evaluation. Optimizer state was fresh; only
-`l1`, `l2` and `l3` weights/biases were trainable.
-
-The published bullet feature patch describes the original base training,
-not a complete reconstruction of this continuation. Match evidence is
-reported in [STRENGTH.md](STRENGTH.md), separately from training loss.
+The published bullet patch covers the original base training, not this
+continuation. Match evidence is in [STRENGTH.md](STRENGTH.md), separate from
+training loss.
 
 ## Architecture
 

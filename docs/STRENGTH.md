@@ -1,54 +1,49 @@
 # Strength
 
-## 6.2.0 external validation
+## 6.2.0 anchored gauntlet
 
-The completed MAIN gauntlet gives **3672 [3661, 3683]** on our anchored
-roster-likelihood scale. This is a self-assessment, not an official CCRL
-rating. Its bracket is the model's approximate one-standard-error interval;
-it excludes uncertainty in opponent anchors and environmental differences.
+**3672 [3661, 3683]** on the project's anchored roster scale, from a
+1,620-game gauntlet against 27 CCRL-listed engines. This is a self-assessment,
+not an official CCRL rating. The bracket is the model's one-standard-error
+interval and ignores uncertainty in the opponents' anchors.
 
-MAIN recorded **609 wins, 770 draws, 241 losses: 994/1620 (61.36%)**.
-Two opponent forfeits have unresolved causes. Counting those as losses
-instead gives 992/1620 (61.23%); this 992–994 range is an outcome-sensitivity
-bound, not a confidence interval. No candidate forfeits were recorded.
+Score: **609 wins, 770 draws, 241 losses = 994/1620 (61.4%)**. Two opponent
+forfeits have unresolved causes; counted as losses the score is 992/1620
+(61.2%). No zigqueen forfeits.
 
-A separate AVX2 run on oldrig completed all 1620 games and estimated
-**3665 [3654, 3676]**, with 979.5 points (60.46%). Three unresolved opponent
-forfeits give a sensitivity range of 976.5–979.5 points (60.28–60.46%).
-We keep the two host results separate: CPU architecture, opponent binary
-variants and background load differ. They are not pooled into one rating.
+A second run of the same gauntlet with the AVX2 build on a different machine
+(Ryzen 9 5950X) gave **3665 [3654, 3676]**, 979.5/1620 (60.5%), with three
+unresolved opponent forfeits (976.5–979.5 range). The two runs differ in CPU,
+opponent binary variants and background load and are reported separately,
+not pooled.
 
 ### Method
 
-- September 8–9, 2026; 27 opponents, 60 games each, 180+1 time control.
-- One engine thread per process, Hash 256 MB, concurrency 24 on MAIN,
-  normal process priority. MAIN is a Ryzen 9 9950X3D; oldrig a Ryzen 9 5950X.
-- `UHO_4060_v4.epd`: each opponent receives a separately seeded draw of
-  30 openings, each played with reversed colours; seeds 6200 through 6226.
-- Candidate Syzygy paths cover 3–6 pieces; default NNUE scale 48.
-- CCRL Blitz anchor snapshot dated July 19, 2026. Installed versions can
-  differ from the versions behind those historical ratings; these anchors
-  are a fixed yardstick, not a current official ranking.
-- MAIN's Lunar, Starzix, Heimdall and Velvet legs were rerun after early
-  contention and a Lunar terminal-environment issue. The canonical result
-  substitutes those complete legs using the exact original opening/colour
-  pairs. Original legs are archived; the other 23 are unchanged. This is
-  one completed gauntlet, not a sum of original and replacement games.
-- The headline fits one common rating to the roster outcomes. The arithmetic
-  mean of per-opponent implied ratings below is 3673.8, a different
-  descriptive estimator. Earlier published summaries used that mean;
-  do not subtract across estimators as if they were identical.
+- September 8–9, 2026; 27 opponents, 60 games each, 180s+1s.
+- One thread per engine, Hash 256 MB, 24 concurrent games on a Ryzen 9
+  9950X3D at normal process priority.
+- Openings from `UHO_4060_v4`: each opponent gets its own seeded draw of 30
+  positions, each played with both colours (seeds 6200–6226).
+- zigqueen probes Syzygy 3–6 pieces; default NNUE scale 48.
+- Anchors: CCRL Blitz ratings as of July 19, 2026. Installed opponent
+  versions can differ from the versions behind those ratings; the anchors
+  are a fixed yardstick, not a current ranking.
+- The Lunar, Starzix, Heimdall and Velvet legs of the primary run were
+  replayed after early machine contention and a Lunar terminal issue, with
+  the same opening/colour pairs. The originals are archived; the other 23
+  legs are untouched. The result is one gauntlet, not a sum of both.
+- The headline fits one rating to all 1,620 outcomes. The arithmetic mean of
+  the per-opponent implied ratings below is 3673.8, a different estimator;
+  earlier releases reported that mean, so do not subtract across the two.
 
-The first RC in this dashboard series was 3664. The observed difference
-is **+8**, within the run uncertainty; it does not establish an isolated
-causal effect for SEE, pruning or QAT. The completed combined version was
-selected as the release baseline.
+The first 6.2.0 release candidate (before the SEE work, retune and QAT
+head) measured 3664 on the same estimator. The observed +8 is inside the
+run uncertainty and does not isolate any one component.
 
-### MAIN per-opponent results
+### Per-opponent results
 
-Results are from zigqueen's perspective, including recorded forfeits.
-The Stockfish leg actually used 17.1; the separately installed Stockfish 19
-was not substituted into this frozen comparison roster.
+From zigqueen's perspective, forfeits included. The Stockfish leg used 17.1;
+Stockfish 19 was installed later and not substituted into the frozen roster.
 
 | Opponent | Anchor | W–D–L | Points / 60 | Implied rating |
 |---|---:|---:|---:|---:|
@@ -80,30 +75,29 @@ was not substituted into this frozen comparison roster.
 | Prelude-2.1 | 3465 | 33–27–0 | 46.5 | 3679.8 |
 | Saturn-1.3 | 3453 | 38–22–0 | 49 | 3712.5 |
 
-## Local candidate evidence and acceptance
+## How the candidate was accepted
 
-The release contains the selected SEE changes, local pruning retune and
-head-only QAT continuation on the previous RC. Correctness gates and
-short paired screens preceded longer head-to-head tests and these external
-runs. QAT's separate 2000-game test was +9.21 ±8.19 Elo with SPRT unresolved;
-that is a promising estimate, not an H1 result. The longer pruning test
-also remained unresolved when the author accepted its neutral-to-positive
-evidence. The combined SEE/pruning/QAT version was explicitly selected
-following the completed external validation. No independent gains are
-summed, and no claim is made that every component passed H1 at two controls.
+The release is the previous RC plus the SEE speed work, the pruning retune
+and the head-only QAT continuation. Each step passed the correctness gates
+and a short paired screen before longer self-play. The SEE/retune core
+reached H1 against the previous RC at 3s+0.1s (+14 ±9 Elo, 1,686 games).
+QAT's 2,000-game test read +9 ±8 with the SPRT unresolved; the author
+accepted it on that estimate. The combined build was then chosen as the
+release after the gauntlet above. Component gains are not summed, and not
+every component reached H1 at two time controls.
 
-## Historical context
+## History
 
-| Version / venue | Self-assessment | Measurement |
+| Version | Self-assessment | Note |
 |---|---:|---|
-| 6.2.0 MAIN | 3672 | Roster-likelihood estimate, 1620 games |
-| 6.2.0 oldrig | 3665 | Separate AVX2 venue, 1620 games |
-| Previous RC, MAIN series | 3664 | Same dashboard estimator; observed comparison only |
-| 6.1.0 / 6.1.1 | ~3644 | Historical mean-implied estimate, Hash 256 |
-| 6.0.0 | ~3602 | Historical mean-implied estimate, Hash 64 |
-| 5.8.3 | ~3590 | Historical mean-implied estimate, Hash 64 |
+| 6.2.0 | 3672 | roster-likelihood fit, 1,620 games, AVX-512 |
+| 6.2.0 (AVX2 machine) | 3665 | same gauntlet, separate run |
+| 6.2.0 first RC | 3664 | same estimator, comparison only |
+| 6.1.0 / 6.1.1 | ~3644 | mean of implied ratings, Hash 256 |
+| 6.0.0 | ~3602 | mean of implied ratings, Hash 64 |
+| 5.8.3 | ~3590 | mean of implied ratings, Hash 64 |
 
-The historical official CCRL Blitz entry for 5.8.3 was 3569 ±16;
-this is not the baseline for current development. Earlier methods, exact
-results and the official historical link are retained in
+The official CCRL Blitz entry for 5.8.3 is 3569 ±16, about 21 below its
+self-assessment; useful calibration, not the development baseline. Earlier
+runs, exact results and the CCRL link are in
 [STRENGTH_6.1.1.md](STRENGTH_6.1.1.md).

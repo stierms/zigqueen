@@ -29,8 +29,7 @@ to `crates/bullet_lib/Cargo.toml` and run it with cargo as any bullet
 example. The patch is offered as documentation of provenance and for
 reproducibility; it carries bullet's MIT license for the modified files.
 
-The 6.2.0 network additionally uses a head-only QAT continuation. This
-original feature-extension patch does not reproduce that later trainer
-change. Its scope, numerical contract and recorded recipe are documented
-in [NETWORK.md](../NETWORK.md). The recorded local data score alterations
-and replay method are offered in [data-r1/README.md](../data-r1/README.md).
+The 6.2.0 head continuation (quantization-aware, heads only) used a later
+trainer change that this patch does not include; its recipe is in
+[NETWORK.md](../NETWORK.md) and the data corrections it trained on in
+[data-r1/README.md](../data-r1/README.md).

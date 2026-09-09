@@ -19,16 +19,15 @@ third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
 | Engine version | Self-assessment (blitz 180s+1s) | CCRL Blitz (2'+1") | CCRL 40/15 |
 |---|---|---|---|
-| v6.2.0 | **~3672** — completed anchored gauntlet ([methodology and separate AVX2 run](docs/STRENGTH.md)) | — | — |
+| v6.2.0 | **~3672** — 1,620-game, 27-opponent anchored gauntlet, 2026-09-09 ([methodology](docs/STRENGTH.md)) | — | — |
 | v6.1.1 | same as 6.1.0 — compliance release (internal mini-book removed, license texts added); strength untouched, no new gauntlet | — | — |
 | v6.1.0 | **~3644** — 1,620-game, 27-opponent anchored gauntlet, 2026-08-31 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v6.0.0 | ~3602 — 1,620-game anchored gauntlet, 2026-08-18/19 ([methodology](docs/STRENGTH.md)) | pending | — |
 | v5.8.3 | ~3590 — 1,620-game anchored gauntlet, 2026-07-26 ([methodology](docs/STRENGTH.md)) | **3569 ±16** (#76–77, [official listing](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — |
 | v5.8.0 | ~3588 — 1,620-game anchored gauntlet, 2026-07-19 ([methodology](docs/STRENGTH.md)) | — | — |
 
-The 5.8.3 entry records its historical official CCRL result. The
-self-assessments are our measurements anchored to published CCRL ratings,
-not official ratings for newer releases;
+The 5.8.3 CCRL entry is the latest official number. Self-assessments are
+our own gauntlets anchored to published CCRL ratings, not official ratings;
 methodology and caveats in [docs/STRENGTH.md](docs/STRENGTH.md).
 
 ## Features
@@ -77,30 +76,30 @@ optional llvm-bolt post-link pass.
 
 ## Development hardware
 
-Development and testing use three privately owned machines:
+Three privately owned desktops, no cluster:
 
-| Host | CPU | GPU | Physical RAM |
+| Role | CPU | GPU | RAM |
 |---|---|---|---|
-| Main | Ryzen 9 9950X3D, AVX-512 | RTX 4090 | 128 GB |
-| Oldrig | Ryzen 9 5950X, AVX2 | No training GPU | 128 GB |
-| Small | Ryzen 5 7600X3D, AVX-512 | RTX 5080 | 64 GB |
+| Development, SPRT, gauntlets | Ryzen 9 9950X3D (AVX-512) | RTX 4090 (training of the 6.0.0 base) | 128 GB |
+| Second SPRT lane, AVX2 gauntlet | Ryzen 9 5950X (AVX2) | — | 128 GB |
+| Network training | Ryzen 5 7600X3D (AVX-512) | RTX 5080 | 64 GB |
 
-Training and Linux testing run under WSL2. Portable binaries are built
-with Zig; GitHub Actions also builds the tagged release sources.
+Training and Linux testing run under WSL2. Release binaries are cross-built
+with Zig; GitHub Actions builds the same tagged sources.
 
 ## How this engine was built (AI disclosure)
 
 zigqueen is developed by [stierms](https://github.com/stierms) with AI
-assistants, including Anthropic's Claude and OpenAI's Codex. Assistants
-write and review code and run experiments under the author's direction;
-the author sets goals, grants experiment scope and decides what ships.
+assistants (Anthropic's Claude, OpenAI's Codex). The assistants write and
+review code and run experiments; the author sets the goals, approves every
+experiment that costs machine time and decides what ships.
 
-Correctness checks include perft, make/unmake invariants and NNUE parity
-against independent calculations. Candidates progress through short
-matches, SPRT and external validation. Some small-effect tests remain
-statistically unresolved; release acceptance and its limits are recorded
-in [STRENGTH.md](docs/STRENGTH.md). Performance-only changes are checked
-for fixed-depth search equivalence.
+Correctness rests on perft, make/unmake invariants and NNUE parity against
+an independent reference. Strength changes go through short paired screens,
+SPRT self-play at two time controls and an external gauntlet; performance
+changes must be node-identical at fixed depth. Not every accepted change
+reached an SPRT boundary. What was accepted on what evidence is recorded in
+[STRENGTH.md](docs/STRENGTH.md).
 
 `ORIGINALITY.md` documents the originality rules: no code was copied
 or translated from other engines. `docs/PROVENANCE.md` records what was
@@ -140,9 +139,9 @@ packaged locally from `android/oex/`.
 | `EvalFile` | string | `<builtin>` | Path to an external `.zqb` net; leave at `<builtin>` for the embedded net. |
 
 That is the complete list. Development builds compiled with `-Dtuning=true`
-additionally expose live search-policy parameters. Release and tuning
-builds share the same defaults; changing a tuning option updates an
-engine-owned configuration between searches.
+additionally expose the search-policy parameters (`Basin*` and friends).
+Both build flavours share the same defaults; tuning options take effect
+between searches.
 
 ## Platform notes
 
