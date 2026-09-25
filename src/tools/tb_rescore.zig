@@ -88,6 +88,7 @@ pub const Stats = struct {
 const REC = 32;
 
 pub fn run(progress: *std.Io.Writer, opts: Options) !void {
+    @import("../search/startup.zig").ensure();
     if (opts.threads == 0 or opts.threads > 512) return error.InvalidThreadCount;
 
     const tb_pathz = try std.heap.page_allocator.dupeZ(u8, opts.tb_path);

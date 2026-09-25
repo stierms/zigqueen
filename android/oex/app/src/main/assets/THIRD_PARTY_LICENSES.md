@@ -7,10 +7,13 @@ provenance of ideas, data and parameters is recorded separately in `docs/PROVENA
 
 ## Fathom — Syzygy tablebase prober (`deps/fathom`, MIT)
 
-Vendored from https://github.com/jdart1/Fathom. Two local modifications in `tbprobe.c`,
-both marked `/* zigqueen: ... */`: a table file that cannot be mapped into memory is
-treated as a probe miss instead of terminating the engine, and an allocation failure
-disables tablebase probing instead of exiting. `deps/fathom/stdendian.h` is from
+Vendored from https://github.com/jdart1/Fathom. Three local modifications in `tbprobe.c`,
+each marked `/* zigqueen: ... */`: a table file that cannot be mapped into memory is
+treated as a probe miss instead of terminating the engine; an allocation failure
+disables tablebase probing instead of exiting; and the file-mapping helper no longer
+closes the file it borrows, which removes a double close after a failed mapping on
+Linux, and on Windows it releases the mapping handle when the view cannot be created.
+`deps/fathom/stdendian.h` is from
 https://gist.github.com/michaeljclark/3b4fd912f6fa8bb598b3 (as distributed with Fathom).
 
 ```
@@ -257,14 +260,22 @@ Stockfish project and LCZero under the Open Database License 1.0:
 https://opendatacommons.org/licenses/odbl/1-0/
 LCZero individual contents are under DBCL 1.0:
 https://opendatacommons.org/licenses/dbcl/1-0/
+We credit the LCZero contributors, Linmiao Xu (linrock), Joost VandeVondele
+(vondele), the Stockfish data contributors, xushawn and the contributors to
+the community BT4 relabelling.
 
-The recorded local score alterations, additional contents and replay
-method are offered free of charge under ODbL-1.0 (our individual added
-contents: DBCL-1.0) at:
-https://github.com/stierms/zigqueen/blob/v6.2.0/docs/data-r1/README.md
+Our alterations to these data (file selection, local re-encoding, position
+filter, holdout, quotas and score conversion) and the method to reproduce
+them are offered free of charge under ODbL-1.0 (individual contents: DBCL-1.0)
+at:
+https://github.com/stierms/zigqueen/blob/v6.3.0/docs/data-r2/README.md
 Data sources, scope and model lineage:
-https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md
+https://github.com/stierms/zigqueen/blob/v6.3.0/docs/NETWORK.md
 
-The optional source-only replay utility uses sfbinpack 0.6.2 (GPL-3.0),
-https://github.com/Disservin/binpack-rust. It is not linked into the engine
-or Android applications. Cargo fetches it under its own license.
+The source-only tools in that offer are GPL-3.0-or-later. Cargo fetches their
+dependencies under their own licenses: sfbinpack 0.6.2 (GPL-3.0,
+https://github.com/Disservin/binpack-rust), bulletformat 1.8.0 (MIT,
+https://github.com/jw1912/bulletformat), sha2 0.10.9, serde and serde_json
+(MIT or Apache-2.0) and their dependencies (MIT, Apache-2.0, Unlicense or
+Unicode-3.0). None of them is linked into the engine or the Android
+applications.

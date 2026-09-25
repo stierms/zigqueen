@@ -25,13 +25,19 @@ const tt = @import("tt.zig");
 /// (seldepth -> UCI), and the stop/hard-stop control flow itself.
 pub const stats_enabled: bool = build_options.search_stats;
 
-pub const Resources = struct {
-    tt: *tt.TranspositionTable,
-    rfp_hint: *rfp_hint.HintTable,
-    eval_cache: *eval_cache_mod.EvalCache,
-    history: *history_mod.HistoryTable,
-    evaluator: *eval_backend.EngineState,
-};
+pub const Resources = ResourcesFor(*tt.TranspositionTable);
+
+/// Specialize the same search functions once for each table implementation.
+/// This selects no runtime tag or function pointer on the probe/store path.
+pub fn ResourcesFor(comptime TablePointer: type) type {
+    return struct {
+        tt: TablePointer,
+        rfp_hint: *rfp_hint.HintTable,
+        eval_cache: *eval_cache_mod.EvalCache,
+        history: *history_mod.HistoryTable,
+        evaluator: *eval_backend.EngineState,
+    };
+}
 
 pub const StaticSearchOutcomeFlags = struct {
     rfp_cutoff: bool = false,
@@ -50,6 +56,8 @@ const StaticSearchBoundClass = enum {
 };
 
 pub const SearchContext = struct {
+    /// Borrowed only while Engine.search owns the admitted job.
+    tablebases: ?*const @import("syzygy.zig").Job = null,
     repetition: repetition.History,
     stack: stack.SearchStack = .{},
     /// Per-thread finny (accumulator-refresh) cache; reset each search via prepareRoot.
@@ -81,6 +89,29 @@ pub const SearchContext = struct {
     /// Optional UCI info sink. Set per search by the worker; null for
     /// tools/tests (search runs identically, just silent).
     info_emitter: ?search_info.InfoEmitter = null,
+    /// negamax's tried-quiet lists, one slot per ply, kept out of its stack
+    /// frame (Windows x64 runs ___chkstk_ms on every call of a frame >= 4 KB).
+    /// Ownership: a node claims slot `ply` just before its move loop and
+    /// releases it on return. Every search call made from inside that loop is
+    /// at ply + 1, plies never decrease down a call chain, and the only
+    /// same-ply calls (null-move verification, singular verification) are made
+    /// before the caller's loop starts. So at most one frame per ply is inside
+    /// its loop and no child can write a live slot. Safe builds assert it.
+    tried_quiets: [stack.MAX_PLY]stack.TriedQuiets = undefined,
+    tried_quiets_claimed: if (std.debug.runtime_safety) [stack.MAX_PLY]bool else void =
+        if (std.debug.runtime_safety) [_]bool{false} ** stack.MAX_PLY else {},
+
+    pub inline fn claimTriedQuiets(self: *SearchContext, ply: usize) *stack.TriedQuiets {
+        if (comptime std.debug.runtime_safety) {
+            std.debug.assert(!self.tried_quiets_claimed[ply]);
+            self.tried_quiets_claimed[ply] = true;
+        }
+        return &self.tried_quiets[ply];
+    }
+
+    pub inline fn releaseTriedQuiets(self: *SearchContext, ply: usize) void {
+        if (comptime std.debug.runtime_safety) self.tried_quiets_claimed[ply] = false;
+    }
 
     /// Runtime record flags, comptime-false when diagnostic stats are compiled
     /// out so the outcome-classification work in the hot loops folds away.

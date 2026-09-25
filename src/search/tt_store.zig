@@ -22,7 +22,7 @@ pub inline fn evalToTt(raw: ?types.Score) i16 {
 
 pub inline fn storeWindowResult(
     ctx: ?*context_mod.SearchContext,
-    table: *tt.TranspositionTable,
+    table: anytype,
     key: u64,
     depth: i16,
     alpha_orig: types.Score,
@@ -37,7 +37,7 @@ pub inline fn storeWindowResult(
 
 pub inline fn storeLowerBound(
     ctx: ?*context_mod.SearchContext,
-    table: *tt.TranspositionTable,
+    table: anytype,
     key: u64,
     depth: i16,
     beta: types.Score,

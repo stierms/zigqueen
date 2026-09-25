@@ -13,19 +13,21 @@ const LMR_NON_IMPROVING: i32 = 0; // extra LMR reduction when not improving
 const NULL_REDUCTION_BASE: u16 = 5; // null-move R at depth >= NULL_REDUCTION_DEPTH
 const NULL_REDUCTION_DEPTH: u16 = 7;
 
-// Built at runtime (startup + on setoption) so the default table and any SPSA
-// perturbation go through the SAME libm — a comptime-built default could differ
-// by an ulp in @log and flip a rounded cell vs the runtime rebuild.
-var lmr_table: [MAX_LMR_DEPTH][MAX_LMR_MOVES]u8 = undefined;
-var lmr_table_ready = false;
+pub const LmrTable = [MAX_LMR_DEPTH][MAX_LMR_MOVES]u8;
 
-/// (Re)build the LMR table for the given shape (centi-units). Called at engine
-/// startup with the defaults and by the tunables layer on setoption. Cheap
-/// (64x64 doubles), never on the search hot path.
+/// Quiescent-only rebuild: no search/constructor in the process may overlap.
+/// Initialization precedes mutation, so later Engines preserve this shape.
 pub fn applyLmrShape(base_100: i32, divisor_100: i32) void {
+    @import("startup.zig").applyLmrShape(base_100, divisor_100);
+}
+
+/// Pure runtime builder used by startup and quiescent tuning. No global access
+/// or guarded getter: the once owner cannot recurse. Keep runtime @log math
+/// identical for defaults and tuned values (comptime math can round differently).
+pub fn buildLmrTable(table: *LmrTable, base_100: i32, divisor_100: i32) void {
     const base = @as(f64, @floatFromInt(base_100)) / 100.0;
     const divisor = @as(f64, @floatFromInt(divisor_100)) / 100.0;
-    for (&lmr_table, 0..) |*row, d| {
+    for (table, 0..) |*row, d| {
         for (row, 0..) |*cell, m| {
             if (d <= 1 or m <= 1) {
                 cell.* = 0;
@@ -45,11 +47,6 @@ pub fn applyLmrShape(base_100: i32, divisor_100: i32) void {
             }
         }
     }
-    lmr_table_ready = true;
-}
-
-fn ensureLmrTable() void {
-    if (!lmr_table_ready) applyLmrShape(LMR_BASE_100_DEFAULT, LMR_DIVISOR_100_DEFAULT);
 }
 
 pub fn lateMoveReduction(
@@ -64,7 +61,7 @@ pub fn lateMoveReduction(
     killer_a: ?move_mod.Move,
     killer_b: ?move_mod.Move,
 ) u16 {
-    ensureLmrTable();
+    const lmr_table = @import("startup.zig").lmrTable();
     if (depth < 3) return 0;
     if (in_check) return 0;
     if (move_index < 2) return 0;
@@ -125,8 +122,8 @@ pub fn nullMoveReduction(depth: u16) u16 {
 }
 
 test "lmr shape rebuild changes reductions and restores defaults exactly" {
+    @import("startup.zig").ensure();
     const q = move_mod.Move.init(.a2, .a3, .quiet);
-    ensureLmrTable();
     const default_r = lateMoveReduction(12, 20, q, false, true, false, true, 0, null, null);
     // Flatter divisor -> larger reductions at deep/late cells.
     applyLmrShape(LMR_BASE_100_DEFAULT, 150);
@@ -138,6 +135,7 @@ test "lmr shape rebuild changes reductions and restores defaults exactly" {
 }
 
 test "late move reduction stays off for early tactical moves and grows with depth and move index" {
+    @import("startup.zig").ensure();
     try std.testing.expectEqual(@as(u16, 0), lateMoveReduction(4, 0, move_mod.Move.init(.e2, .e4, .double_push), false, true, false, true, 0, null, null));
     try std.testing.expectEqual(@as(u16, 0), lateMoveReduction(4, 4, move_mod.Move.init(.e2, .d3, .capture), false, true, false, true, 0, null, null));
     const q = move_mod.Move.init(.a2, .a3, .quiet);
@@ -146,6 +144,7 @@ test "late move reduction stays off for early tactical moves and grows with dept
 }
 
 test "late move reduction respects in-check and killer guards" {
+    @import("startup.zig").ensure();
     const q = move_mod.Move.init(.a2, .a3, .quiet);
     try std.testing.expectEqual(@as(u16, 0), lateMoveReduction(8, 10, q, true, true, false, true, 0, null, null));
     try std.testing.expectEqual(@as(u16, 0), lateMoveReduction(8, 10, q, false, true, false, true, 0, q, null));
@@ -153,6 +152,7 @@ test "late move reduction respects in-check and killer guards" {
 }
 
 test "late move reduction never reduces less when not improving" {
+    @import("startup.zig").ensure();
     // The improving-asymmetry lives in LMR_NON_IMPROVING (currently 0) — the old
     // narrow all-node bonus was replaced by the broad cut-node bonus (v2 bundle).
     const q = move_mod.Move.init(.a2, .a3, .quiet);
@@ -162,6 +162,7 @@ test "late move reduction never reduces less when not improving" {
 }
 
 test "late move reduction shrinks when quiet history is strongly positive" {
+    @import("startup.zig").ensure();
     const q = move_mod.Move.init(.a2, .a3, .quiet);
     const unknown = lateMoveReduction(8, 10, q, false, false, false, true, 0, null, null);
     const hot_quiet = lateMoveReduction(8, 10, q, false, false, false, true, 30_000, null, null);
@@ -169,6 +170,7 @@ test "late move reduction shrinks when quiet history is strongly positive" {
 }
 
 test "cut-node bonus (when enabled) and hot history shape reductions" {
+    @import("startup.zig").ensure();
     const q = move_mod.Move.init(.a2, .a3, .quiet);
     const all_node = lateMoveReduction(8, 20, q, false, false, false, true, 0, null, null);
     const cut_node = lateMoveReduction(8, 20, q, false, false, true, true, 0, null, null);

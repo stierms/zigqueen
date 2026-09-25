@@ -16,3 +16,8 @@ paths = [
   '''docs/diagrams/.*''',
   '''.*\.(png|svg|jar)$''',
 ]
+# The FNV-1a 64-bit offset basis in the published trainer patch is a hash
+# constant, not a credential (generic-api-key false positive).
+regexes = [
+  '''0xcbf29ce484222325''',
+]

@@ -1,23 +1,129 @@
 # The network: data, training, and provenance
 
-zigqueen has shipped the `zqHalfKA9` full-threats network in the engine's
-`ZQB9` container since 6.0.0; 6.2.0 continues its head layers with
-quantization-aware training. This page records what the network is, how it
-was trained, and what was not used to produce its weights.
+zigqueen has shipped a `zqHalfKA9` full-threats network in the engine's
+`ZQB9` container since 6.0.0. 6.3.0 ships a new one with the same
+architecture, trained from scratch on a wider set of published data. The
+6.0.0–6.2.0 network is described further down.
 
 | | |
 |---|---|
-| **Training data** | Publicly published Stockfish NNUE training datasets |
-| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set (the extension is published as [`trainer/bullet-fullthreats.patch`](trainer/README.md)) |
+| **Training data** | 42 published, relabelled components of Stockfish and LCZero training data |
+| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set; the extensions are published as patches in [`trainer/`](trainer/README.md) |
 | **Architecture** | 8-bucket mirrored HalfKA + 60,144 full-threat inputs; width 1024; `1024 -> 16 -> 32 -> 1` layer stack in each of 8 output buckets |
-| **Weights** | Original base trained from random initialisation; local head-only QAT continuation for 6.2.0 |
+| **Weights** | 6.3.0: trained from seeded random initialisation, then a head-only QAT stage |
 | **Engine format** | `ZQB9`, 74.6 MB embedded net, default scale 48 |
 | **Engine inference** | Written from scratch in Zig and checked against independent reference calculations |
 
-## Training data
+## 6.3.0 network
+
+| | |
+|---|---|
+| Released model | SHA-256 `a63732096ec9f2afdb0e18ddf09a7a04b6cdd5c1b6c8844b200afaf48f9da731` |
+| Averaged model before QAT | SHA-256 `9066cabe9e9aee4a41158a0b744b35b54a843d98e29f4f012bf58206116e825b` |
+| Size | 74,587,732 bytes, both |
+| Initialisation | seeded random weights (seed 62020914); nothing taken from the 6.2.0 network or any other network |
+| Positions | 131,124,072,315 admitted training positions from 42 components, not deduplicated across components; 7,998,177 held out by position key |
+| Main schedule | 4,721 superbatches of 100,007,936 samples, cosine learning rate 0.001 → 2.43e-6 |
+| Finish | 1,181 further superbatches, cosine 2.43e-6 → 2.43e-7; 590,246,838,272 samples in all, about 4.5 passes |
+| Averaging | mean of 13 checkpoints from the last quarter of the finish (superbatches 5,621 to 5,902) |
+| QAT | dense head tensors only, 65,536 updates × 16,384 rows = 1,073,741,824 samples, learning rate 1e-5, fresh optimizer state; feature transformer and PSQT bytes unchanged by this stage |
+| Target | `0.9 × sigmoid(0.92568 × score / 400) + 0.1 × game_result` |
+
+Components are sampled by quota, not by file size. The
+score in the target is the published teacher score in centipawns; where our
+older copies stored it pre-multiplied by a per-source factor, the original
+integer is reconstructed (at most 0.5 cp error). The single factor 0.92568
+keeps our existing score scale; it was fixed in advance, not tuned for
+strength.
+
+Self-play against the 6.2.0 network, same engine code: +10.8 ± 7.5 Elo at
+8s+0.08s (2,554 games) and +7.9 ± 6.0 Elo at 60s+0.6s (3,368 games), SPRT H1
+at both. Match evidence is in [STRENGTH.md](STRENGTH.md).
+
+### 6.3.0 training data
+
+All 42 components are published *relabelled* collections on Hugging Face,
+scored with Leela BT4 evaluations:
+
+- [`vondele/from_kaggle_1_relabel`](https://huggingface.co/datasets/vondele/from_kaggle_1_relabel):
+  `leela96-filt-v2`, splits 0–4 (6.2.0 used split 0 only);
+- [`vondele/from_kaggle_2_relabel`](https://huggingface.co/datasets/vondele/from_kaggle_2_relabel):
+  the `T60T70wIsRightFarseerT60T74T75T76` blend, splits 0–4 (new);
+- [`vondele/linrock_relabel_1`](https://huggingface.co/datasets/vondele/linrock_relabel_1):
+  `test60` 2021-11 and 2021-12, `test77` 2021-12 (new), `test78` 2022-01 to
+  2022-09, `test79` 2022-04 and 2022-05, `test80` 2022-06 to 2022-11;
+- [`vondele/linrock_relabel_2`](https://huggingface.co/datasets/vondele/linrock_relabel_2):
+  `test80` 2023-01 to 2023-12;
+- [`vondele/master-binpacks_relabel`](https://huggingface.co/datasets/vondele/master-binpacks_relabel):
+  `wrongIsRight_nodes5000pv2`, plus `dfrc_n5000`, `fishpack32`,
+  `multinet_pv-2_diff-100_nodes-5000` and `nodes5000pv2_UHO` (new);
+- [`xushawn/test80-bt4-relabel`](https://huggingface.co/datasets/xushawn/test80-bt4-relabel):
+  `test80` 2024-01 and 2024-02 (ODbL-1.0).
+
+The `xushawn` card declares ODbL-1.0. The `vondele` cards state no license;
+their sources are the LCZero training data (ODbL-1.0, individual contents
+DbCL-1.0) and the Stockfish project's published binpacks (ODbL-1.0), and some
+original Kaggle uploads also carry CC0 declarations. We treat the relabelled
+copies as continuing their sources' ODbL terms. We credit the LCZero
+contributors, Linmiao Xu (linrock), Joost VandeVondele (vondele), the
+Stockfish data contributors, xushawn and the contributors to the community
+BT4 relabelling. No self-play positions went into the network.
+
+**ODbL notice.** Parts of these data are made available by the Stockfish
+project and LCZero under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/),
+with LCZero contents under [DBCL 1.0](https://opendatacommons.org/licenses/dbcl/1-0/).
+We relabelled nothing, but we did change how these data reach the network:
+the choice of files, local copies of 37 of them that store each score
+multiplied by a per-source factor, reconstruction of the published score from
+those copies, the position filter, a holdout by position key, per-component
+quotas and the conversion of scores into targets with the common factor.
+[data-r2/README.md](data-r2/README.md) lists each change with its rule and
+totals, and the release asset `zigqueen-training-data-r2-alterations.tar.xz` on
+the [6.3.0 release](https://github.com/stierms/zigqueen/releases/tag/v6.3.0)
+holds the manifests, indexes, tables and code to repeat them. Both are free of
+charge. The derivative database and our alterations are offered under
+ODbL-1.0, individual contents under DbCL-1.0. The `r1` archive below covers
+the 6.2.0 network only.
+
+**Trainer changes.** The bullet changes that trained this network are
+published in [trainer/](trainer/README.md) as two patches against the same
+upstream commit as before (`d372d48`): `bullet-bt4-full.patch` for the main
+run, the finish, checkpoint averaging and resuming, and
+`bullet-bt4-head-qat.patch` for the head-only QAT stage. Applied to a clean
+bullet checkout, each reproduces byte for byte the bullet source files its
+training program was built from. The main run was interrupted and resumed
+four times, each time from a checksummed checkpoint that holds the optimizer
+state, the data position and the running average; the trainer refuses to
+resume if any setting or the program itself has changed. The data loader
+that samples the 42 components is zigqueen's own code rather than a bullet
+change, and is published with the data offer above. GPU training is not
+bitwise repeatable, so rebuilding the trainer gives the same programs, not
+these exact weights.
+
+## Trainer and training origin
+
+Stockfish trains its own networks with `nnue-pytorch`. zigqueen uses bullet,
+an independent open-source NNUE trainer, plus a project-specific extension
+that teaches bullet the 60,144-input full-threat mapping.
+
+Both zigqueen network lineages were trained **from scratch**, starting from
+random weights: the 6.0.0 base, and the 6.3.0 network from a new seed. Their
+weights were never:
+
+- initialized from a Stockfish or other third-party network;
+- fine-tuned from third-party network weights; or
+- distilled logit-wise from Stockfish network outputs.
+
+The contribution of Stockfish, LCZero and the relabelling contributors is the
+openly published training data. The network weights, feature mapping, trainer
+extension, quantization, and Zig inference path are zigqueen work.
+
+## The 6.0.0–6.2.0 network
+
+### Training data
 
 The Stockfish project and its contributors publish NNUE training datasets.
-The shipped network was trained on twenty-seven published components,
+The 6.0.0–6.2.0 network was trained on twenty-seven published components,
 interleaved:
 
 - `leela96-filt-v2` (split 0) — LCZero-derived positions from the
@@ -60,24 +166,7 @@ with LCZero contents under [DBCL 1.0](https://opendatacommons.org/licenses/dbcl/
 The local alterations, additional contents and replay method are offered
 free of charge in [data-r1/README.md](data-r1/README.md).
 
-## Trainer and training origin
-
-Stockfish trains its own networks with `nnue-pytorch`. zigqueen uses bullet,
-an independent open-source NNUE trainer, plus a project-specific extension
-that teaches bullet the 60,144-input full-threat mapping.
-
-The 6.0.0 network was trained **from scratch**, starting from random weights.
-Its weights were never:
-
-- initialized from a Stockfish or other third-party network;
-- fine-tuned from third-party network weights; or
-- distilled logit-wise from Stockfish network outputs.
-
-Stockfish's contribution here is the openly published training data. The
-network weights, feature mapping, trainer extension, quantization, and Zig
-inference path are zigqueen work.
-
-## 6.2.0 head continuation
+### 6.2.0 head continuation
 
 | | |
 |---|---|

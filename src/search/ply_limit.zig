@@ -12,7 +12,12 @@ const types = @import("../core/types.zig");
 /// path while sharing the same terminal-aware fallback with recursive qsearch.
 pub const START: usize = stack.MAX_PLY - 4;
 
-pub fn fallback(
+/// The ply test stays inline at every negamax/qsearch entry; the cap body is a
+/// separate cold function. Inlined, its MAX_MOVES list sat in both recursive
+/// frames on every call (520 B each; the Windows x64 AVX2 negamax frame was
+/// 4,984 B, above the 4 KB ___chkstk_ms probe threshold) although it only runs
+/// at ply >= START.
+pub inline fn fallback(
     ctx: *context_mod.SearchContext,
     evaluator: *eval_backend.EngineState,
     pos: *position.Position,
@@ -20,7 +25,17 @@ pub fn fallback(
     in_check_hint: ?bool,
 ) ?types.Score {
     if (ply < START) return null;
+    return capScore(ctx, evaluator, pos, ply, in_check_hint);
+}
 
+noinline fn capScore(
+    ctx: *context_mod.SearchContext,
+    evaluator: *eval_backend.EngineState,
+    pos: *position.Position,
+    ply: usize,
+    in_check_hint: ?bool,
+) types.Score {
+    @branchHint(.cold);
     const in_check = in_check_hint orelse legal.isInCheck(pos, pos.side_to_move);
     var moves = move_mod.MoveList.init();
     legal.generateHinted(pos, &moves, in_check);

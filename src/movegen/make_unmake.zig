@@ -31,7 +31,7 @@ pub inline fn isIrreversibleMove(moving_piece: piece.Piece, mv: move_mod.Move) b
 /// from the register instead of reloading `pos.zobrist_key` — a load that had
 /// to wait on the store makeMove just issued (7.9% of negamax's middlegame
 /// samples, ~5% endgame, at the post-make reload cluster 0x30de3f1..0x30de413).
-pub fn makeMove(pos: *position.Position, mv: move_mod.Move, state: *StateInfo) u64 {
+pub fn makeMove(pos: *position.Position, mv: move_mod.Move, state: *StateInfo) align(64) u64 { // align(64): pins hot entry placement (layout stability, not call speed)
     const side = pos.side_to_move;
     const moving_piece = pos.pieceAt(mv.from);
     std.debug.assert(moving_piece != .none);
@@ -93,7 +93,7 @@ pub fn makeMoveForLegality(pos: *position.Position, mv: move_mod.Move) void {
     }
 }
 
-pub fn unmakeMove(pos: *position.Position, mv: move_mod.Move, state: *const StateInfo) void {
+pub fn unmakeMove(pos: *position.Position, mv: move_mod.Move, state: *const StateInfo) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
     const side = pos.side_to_move.other();
 
     pos.side_to_move = side;

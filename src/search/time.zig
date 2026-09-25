@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("../util/search_runtime.zig");
 const types = @import("../core/types.zig");
 
 pub const DEFAULT_MOVE_OVERHEAD_MS: u64 = 20;
@@ -158,14 +159,10 @@ pub fn loadTmConfigFromEnv() TmConfig {
     return cfg;
 }
 
-/// Process-wide cached config. Read once on first use; the UCI worker, the
-/// engine and the tools all see the same snapshot, so a search is internally
-/// consistent even if the environment mutates mid-process.
-var tm_config_cache: ?TmConfig = null;
-
+/// Process-wide snapshot frozen at first Engine construction or cold getter.
+/// Engine-less tools/tests use the same acquire/release initialization boundary.
 pub fn tmConfig() TmConfig {
-    if (tm_config_cache == null) tm_config_cache = loadTmConfigFromEnv();
-    return tm_config_cache.?;
+    return @import("startup.zig").tmConfig();
 }
 
 fn envU32(allocator: std.mem.Allocator, name: []const u8) ?u32 {
@@ -445,14 +442,14 @@ pub const Controller = struct {
     stop_flag: *const std.atomic.Value(bool),
     limits: Limits,
     legacy_maximum_budget_ns: ?u64 = null,
-    timer: ?std.time.Timer = null,
+    timer: ?runtime.Timer = null,
 
     pub fn init(stop_flag: *const std.atomic.Value(bool), limits: Limits) Controller {
         return .{
             .stop_flag = stop_flag,
             .limits = limits,
             .legacy_maximum_budget_ns = limits.maximum_budget_ns,
-            .timer = std.time.Timer.start() catch null,
+            .timer = runtime.Timer.start() catch null,
         };
     }
 

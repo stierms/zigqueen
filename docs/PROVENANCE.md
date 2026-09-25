@@ -1,6 +1,6 @@
 # Provenance and licensing record
 
-**Updated September 9, 2026 for 6.2.0.** This record distinguishes inherited
+**Updated September 25, 2026 for 6.3.0.** This record distinguishes inherited
 ideas and initial parameters, local implementations and retunes, trained
 weights, data transformations and redistributed third-party code.
 
@@ -29,13 +29,13 @@ https://github.com/stierms/zigqueen/issues.
 | Component / source | License | How zigqueen relates to it |
 |---|---|---|
 | zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
-| Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1). No code. GPL-compatible. |
+| Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1); threat-conditioned quiet history is a published idea it also uses (§1, 6.3.0). No code. GPL-compatible. |
 | Stockfish 18 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§2, §3). No code. Training data: see next row. |
-| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the shipped network (§4): published collections with local score alterations in the QAT continuation. Notice and alteration offer below. |
-| `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the 2024 components. |
+| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/from_kaggle_2_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03 and 2026-09-14); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the 6.3.0 network (40 of its 42 components) and for the 6.2.0 network (§4), with local score alterations. Notice and alteration offer below. |
+| `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the two 2024 components. |
 | Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | LCZero-derived components of the training mix (§4). ODbL notice below. |
 | bullet (Jamie Whiting) | MIT | NNUE trainer, used with a full-threats input extension written for zigqueen and published as a patch (§4). Not linked into the engine. |
-| Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, two local modifications (§5). |
+| Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, three local modifications (§5). |
 | chessenginesupport-androidlib (gkalab) | Apache-2.0 | Vendored unmodified in `android/oex/…/com/kalab/chess/enginesupport/` for the OEX APK (§5). |
 | Gradle wrapper | Apache-2.0 | `android/oex/gradle/wrapper/gradle-wrapper.jar` (§5). |
 | Opening books used for testing (UHO, Stefan Pohl) | not redistributed | Used to run gauntlets only. |
@@ -84,6 +84,21 @@ independently derived. The Zig implementation, integration, guards and
 score-unit calibration remain zigqueen work. Both projects publish under
 GPL terms; this attribution is retained independently of the retune.
 
+**Search changes in 6.3.0.** None of these copies code from another engine.
+
+- *Threat-conditioned quiet history.* Keeping quiet-move history separately
+  by whether the move's from- and to-squares are attacked is a published idea
+  used by several engines; Stormphrax's history tables, for example, are
+  indexed this way. zigqueen's version splits its own piece-to history into
+  four tables; its layout, update and consumers are our own.
+- *Cut-node labels.* Reduced late-move searches and ProbCut confirmation
+  searches now pass cut/all labels by the convention Stockfish 19 uses, which
+  the inherited reduction formula (above) assumes.
+- *Parallel search.* Shared-hash parallel search ("Lazy SMP") is a
+  long-published technique. The worker pool, the sequence-checked shared
+  transposition-table cluster, the job-wide node budget and the tablebase
+  service were written for zigqueen.
+
 ## 2. NNUE evaluation: published forms, our own implementation
 
 - **Feature transformer.** Mirrored HalfKA with 8 king buckets (each perspective's own king; files e–h mirrored onto
@@ -124,24 +139,58 @@ no longer shipped.
 
 ## 4. The network: weights and data
 
-- **Weights.** The original full-threat base was trained from random
+- **Weights (6.3.0).** The 6.3.0 network was trained from seeded random
+  initialisation, then its nonlinear heads went through a QAT stage. No
+  weights from the 6.2.0 network or any third-party network were used for
+  initialisation, fine-tuning or logit distillation; the training labels are
+  published numeric scores, not teacher network weights.
+- **Data (6.3.0).** Forty-two published components from six Hugging Face
+  repositories, listed in [NETWORK.md](NETWORK.md); all carry BT4 relabel
+  scores. The two `xushawn` components declare ODbL-1.0. The other forty rely
+  on their sources' terms: LCZero data (ODbL-1.0, individual contents
+  DbCL-1.0), the Stockfish project's published binpacks (ODbL-1.0), and
+  CC0 declarations on some original Kaggle uploads, which cover only what
+  their authors could waive. The five `vondele` relabel repositories state
+  no terms of their own, and we have not found a separate notice for rights
+  added by the relabelling; we treat the relabelled copies as continuing
+  their sources' ODbL terms.
+- **Local changes (6.3.0).** No score was relabelled; every training score is
+  a fixed function of a published score. We chose 42 files and left out
+  Q-value versions, compressed and split copies, and overlapping or unclear
+  collections. For 37 files we used local copies, made in July 2026, that keep
+  every entry in order but store the score multiplied by a per-source factor
+  (0.8426 to 0.9869) and rounded; the published integer is reconstructed from
+  them with at most 0.5 cp error. The admission removed published scores of
+  magnitude 30000 or more, positions before ply 16, captures and special
+  moves, positions in check, scores beyond 10,000 after the common factor
+  0.92568, and castling positions in `dfrc_n5000` (none occurred): it kept
+  131,124,072,315 of 225,520,878,403 rows and held out 7,998,177 by position
+  key. Components are mixed by quota, and the target is
+  `0.9 × sigmoid(0.92568 × score / 400) + 0.1 × game result`. Positions, moves
+  and game results are unchanged, and nothing was deduplicated beyond the
+  holdout. Own self-play generation did not supply positions. Rules, counts
+  and code: [data-r2/README.md](data-r2/README.md).
+- **Weights (6.0.0–6.2.0).** The original full-threat base was trained from random
   initialisation on the author's RTX 4090. The 6.2.0 network adds a QAT
   continuation on the RTX 5080, training only its nonlinear heads. Feature
   transformer and PSQT bytes are unchanged. No third-party network weights
   were used for initialisation, fine-tuning or logit distillation.
 - **Trainer.** bullet (MIT) with locally written feature mapping, loading,
-  recipe and deployed-arithmetic training extensions. The published
-  `docs/trainer/bullet-fullthreats.patch` documents the original base
-  extension against `d372d48`; it does not include the later QAT extension.
-  [NETWORK.md](NETWORK.md) records the continuation recipe and model hashes.
-- **Data.** Twenty-seven published components, with exact source families
+  recipe and deployed-arithmetic training extensions. `docs/trainer/`
+  publishes them as patches against `d372d48`: `bullet-fullthreats.patch`
+  for the original base, and `bullet-bt4-full.patch` and
+  `bullet-bt4-head-qat.patch` for the 6.3.0 network, with the two zigqueen
+  export scripts in `docs/trainer/tools/`. The trainer change behind the
+  6.2.0 head continuation is not published.
+  [NETWORK.md](NETWORK.md) records the recipes and model hashes.
+- **Data (6.0.0–6.2.0).** Twenty-seven published components, with exact source families
   listed in [NETWORK.md](NETWORK.md). Publisher metadata identifies
   Stockfish-project relabels, including BT4 teacher labels. Twenty-six
   components have LCZero-derived position ancestry; the generation ancestry
   of `wrongIsRight_nodes5000pv2` remains unresolved in our audit. We have
   not reconstructed each row's upstream teacher execution or certified
   source-family independence.
-- **Local changes.** The original base used the published-label corpus.
+- **Local changes (6.0.0–6.2.0).** The original base used the published-label corpus.
   The later QAT continuation used a prefix of its local `r1` version:
   selected tablebase and decisive-anchor score replacements, preserving
   position, move and game-result fields. The previous statement that the
@@ -158,14 +207,24 @@ no longer shipped.
   offered under ODbL-1.0, with our individual additional contents under
   DBCL-1.0. We do not rely on the earlier assertion that distributing only
   a trained network always removes derivative-database obligations.
+  For the 6.3.0 network the offer is [data-r2/README.md](data-r2/README.md)
+  and the release asset `zigqueen-training-data-r2-alterations.tar.xz`: the
+  pinned sources, the re-encoding of our local copies and how the published
+  scores are reconstructed from them, the common factor, the position filter,
+  the holdout keys, the quotas, the target and the code for each step,
+  offered free of charge. The derivative database and our alterations are
+  offered under ODbL-1.0 and individual contents under DbCL-1.0; we added no
+  individual contents. The `data-r1` offer covers the 6.2.0 network only.
 
 ## 5. Third-party code compiled or packaged with zigqueen
 
 - **Fathom** (`deps/fathom`, MIT): Syzygy tablebase prober by Ronald de Man, basil00 and Jon Dart, vendored from
-  `github.com/jdart1/Fathom` (the unmodified files match upstream commit `c9c6fef`, 2025-12-23). Two local changes in
-  `tbprobe.c`, both marked
+  `github.com/jdart1/Fathom` (the unmodified files match upstream commit `c9c6fef`, 2025-12-23). Three local changes in
+  `tbprobe.c`, marked
   `/* zigqueen: … */`: a table that cannot be mapped into memory is treated as a probe miss instead of terminating the
-  engine, and an allocation failure disables tablebases instead of exiting. The MIT notice is kept in every source
+  engine; an allocation failure disables tablebases instead of exiting; and (6.3.0) the file-mapping helper no longer
+  closes the file it borrows, which removes a double close after a failed mapping on Linux, and on Windows it releases
+  the mapping handle when the view cannot be created. The MIT notice is kept in every source
   header and reproduced in `THIRD_PARTY_LICENSES.md`, which ships in every binary archive.
 - **chessenginesupport-androidlib** (Apache-2.0, gkalab): the reference OEX provider implementation, vendored
   unmodified for the Android APKs; license text in `THIRD_PARTY_LICENSES.md` and in the APK.
@@ -221,3 +280,6 @@ at https://github.com/stierms/zigqueen/issues.
   local data alteration offer; corrected single-PSQT description and
   overly broad claims about training labels, workstation contents,
   repository removals and universal SPRT acceptance.
+- September 25, 2026, 6.3.0: new network trained from scratch on 42
+  components and its data changes; search ideas added in 6.3.0; third local
+  Fathom change.

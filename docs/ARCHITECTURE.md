@@ -1,10 +1,11 @@
 # zigqueen architecture
 
-zigqueen is a single-threaded UCI chess engine written in Zig, built around a
-bitboard position model, an NNUE evaluation with incrementally updated
-accumulators, and a PVS/negamax search with a modern pruning and extension
-stack. This document maps the source tree and records the design decisions
-that matter for correctness and performance.
+zigqueen is a UCI chess engine written in Zig, built around a bitboard
+position model, an NNUE evaluation with incrementally updated accumulators,
+and a PVS/negamax search with a modern pruning and extension stack. Since
+6.3.0 the search can run on up to 32 threads (Lazy SMP). This document maps
+the source tree and records the design decisions that matter for correctness
+and performance.
 
 ## Module map
 
@@ -69,7 +70,9 @@ option. The deployed generation is **ZQB9**:
 
 Inference uses portable `@Vector` SIMD (lowers to AVX-512/AVX2/NEON with a
 scalar fallback); integer SIMD is bit-exact, so eval output is identical
-across targets.
+across targets. The AVX-512 build runs the accumulator and activation kernels
+512 bits wide; since 6.3.0 this is forced explicitly, because LLVM's default
+tuning for x86-64-v4 had kept them at 256 bits.
 
 ### Incremental update machinery
 
@@ -98,10 +101,22 @@ mapping is validated bit-for-bit against a trainer-faithful reference.
 
 Iterative deepening with aspiration windows around a PVS/negamax core.
 
-- **Transposition table.** Clustered (2 entries per cluster, 24-byte
-  entries), generation-based depth-preferred replacement, prefetched, and
-  it caches the raw static eval so a TT hit without a cutoff still skips
-  the NNUE forward pass.
+- **Threads (Lazy SMP).** With `Threads` above 1, every thread runs its own
+  iterative deepening on the same root. The threads share one transposition
+  table; move histories, the eval cache, the hint table and NNUE
+  accumulators are private to each thread. Thread 0 owns the clock, the
+  root tablebase decision, all UCI output and the final move, and one
+  job-wide node budget covers `go nodes`. Helper threads are created when
+  `Threads` changes and park between searches; nothing is allocated during a
+  search. `Threads=1` runs the serial search with no helper threads.
+- **Transposition table.** Clustered, generation-based depth-preferred
+  replacement, prefetched, and it caches the raw static eval so a TT hit
+  without a cutoff still skips the NNUE forward pass. At one thread a
+  cluster holds two 24-byte entries (48 bytes). The shared table used with
+  more threads has 64-byte clusters of two entries behind a sequence word:
+  a writer takes the cluster with one compare-and-swap or skips the store,
+  and a reader that sees a concurrent write treats it as a miss, so a torn
+  entry is never used.
 - **Dedicated eval cache.** A 2-way set-associative, 1-bit-LRU memo of the
   raw static eval keyed by the full 64-bit zobrist key, sized off `Hash`.
   It gives TT-evicted positions a second chance: the TT's depth-preferred
@@ -121,27 +136,33 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
   only when the static eval is at or below alpha — never while ahead, which
   keeps the branching factor position-aware).
 - **Move ordering:** TT move first, captures by SEE, killers, countermove,
-  main history, continuation history. Correction history is implemented but
-  parked in this release (its tables are not allocated, so the static eval is
-  used uncorrected).
+  quiet history (kept in four tables by whether the move's from- and
+  to-squares are attacked by the opponent), continuation history. Correction
+  history is implemented but parked in this release (its tables are not
+  allocated, so the static eval is used uncorrected).
 - **Quiescence:** captures/promotions plus SEE-gated quiet checks at the
   first qsearch ply (a direct-check generator keeps the horizon
   check-aware without a movegen pass).
 - **Node accounting:** one visited position, one node — `nodes`/`nps` are
   honest counts.
 - **Endgames:** Syzygy WDL probing at search time via the vendored Fathom
-  prober (`SyzygyPath`). Tablebase-decided root results are proven once
-  (two agreeing completed iterations past a depth floor) and reused instead
-  of re-searched every iteration.
+  prober (`SyzygyPath`). At a root the tables cover, a clock-aware DTZ probe
+  of every legal move restricts the search to the moves that keep the best
+  tablebase result (respecting `go searchmoves`), and a search score that
+  contradicts that result is not accepted. Only thread 0 probes the root;
+  helpers receive the same move restriction. Tablebase-decided root results
+  are proven once (two agreeing completed iterations past a depth floor) and
+  reused instead of re-searched every iteration.
 - **Time management:** iteration-based budgeting with a `Move Overhead`
   guard; the hard per-move deadline extends beyond its normal ceiling only
   for the iteration after a completed iteration that changed its best move
   or dropped the score. The per-node clock check is throttled off the hot
   path.
 
-Search behavior at fixed depth is bit-deterministic, which the tooling
-exploits: performance work is validated by node-identity (identical node
-counts and PV at fixed depth) before any strength testing.
+At `Threads=1`, search behavior at fixed depth is bit-deterministic, which
+the tooling exploits: performance work is validated by node-identity
+(identical node counts and PV at fixed depth) before any strength testing.
+With more threads the result depends on scheduling and is not reproducible.
 
 ## Performance design decisions
 
@@ -160,6 +181,9 @@ counts and PV at fixed depth) before any strength testing.
 - **Cache-conscious layouts.** TT clusters and eval-cache sets are sized to
   cache lines (4 eval-cache entries per 64-byte line); the accumulator and
   weight blocks are 64-byte aligned.
+- **Stable code placement.** The hottest search and NNUE functions are
+  aligned to 64 bytes, so unrelated code changes do not shift their cache-line
+  placement and with it the measured speed.
 - **Exact-output discipline.** Performance changes must preserve fixed-depth
   node identity; speed and strength are then judged separately. An optional
   llvm-bolt post-link pass (`scripts/bolt-optimize.sh`) reorders the hot

@@ -316,6 +316,7 @@ pub fn run(
     max_lines: []const u64,
     threads: u32,
 ) !void {
+    @import("../search/startup.zig").ensure();
     const allocator = std.heap.page_allocator;
     const tb_pathz = try allocator.dupeZ(u8, opts.tb_path);
     defer allocator.free(tb_pathz);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("../util/search_runtime.zig");
 const build_options = @import("build_options");
 const types = @import("../core/types.zig");
 const context_mod = @import("context.zig");
@@ -59,6 +60,10 @@ pub const SearchDiagnostics = struct {
     /// Last combined three-signal soft-limit factor (percent, 100 = neutral).
     /// Stays 100 unless a ZQ_TM_NF/BM/SC signal is enabled.
     soft_scale_pct: u32 = 100,
+    /// Completed search scores contradicted a clock-aware root TB outcome.
+    /// The legal root set remains protected; published scores use that oracle.
+    /// Compiled out with other search diagnostics; preserves the production ABI.
+    root_tb_conflicts: if (build_options.search_stats) u32 else void = if (build_options.search_stats) 0 else {},
 };
 
 pub const SearchResult = struct {
@@ -119,8 +124,16 @@ pub const Engine = struct {
     /// --threads): TT/hint/eval-cache/history/context are private per engine,
     /// only the weight blob is borrowed. The caller owns `net`, must keep it
     /// alive for this engine's lifetime, and frees it after deinit.
-    pub fn initWithSharedNet(allocator: std.mem.Allocator, hash_mb: u32, net: *eval_backend.Net) !Engine {
+    pub fn initWithSharedNet(allocator: std.mem.Allocator, hash_mb: u32, net: *const eval_backend.Net) !Engine {
         var evaluator = eval_backend.EngineState.initBorrowedNet(allocator, net, .{});
+        errdefer evaluator.deinit();
+        return initWithEvaluator(allocator, hash_mb, &evaluator);
+    }
+
+    /// The process/pool owns the loaded network; worker scale selection is
+    /// copied exactly, without re-running family-default scale adoption.
+    pub fn initWithBorrowedEvaluator(allocator: std.mem.Allocator, hash_mb: u32, owner: *const eval_backend.EngineState) !Engine {
+        var evaluator = owner.borrow(allocator);
         errdefer evaluator.deinit();
         return initWithEvaluator(allocator, hash_mb, &evaluator);
     }
@@ -128,7 +141,19 @@ pub const Engine = struct {
     /// Takes ownership of `evaluator` (moved into the returned engine); on
     /// error the caller's errdefer still owns it.
     fn initWithEvaluator(allocator: std.mem.Allocator, hash_mb: u32, evaluator: *eval_backend.EngineState) !Engine {
-        var tt_table = try tt.TranspositionTable.init(allocator, hash_mb);
+        return initWithTables(allocator, hash_mb, evaluator, true);
+    }
+
+    /// A parallel worker has private search/caches but no private serial TT.
+    pub fn initForParallel(allocator: std.mem.Allocator, hash_mb: u32, owner: *const eval_backend.EngineState) !Engine {
+        var evaluator = owner.borrow(allocator);
+        errdefer evaluator.deinit();
+        return initWithTables(allocator, hash_mb, &evaluator, false);
+    }
+
+    fn initWithTables(allocator: std.mem.Allocator, hash_mb: u32, evaluator: *eval_backend.EngineState, comptime serial_table: bool) !Engine {
+        @import("startup.zig").ensure();
+        var tt_table = if (serial_table) try tt.TranspositionTable.init(allocator, hash_mb) else tt.TranspositionTable{ .allocator = allocator };
         errdefer tt_table.deinit();
         var hint_table = try rfp_hint_mod.HintTable.init(allocator, hintSizeFor(hash_mb));
         errdefer hint_table.deinit();
@@ -214,9 +239,39 @@ pub const Engine = struct {
     }
 
     pub fn resizeHash(self: *Engine, hash_mb: u32) !void {
-        try self.tt.resize(hash_mb);
-        try self.rfp_hint.resize(hintSizeFor(hash_mb));
-        try self.eval_cache.resize(eval_cache_mod.sizeForHash(hash_mb));
+        var factory = HashTableFactory{};
+        try self.resizeHashWithFactory(hash_mb, &factory);
+    }
+
+    /// Quiescent configuration transaction: every fallible preparation finishes
+    /// before any live table or history changes. The pool/worker owns the idle
+    /// barrier; this method neither stops a search nor publishes to live readers.
+    fn resizeHashWithFactory(self: *Engine, hash_mb: u32, factory: anytype) !void {
+        const hint_mb = hintSizeFor(hash_mb);
+        const eval_mb = eval_cache_mod.sizeForHash(hash_mb);
+        if (hash_mb == self.tt.hashSizeMb() and
+            hint_mb == self.rfp_hint.hintSizeMb() and
+            eval_mb == self.eval_cache.cacheSizeMb())
+        {
+            self.reset();
+            return;
+        }
+
+        var new_tt = try factory.create(tt.TranspositionTable, self.tt.allocator, hash_mb);
+        errdefer new_tt.deinit();
+        var new_hint = try factory.create(rfp_hint_mod.HintTable, self.rfp_hint.allocator, hint_mb);
+        errdefer new_hint.deinit();
+        var new_eval = try factory.create(eval_cache_mod.EvalCache, self.eval_cache.allocator, eval_mb);
+        // resize previously preserved runtime associativity and did not re-read
+        // stats-build environment overrides. Keep that contract here as well.
+        new_eval.assoc = self.eval_cache.assoc;
+
+        self.tt.deinit();
+        self.rfp_hint.deinit();
+        self.eval_cache.deinit();
+        self.tt = new_tt;
+        self.rfp_hint = new_hint;
+        self.eval_cache = new_eval;
         self.history.clear();
     }
 
@@ -247,24 +302,72 @@ pub const Engine = struct {
         root_moves: ?*const move_mod.MoveList,
     ) SearchResult {
         self.tt.newSearch();
+        return self.searchWithTable(pos, root_history, limits, stop_flag, root_moves, &self.tt, null);
+    }
+
+    /// Single-worker shared-TT integration entry. The caller owns the table's
+    /// idle/job transitions and holds this view through return. This entry still
+    /// acquires its own TB lease and clock: it must NOT be used as a helper API.
+    /// The P2 pool will supply the shared job/clock/node policy separately.
+    pub fn searchWithSharedTable(
+        self: *Engine,
+        pos: *const position.Position,
+        root_history: *const repetition.History,
+        limits: time.Limits,
+        stop_flag: *const std.atomic.Value(bool),
+        root_moves: ?*const move_mod.MoveList,
+        table: *@import("shared_tt.zig").View,
+    ) SearchResult {
+        return self.searchWithTable(pos, root_history, limits, stop_flag, root_moves, table, null);
+    }
+
+    pub fn searchParallel(self: *Engine, comptime coordinator: bool, execution: *@import("shared_job.zig").Execution(coordinator)) SearchResult {
+        const job = execution.job;
+        const root_moves = if (job.root_moves) |*moves| moves else null;
+        return self.searchWithTable(&job.position, &job.history, job.limits, job.control.external_stop, root_moves, &job.table, execution);
+    }
+
+    fn searchWithTable(
+        self: *Engine,
+        pos: *const position.Position,
+        root_history: *const repetition.History,
+        limits: time.Limits,
+        stop_flag: *const std.atomic.Value(bool),
+        root_moves: ?*const move_mod.MoveList,
+        table: anytype,
+        execution: anytype,
+    ) SearchResult {
+        const parallel = @TypeOf(execution) != @TypeOf(null);
+        const helper = if (parallel) @TypeOf(execution.*).is_helper else false;
         var working = pos.*;
         // Reset the heap-owned context (also zeroes the ~1MB accumulator stack),
         // matching the prior fresh-`.{}` behaviour exactly.
         const ctx = self.ctx;
         ctx.* = context_mod.SearchContext{
             .repetition = root_history.*,
-            .control = time.Controller.init(stop_flag, limits),
+            .control = if (helper) time.Controller{ .stop_flag = stop_flag, .limits = limits } else time.Controller.init(stop_flag, limits),
             .record_static_search_outcomes = self.record_static_search_outcomes,
             .record_move_order_outcomes = self.record_move_order_outcomes,
         };
-        ctx.info_emitter = self.info_emitter;
+        if (comptime parallel) {
+            // Node limits are shared credits; helpers never own a clock.
+            ctx.control.limits.node_limit = null;
+            ctx.control.timer = if (helper) null else execution.job.timer;
+            if (comptime helper) {
+                ctx.control.limits.maximum_budget_ns = null;
+                ctx.control.limits.optimum_budget_ns = null;
+                ctx.control.limits.wider_maximum_budget_ns = null;
+                ctx.control.limits.infinite = false;
+            }
+        }
+        ctx.info_emitter = if (helper) null else self.info_emitter;
         ctx.contempt = self.contempt_cp;
         if (comptime build_options.tuning) ctx.basin_config = &self.basin_config;
         ctx.root_color = working.side_to_move;
         if (ctx.repetition.count == 0) ctx.repetition.push(working.zobrist_key);
         self.evaluator.prepareRoot(&ctx.stack, &working, &ctx.finny, &ctx.ft);
 
-        const fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock), root_moves);
+        var fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock), root_moves);
         var best = SearchResult{ .best_move = fallback };
 
         if (working.halfmove_clock >= 100 or ctx.repetition.isClaimableCurrentRepetition(working.halfmove_clock)) {
@@ -272,20 +375,40 @@ pub const Engine = struct {
             return best;
         }
 
-        // Root DTZ probe (rule-50-aware): in a TB-covered WINNING root, play
-        // Fathom's DTZ-optimal move directly — search cannot outplay the table,
-        // and pawnless wins (KBN vs K et al.) are invisible to the in-search
-        // WDL probe (no zeroing move ever resets the clock, so its rule-50
-        // gate never opens; measured live: 50 shuffled moves, drawn win).
-        // Draws/losses fall through to the normal search: against imperfect
-        // opposition the search keeps practical winning/swindle chances that
-        // "any TB-optimal move" would forfeit.
-        if (syzygy.probeRoot(&working)) |tbv| {
-            if (tbv.win) {
-                if (matchLegalMove(&working, tbv)) |mv| {
-                    if (rootMoveAllowed(root_moves, mv)) {
+        if (comptime parallel) {
+            if (limits.node_limit == 0 or fallback == null or execution.job.control.stopping()) {
+                if (fallback == null and legal.isInCheck(&working, working.side_to_move)) best.score = -score_mod.MATE_SCORE;
+                return best;
+            }
+        }
+        var local_tablebase_job: ?syzygy.Job = if (parallel) null else syzygy.beginJob();
+        defer if (local_tablebase_job) |*local| local.deinit();
+        const tablebase_job = if (parallel) execution.job.tablebases else &local_tablebase_job.?;
+        ctx.tablebases = if (tablebase_job.enabled()) tablebase_job else null;
+        defer ctx.tablebases = null;
+
+        // Establish a clock-aware result-preserving root set once, before
+        // helper publication. Search keeps practical choices inside that set.
+        // Helpers borrow the coordinator's copied policy and never root-probe.
+        var root_policy: ?syzygy.RootPolicy = if (helper or limits.node_limit == 0 or fallback == null or stop_flag.load(.acquire))
+            null
+        else
+            tablebase_job.probeRootMoves(&working, root_moves);
+        const safe_root_moves = if (root_policy) |*p| &p.moves else root_moves;
+        const root_wdl = if (root_policy) |p| p.wdl else if (helper) execution.job.root_wdl else null;
+        if (root_policy) |*p| {
+            fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock), &p.moves);
+            best.best_move = fallback;
+            best.score = syzygy.wdlScore(p.wdl, 0);
+            if (p.wdl == .win) {
+                if (matchLegalMove(&working, p.suggested)) |mv| {
+                    if (rootMoveAllowed(&p.moves, mv)) {
+                        if (comptime parallel) {
+                            if (!execution.job.control.count(true, execution.account)) return best;
+                            ctx.nodes = 1;
+                        }
                         best.best_move = mv;
-                        best.score = syzygy.TB_WIN_SCORE - @as(types.Score, @intCast(@min(tbv.dtz, 1000)));
+                        best.score = syzygy.TB_WIN_SCORE - @as(types.Score, @intCast(@min(p.suggested.dtz, 1000)));
                         best.depth = 1;
                         best.seldepth = 1;
                         best.nodes = 1;
@@ -297,6 +420,23 @@ pub const Engine = struct {
             }
         }
 
+        if (comptime parallel and !helper) {
+            if (execution.ready) |ready| ready.call(ready.ctx, if (root_policy) |*p| p else null);
+        }
+        const resources = if (parallel) .{
+            .tt = table,
+            .rfp_hint = &self.rfp_hint,
+            .eval_cache = &self.eval_cache,
+            .history = &self.history,
+            .evaluator = &self.evaluator,
+            .execution = execution,
+        } else context_mod.ResourcesFor(@TypeOf(table)){
+            .tt = table,
+            .rfp_hint = &self.rfp_hint,
+            .eval_cache = &self.eval_cache,
+            .history = &self.history,
+            .evaluator = &self.evaluator,
+        };
         const max_depth = limits.depth orelse 64;
         var previous_trace: ?IterationTrace = null;
         var previous_root_hints: ?root.RootMoveHints = null;
@@ -309,6 +449,9 @@ pub const Engine = struct {
         var best_move_streak: u32 = 0;
         var depth: u16 = 1;
         search_loop: while (depth <= max_depth) : (depth += 1) {
+            if (comptime parallel) {
+                if (execution.job.control.stopping()) break;
+            }
             if (ctx.control.stopReasonNow(ctx.nodes)) |reason| {
                 ctx.noteHardStop(reason);
                 break;
@@ -328,16 +471,16 @@ pub const Engine = struct {
 
             while (true) {
                 const reused_root_hints = if (previous_root_hints) |*hints| hints else null;
-                var iteration_timer = std.time.Timer.start() catch null;
+                var iteration_timer: ?runtime.Timer = if (helper) null else runtime.Timer.start() catch null;
                 iteration = root.searchDepthWindow(
                     ctx,
-                    .{ .tt = &self.tt, .rfp_hint = &self.rfp_hint, .eval_cache = &self.eval_cache, .history = &self.history, .evaluator = &self.evaluator },
+                    resources,
                     &working,
                     depth,
                     alpha,
                     beta,
                     reused_root_hints,
-                    root_moves,
+                    safe_root_moves,
                 );
                 iteration_elapsed_ns = if (iteration_timer) |*timer|
                     @max(@as(i128, std.time.ns_per_ms), @as(i128, @intCast(timer.read())))
@@ -352,8 +495,13 @@ pub const Engine = struct {
                 }
                 // Only a direction-matching decisive bound proves the WDL:
                 // fail-low can prove a loss, and fail-high can prove a win.
-                if (isTablebaseWdlProof(alpha, beta, iteration.score)) break;
-                if (ctx.info_emitter) |emitter| {
+                // For oracle-covered roots, resolve aspiration bounds normally.
+                // A search-derived decisive bound is not an independent proof.
+                if (root_wdl == null and isTablebaseWdlProof(alpha, beta, iteration.score)) break;
+                // A partial selective-search bound does not supersede the
+                // authoritative root outcome. Keep it internal; completed
+                // iteration output below reports the independently known WDL.
+                if (if (root_wdl == null) ctx.info_emitter else null) |emitter| {
                     emitter.emit(.{ .iteration = .{
                         .depth = depth,
                         .seldepth = ctx.seldepth,
@@ -361,7 +509,7 @@ pub const Engine = struct {
                         .bound = if (iteration.score <= alpha) .upper else .lower,
                         .nodes = ctx.nodes,
                         .time_ms = ctx.control.elapsedNs() / std.time.ns_per_ms,
-                        .hashfull = self.hashfullPermille(),
+                        .hashfull = table.hashfullPermille(),
                         .best_move = iteration.best_move,
                         .pv = &[_]move_mod.Move{},
                     } });
@@ -371,16 +519,23 @@ pub const Engine = struct {
             }
 
             best.best_move = iteration.best_move orelse fallback;
-            best.score = iteration.score;
+            if (root_wdl) |wdl| {
+                if (comptime build_options.search_stats) {
+                    if (rootScoreContradicts(wdl, iteration.score)) best.diagnostics.root_tb_conflicts += 1;
+                }
+            }
+            // This score is the known root outcome, not a promoted aspiration
+            // bound. The search still chooses among outcome-preserving moves.
+            best.score = if (root_wdl) |wdl| rootOutcomeScore(wdl, iteration.score) else iteration.score;
             best.depth = iteration.depth;
             best.seldepth = ctx.seldepth;
             best.nodes = ctx.nodes;
-            pv.reconstructFromRootMoveLimited(&working, &ctx.repetition, &self.tt, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
+            pv.reconstructFromRootMoveLimited(&working, &ctx.repetition, table, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
 
             const current_trace = IterationTrace{
                 .depth = iteration.depth,
                 .seldepth = ctx.seldepth,
-                .score = iteration.score,
+                .score = best.score,
                 .nodes = ctx.nodes,
                 .best_move = best.best_move,
                 .pv = best.pv,
@@ -391,7 +546,7 @@ pub const Engine = struct {
                 best.diagnostics.trace[best.diagnostics.trace_len] = current_trace;
                 best.diagnostics.trace_len += 1;
             }
-            tb_decision_streak = nextTablebaseDecisionStreak(tb_decision_streak, previous_trace, current_trace);
+            tb_decision_streak = if (root_wdl == null) nextTablebaseDecisionStreak(tb_decision_streak, previous_trace, current_trace) else 0;
             stable_iteration_streak = nextStableIterationStreak(stable_iteration_streak, previous_trace, current_trace);
             best_move_streak = if (previous_trace) |prev|
                 (if (prev.best_move == current_trace.best_move) best_move_streak + 1 else 1)
@@ -414,7 +569,7 @@ pub const Engine = struct {
                     .bound = .exact,
                     .nodes = best.nodes,
                     .time_ms = ctx.control.elapsedNs() / std.time.ns_per_ms,
-                    .hashfull = self.hashfullPermille(),
+                    .hashfull = table.hashfullPermille(),
                     .best_move = best.best_move,
                     .pv = best.pv.slice(),
                 } });
@@ -434,7 +589,7 @@ pub const Engine = struct {
                 best.diagnostics.soft_scale_pct = soft_policy.scale_pct;
             }
 
-            if (iterationStopReasonWithPolicy(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns, soft_policy)) |reason| {
+            if (if (helper) null else iterationStopReasonWithPolicy(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns, soft_policy)) |reason| {
                 best.diagnostics.iteration_stop_reason = reason;
                 switch (reason) {
                     .maximum_elapsed => ctx.noteIterationStopMaximumElapsed(),
@@ -457,10 +612,20 @@ pub const Engine = struct {
         // `go infinite` to emit bestmove. If it is ever reached, remain in the
         // search until the GUI sends `stop`.
         if (ctx.control.limits.infinite and !stop_flag.load(.acquire)) {
-            while (!stop_flag.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+            while (!stop_flag.load(.acquire)) runtime.Thread.sleep(std.time.ns_per_ms);
         }
         best.diagnostics.stats = ctx.stats;
         return best;
+    }
+};
+
+/// Cold-path construction seam; the generic caller also permits deterministic
+/// stage failures in tests without changing the OS huge-page allocator.
+const HashTableFactory = struct {
+    fn create(_: *@This(), comptime Table: type, allocator: std.mem.Allocator, mb: u32) !Table {
+        var table = Table{ .allocator = allocator };
+        try table.resize(mb);
+        return table;
     }
 };
 
@@ -491,6 +656,23 @@ fn initialAspirationBeta(guess: ?i32, delta: i32) i32 {
 fn shouldResearchAspiration(guess: ?i32, alpha: i32, beta: i32, score: i32) bool {
     _ = guess orelse return false;
     return score <= alpha or score >= beta;
+}
+
+fn rootScoreContradicts(wdl: syzygy.Wdl, score: i32) bool {
+    if (!score_mod.isDecisive(score)) return false;
+    return switch (wdl) {
+        .draw => true,
+        .win => score < 0,
+        .loss => score > 0,
+    };
+}
+
+fn rootOutcomeScore(wdl: syzygy.Wdl, searched: i32) i32 {
+    return switch (wdl) {
+        .draw => 0,
+        .win => if (score_mod.isDecisive(searched) and searched > 0) searched else syzygy.TB_WIN_SCORE,
+        .loss => if (score_mod.isDecisive(searched) and searched < 0) searched else -syzygy.TB_WIN_SCORE,
+    };
 }
 
 fn isTablebaseWdlProof(alpha: i32, beta: i32, score: i32) bool {
@@ -1334,4 +1516,245 @@ test "lazy accumulator reconstruction matches full refresh across real searches 
         const result = engine.search(&pos, &history, .{ .depth = 5 }, &stop_flag);
         try std.testing.expect(result.best_move != null);
     }
+}
+
+const FailingHashTableFactory = struct {
+    fail_at: usize,
+    calls: usize = 0,
+
+    fn create(self: *@This(), comptime Table: type, allocator: std.mem.Allocator, mb: u32) !Table {
+        const call = self.calls;
+        self.calls += 1;
+        if (call == self.fail_at) return error.OutOfMemory;
+        var factory = HashTableFactory{};
+        return factory.create(Table, allocator, mb);
+    }
+};
+
+test "hash resize failure at every preparation stage preserves live resources" {
+    // Hash 1 -> 2 keeps the temporary TT and hint allocations below the huge
+    // mapping threshold, so testing.allocator also detects failed-stage leaks.
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    engine.tt.entries[0].entries[0] = .{ .key = 17, .depth = 7, .score = 31 };
+    engine.rfp_hint.entries[0].entries[0] = .{ .key = 19, .depth = 5, .score = 37 };
+    engine.eval_cache.entries[0] = .{ .key = 23, .eval = 41 };
+    engine.history.quiet[0][0][0][0] = 43;
+    engine.tt.generation = 11;
+    const old_tt = engine.tt;
+    const old_hint = engine.rfp_hint;
+    const old_eval = engine.eval_cache;
+    for (0..3) |stage| {
+        var factory = FailingHashTableFactory{ .fail_at = stage };
+        try std.testing.expectError(error.OutOfMemory, engine.resizeHashWithFactory(2, &factory));
+        try std.testing.expectEqual(stage + 1, factory.calls);
+        try std.testing.expectEqual(old_tt.entries.ptr, engine.tt.entries.ptr);
+        try std.testing.expectEqual(old_tt.entries.len, engine.tt.entries.len);
+        try std.testing.expectEqual(old_tt.mask, engine.tt.mask);
+        try std.testing.expectEqual(old_tt.generation, engine.tt.generation);
+        try std.testing.expectEqual(@as(u32, 1), engine.hashSizeMb());
+        try std.testing.expectEqual(old_hint.entries.ptr, engine.rfp_hint.entries.ptr);
+        try std.testing.expectEqual(old_hint.mask, engine.rfp_hint.mask);
+        try std.testing.expectEqual(old_eval.entries.ptr, engine.eval_cache.entries.ptr);
+        try std.testing.expectEqual(old_eval.index_shift, engine.eval_cache.index_shift);
+        try std.testing.expectEqual(@as(u64, 17), engine.tt.entries[0].entries[0].key);
+        try std.testing.expectEqual(@as(u64, 19), engine.rfp_hint.entries[0].entries[0].key);
+        try std.testing.expectEqual(@as(u64, 23), engine.eval_cache.entries[0].key);
+        try std.testing.expectEqual(@as(i16, 43), engine.history.quiet[0][0][0][0]);
+    }
+    // The original engine remains usable after all three failures.
+    const pos = try @import("../core/fen.zig").startpos();
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    var stop = std.atomic.Value(bool).init(false);
+    const result = engine.search(&pos, &history, .{ .depth = 3 }, &stop);
+    try std.testing.expect(result.best_move != null);
+    try std.testing.expectEqual(@as(u16, 3), result.depth);
+}
+
+test "hash resize commits all tables and preserves eval associativity" {
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    engine.eval_cache.assoc = 1;
+    const net = engine.evaluator.net;
+    const context = engine.ctx;
+    for ([_]u32{ 2, 4, 1 }) |mb| {
+        engine.tt.entries[0].entries[0].key = 17;
+        engine.rfp_hint.entries[0].entries[0].key = 19;
+        engine.eval_cache.entries[0].key = 23;
+        engine.history.quiet[0][0][0][0] = 43;
+        try engine.resizeHash(mb);
+        try std.testing.expectEqual(mb, engine.hashSizeMb());
+        try std.testing.expectEqual(hintSizeFor(mb), engine.rfp_hint.hintSizeMb());
+        try std.testing.expectEqual(eval_cache_mod.sizeForHash(mb), engine.eval_cache.cacheSizeMb());
+        try std.testing.expectEqual(@as(u8, 1), engine.eval_cache.assoc);
+        try std.testing.expectEqual(@as(u64, 0), engine.tt.entries[0].entries[0].key);
+        try std.testing.expectEqual(@as(u64, 0), engine.rfp_hint.entries[0].entries[0].key);
+        try std.testing.expectEqual(@as(u64, 0), engine.eval_cache.entries[0].key);
+        try std.testing.expectEqual(@as(i16, 0), engine.history.quiet[0][0][0][0]);
+        try std.testing.expectEqual(net, engine.evaluator.net);
+        try std.testing.expectEqual(context, engine.ctx);
+    }
+}
+
+test "same hash reset requires no replacement allocations" {
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    engine.tt.entries[0].entries[0].key = 17;
+    engine.tt.generation = 11;
+    engine.history.quiet[0][0][0][0] = 43;
+    const ptr = engine.tt.entries.ptr;
+    var factory = FailingHashTableFactory{ .fail_at = 0 };
+    try engine.resizeHashWithFactory(1, &factory);
+    try std.testing.expectEqual(@as(usize, 0), factory.calls);
+    try std.testing.expectEqual(ptr, engine.tt.entries.ptr);
+    try std.testing.expectEqual(@as(u64, 0), engine.tt.entries[0].entries[0].key);
+    try std.testing.expectEqual(@as(u8, 0), engine.tt.generation);
+    try std.testing.expectEqual(@as(i16, 0), engine.history.quiet[0][0][0][0]);
+}
+
+test "real allocator failure preserves the original hash allocation" {
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    engine.tt.entries[0].entries[0].key = 17;
+    const old_entries = engine.tt.entries;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    // The 2-MB request rounds down to a 1.5-MB TT: hugealloc uses its real
+    // fallback allocator, so this induces an actual allocation failure.
+    engine.tt.allocator = failing.allocator();
+    defer engine.tt.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, engine.resizeHash(2));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(old_entries.len, engine.tt.entries.len);
+    try std.testing.expectEqual(old_entries.ptr, engine.tt.entries.ptr);
+    try std.testing.expectEqual(@as(u64, 17), engine.tt.entries[0].entries[0].key);
+}
+
+fn netWeightHash(net: *const Net) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    inline for (.{
+        "feature_weights", "feature_bias", "output_weights", "output_biases",
+        "psqtw",           "psqtb",        "threat_w8",      "l1_weights",
+        "l1_byte_weights", "l1_blocked",   "l1_bias",        "l2_weights",
+        "l2_weights_t",    "l2_bias",      "l3_weights",     "l3_bias",
+    }) |field| hash.update(std.mem.sliceAsBytes(@field(net, field)));
+    return hash.final();
+}
+
+const SharedNetSearchParticipant = struct {
+    engine: *Engine,
+    pos: position.Position,
+    history: repetition.History,
+    start: *runtime.ResetEvent,
+    result: ?SearchResult = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.start.timedWait(10 * std.time.ns_per_s) catch |err| {
+            self.failure = err;
+            return;
+        };
+        var stop = std.atomic.Value(bool).init(false);
+        self.result = self.engine.search(&self.pos, &self.history, .{ .depth = 5 }, &stop);
+    }
+};
+
+test "shared const net searches keep mutable worker resources independent" {
+    const allocator = std.testing.allocator;
+    const nnue = @import("../eval/nnue768.zig");
+    const fen = @import("../core/fen.zig");
+    const blob = try nnue.buildZqb9TestBlob(allocator);
+    defer allocator.free(blob);
+    const owner = try nnue.loadFromBytes(allocator, blob);
+    defer owner.destroy(allocator);
+    const shared: *const Net = owner;
+    const weight_hash = netWeightHash(shared);
+    var engines: [4]Engine = undefined;
+    var initialized: usize = 0;
+    defer for (engines[0..initialized]) |*engine| engine.deinit();
+    for (&engines) |*engine| {
+        engine.* = try Engine.initWithSharedNet(allocator, 1, shared);
+        initialized += 1;
+        try std.testing.expect(engine.evaluator.owned_net == null);
+        try std.testing.expect(engine.evaluator.net == shared);
+    }
+    var start = runtime.ResetEvent{};
+    var participants: [4]SharedNetSearchParticipant = undefined;
+    var expected: [4]SearchResult = undefined;
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/2pP4/1p2P3/2N2N2/PPQBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "4k3/P7/8/8/8/8/7p/4K3 w - - 0 1",
+    };
+    for (&participants, &engines, 0..) |*participant, *engine, i| {
+        const pos = try fen.parse(fens[i]);
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        participant.* = .{ .engine = engine, .pos = pos, .history = history, .start = &start };
+        var stop = std.atomic.Value(bool).init(false);
+        expected[i] = engine.search(&pos, &history, .{ .depth = 5 }, &stop);
+        engine.reset();
+        for (engines[0..i]) |*other| {
+            try std.testing.expect(engine.ctx != other.ctx);
+            try std.testing.expect(engine.tt.entries.ptr != other.tt.entries.ptr);
+            try std.testing.expect(engine.rfp_hint.entries.ptr != other.rfp_hint.entries.ptr);
+            try std.testing.expect(engine.eval_cache.entries.ptr != other.eval_cache.entries.ptr);
+        }
+    }
+    var threads: [4]runtime.Thread = undefined;
+    var started: usize = 0;
+    defer {
+        start.set();
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for (&participants, 0..) |*participant, i| {
+        threads[i] = try runtime.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, SharedNetSearchParticipant.run, .{participant});
+        started += 1;
+    }
+    start.set();
+    for (threads) |thread| thread.join();
+    started = 0;
+    for (&participants, expected) |*participant, reference| {
+        if (participant.failure) |err| return err;
+        const actual = participant.result orelse return error.MissingSearchResult;
+        try std.testing.expectEqual(reference.best_move, actual.best_move);
+        try std.testing.expectEqual(reference.score, actual.score);
+        try std.testing.expectEqual(reference.depth, actual.depth);
+        try std.testing.expectEqual(reference.nodes, actual.nodes);
+        try std.testing.expectEqualSlices(move_mod.Move, reference.pv.slice(), actual.pv.slice());
+    }
+    try std.testing.expectEqual(weight_hash, netWeightHash(shared));
+}
+
+test "root outcome authority distinguishes actual loss from restricted draw" {
+    try std.testing.expect(rootScoreContradicts(.draw, -27990));
+    try std.testing.expect(rootScoreContradicts(.draw, 27990));
+    try std.testing.expect(!rootScoreContradicts(.loss, -27990));
+    try std.testing.expectEqual(@as(i32, 0), rootOutcomeScore(.draw, -27990));
+    try std.testing.expect(rootOutcomeScore(.loss, 12) < -score_mod.TB_DECISIVE_THRESHOLD);
+}
+
+test "drawn Horsie root cannot accept false TB loss or stop on its streak" {
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_ROOT_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    try std.testing.expect(syzygy.init(path_z));
+    defer syzygy.disable();
+    var engine = try Engine.init(a, 16);
+    defer engine.deinit();
+    const pos = try @import("../core/fen.zig").parse("7k/6P1/7P/5N2/2r5/5K2/8/8 b - - 0 91");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    var stop = std.atomic.Value(bool).init(false);
+    const result = engine.search(&pos, &history, .{ .node_limit = 20000 }, &stop);
+    try std.testing.expectEqual(@as(i32, 0), result.score);
+    try std.testing.expect(result.best_move != null);
+    try std.testing.expectEqual(@as(u64, 20000), engine.ctx.nodes);
+    var job = syzygy.beginJob();
+    defer job.deinit();
+    const policy = job.probeRootMoves(&pos, null).?;
+    try std.testing.expect(rootMoveAllowed(&policy.moves, result.best_move.?));
 }

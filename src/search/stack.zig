@@ -42,6 +42,14 @@ pub const StackEntry = struct {
     parent_lmr_reduction: if (build_options.tuning) u16 else void = if (build_options.tuning) 0 else {},
 };
 
+/// Quiet moves one negamax node searched without a cutoff, with their moving
+/// piece types (the history malus input at a later quiet cutoff). Slots live
+/// in SearchContext.tried_quiets, one per ply.
+pub const TriedQuiets = struct {
+    moves: [move_mod.MAX_MOVES]move_mod.Move,
+    pieces: [move_mod.MAX_MOVES]piece.PieceType,
+};
+
 pub const SearchStack = struct {
     entries: [MAX_PLY]StackEntry = [_]StackEntry{.{}} ** MAX_PLY,
     /// Length of the contiguous CLEAN accumulator prefix on the live line: every

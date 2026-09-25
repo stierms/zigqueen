@@ -1,0 +1,3015 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b6f4a5bdc784ee05d9f9c3ab9b8d7892a278f90b..00b116f2b233ad363a0572214b15ce24582a6e26 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -52,6 +52,15 @@ version = "2.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8f68f53c83ab957f72c32642f3868eec03eb974d1fb82e453128456482613d36"
+ 
++[[package]]
++name = "block-buffer"
++version = "0.10.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
++dependencies = [
++ "generic-array",
++]
++
+ [[package]]
+ name = "bullet-compiler"
+ version = "0.1.0"
+@@ -93,8 +102,11 @@ dependencies = [
+  "bullet-trainer",
+  "bulletformat",
+  "montyformat",
++ "serde_json",
+  "sfbinpack",
++ "sha2",
+  "viriformat",
++ "zq-bt4-loader",
+ ]
+ 
+ [[package]]
+@@ -124,12 +136,51 @@ dependencies = [
+  "vec_map",
+ ]
+ 
++[[package]]
++name = "cpufeatures"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "crypto-common"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
++dependencies = [
++ "generic-array",
++ "typenum",
++]
++
++[[package]]
++name = "digest"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
++dependencies = [
++ "block-buffer",
++ "crypto-common",
++]
++
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+ 
++[[package]]
++name = "generic-array"
++version = "0.14.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
++dependencies = [
++ "typenum",
++ "version_check",
++]
++
+ [[package]]
+ name = "getrandom"
+ version = "0.3.1"
+@@ -176,6 +227,12 @@ dependencies = [
+  "hashbrown",
+ ]
+ 
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
+ [[package]]
+ name = "lazy_static"
+ version = "1.4.0"
+@@ -305,6 +362,12 @@ dependencies = [
+  "rand",
+ ]
+ 
++[[package]]
++name = "ryu"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
++
+ [[package]]
+ name = "serde"
+ version = "1.0.218"
+@@ -325,6 +388,18 @@ dependencies = [
+  "syn 2.0.98",
+ ]
+ 
++[[package]]
++name = "serde_json"
++version = "1.0.143"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d401abef1d108fbd9cbaebc3e46611f4b1021f714a0597a71f41ee463f5f4a5a"
++dependencies = [
++ "itoa",
++ "memchr",
++ "ryu",
++ "serde",
++]
++
+ [[package]]
+ name = "serde_spanned"
+ version = "0.6.8"
+@@ -344,6 +419,17 @@ dependencies = [
+  "thiserror",
+ ]
+ 
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest",
++]
++
+ [[package]]
+ name = "strsim"
+ version = "0.8.0"
+@@ -459,6 +545,12 @@ dependencies = [
+  "winnow",
+ ]
+ 
++[[package]]
++name = "typenum"
++version = "1.20.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
++
+ [[package]]
+ name = "unicode-ident"
+ version = "1.0.12"
+@@ -635,3 +727,14 @@ dependencies = [
+  "quote",
+  "syn 2.0.98",
+ ]
++
++[[package]]
++name = "zq-bt4-loader"
++version = "0.1.0"
++dependencies = [
++ "bulletformat",
++ "serde",
++ "serde_json",
++ "sfbinpack",
++ "sha2",
++]
+diff --git a/crates/bullet_lib/Cargo.toml b/crates/bullet_lib/Cargo.toml
+index c62b507e4de9f48adf08be9c118c23c72fd9bdd9..a7b2ccdc3d43ef1b680e373209481c48cb8cf1e3 100644
+--- a/crates/bullet_lib/Cargo.toml
++++ b/crates/bullet_lib/Cargo.toml
+@@ -10,6 +10,9 @@ edition = { workspace = true }
+ description = "Neural Network Trainer"
+ 
+ [dependencies]
++serde_json = "1"
++sha2 = "0.10.9"
++zq-bt4-loader = { path = "/home/mstie/projects/zq-bt4-prefetch-20260914/tools/bt4-loader" }
+ bullet-compiler = { workspace = true }
+ bullet-gpu = { workspace = true }
+ bullet-trainer = { workspace = true }
+@@ -53,3 +56,312 @@ path = "../../examples/progression/3_input_buckets.rs"
+ [[example]]
+ name = "4_multi_layer"
+ path = "../../examples/progression/4_multi_layer.rs"
++
++[[example]]
++name = "zq768"
++path = "../../examples/zq768.rs"
++
++[[example]]
++name = "zq768sf"
++path = "../../examples/zq768sf.rs"
++
++[[example]]
++name = "zq768sf_full"
++path = "../../examples/zq768sf_full.rs"
++
++[[example]]
++name = "zq768sf_h512"
++path = "../../examples/zq768sf_h512.rs"
++
++[[example]]
++name = "zq768sf_h512_long"
++path = "../../examples/zq768sf_h512_long.rs"
++
++[[example]]
++name = "zq768sf_h512_buckets"
++path = "../../examples/zq768sf_h512_buckets.rs"
++
++[[example]]
++name = "zq768sf_h512_long240"
++path = "../../examples/zq768sf_h512_long240.rs"
++
++[[example]]
++name = "zq768sf_h512_buckets240"
++path = "../../examples/zq768sf_h512_buckets240.rs"
++
++[[example]]
++name = "zq768sf_h512_12mo"
++path = "../../examples/zq768sf_h512_12mo.rs"
++
++[[example]]
++name = "zq768sf_h1024"
++path = "../../examples/zq768sf_h1024.rs"
++
++[[example]]
++name = "zq768sf_h512_12mo480"
++path = "../../examples/zq768sf_h512_12mo480.rs"
++
++[[example]]
++name = "zq768sf_h1024_12mo"
++path = "../../examples/zq768sf_h1024_12mo.rs"
++
++[[example]]
++name = "zqHalfKA16_h1024"
++path = "../../examples/zqHalfKA16_h1024.rs"
++
++[[example]]
++name = "zqHalfKA16_h1024_15mo"
++path = "../../examples/zqHalfKA16_h1024_15mo.rs"
++
++[[example]]
++name = "zqHalfKA32_h1024_15mo"
++path = "../../examples/zqHalfKA32_h1024_15mo.rs"
++
++[[example]]
++name = "zqHalfKA8_h2048_15mo"
++path = "../../examples/zqHalfKA8_h2048_15mo.rs"
++
++[[example]]
++name = "zqHalfKA16_h2048_15mo"
++path = "../../examples/zqHalfKA16_h2048_15mo.rs"
++
++[[example]]
++name = "zqHalfKA16_h2048_15mo_resume"
++path = "../../examples/zqHalfKA16_h2048_15mo_resume.rs"
++
++[[example]]
++name = "zqHalfKA16_ml_h1024"
++path = "../../examples/zqHalfKA16_ml_h1024.rs"
++
++
++[[example]]
++name = "zqHalfKA16_ml_h1024_b8"
++path = "../../examples/zqHalfKA16_ml_h1024_b8.rs"
++
++[[example]]
++name = "zqHalfKA16_ml_h1024_b8_resume"
++path = "../../examples/zqHalfKA16_ml_h1024_b8_resume.rs"
++
++[[example]]
++name = "zqHalfKA16_h768_b8"
++path = "../../examples/zqHalfKA16_h768_b8.rs"
++
++[[example]]
++name = "zqHalfKA16_threats_v1"
++path = "../../examples/zqHalfKA16_threats_v1.rs"
++
++[[example]]
++name = "zqHalfKA16_threats_v2_add"
++path = "../../examples/zqHalfKA16_threats_v2_add.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats"
++path = "../../examples/zqHalfKA8_leanthreats.rs"
++
++[[example]]
++name = "zqHalfKA8_base"
++path = "../../examples/zqHalfKA8_base.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac"
++path = "../../examples/zqHalfKA8_leanthreats_fac.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_w1024_b8"
++path = "../../examples/zqHalfKA8_leanthreats_w1024_b8.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1024"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1024.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1024_ls"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1024_ls.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1024_ls_b8"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1024_ls_b8.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1024_ls_b8_l16"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1024_ls_b8_l16.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1536_ls_b8_l16"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1536_ls_b8_l16.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1024_ls_b8_l16_midcur"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1024_ls_b8_l16_midcur.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1536_ls_b8_l16_midcur"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1536_ls_b8_l16_midcur.rs"
++
++[[example]]
++name = "zq_labelprobe_dump"
++path = "../../examples/zq_labelprobe_dump.rs"
++
++[[example]]
++name = "zq_relabel_pack"
++path = "../../examples/zq_relabel_pack.rs"
++
++[[example]]
++name = "zq_fishtest_pack"
++path = "../../examples/zq_fishtest_pack.rs"
++
++[[example]]
++name = "zq_binpack_result_check"
++path = "../../examples/zq_binpack_result_check.rs"
++
++[[example]]
++name = "zq_uci_to_internal"
++path = "../../examples/zq_uci_to_internal.rs"
++
++[[example]]
++name = "zq_house_chunks"
++path = "../../examples/zq_house_chunks.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1536_fresh26"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1536_fresh26.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1536_mix26"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1536_mix26.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1536_relabel26"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1536_relabel26.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w2048_relabel26"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w2048_relabel26.rs"
++
++[[example]]
++name = "zqHalfKA8_ded_w768_relabel26"
++path = "../../examples/zqHalfKA8_ded_w768_relabel26.rs"
++
++[[example]]
++name = "zqHalfKA8_mrl1536p768_relabel26"
++path = "../../examples/zqHalfKA8_mrl1536p768_relabel26.rs"
++
++[[example]]
++name = "zqHalfKA8_mrl1536p768_dedup"
++path = "../../examples/zqHalfKA8_mrl1536p768_dedup.rs"
++
++[[example]]
++name = "zqHalfKA8_m3_512_896_1536_relabel26"
++path = "../../examples/zqHalfKA8_m3_512_896_1536_relabel26.rs"
++
++[[example]]
++name = "zq_dedup_graph_probe"
++path = "../../examples/zq_dedup_graph_probe.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_w1536_ls_b8_l16_ft"
++path = "../../examples/zqHalfKA8_leanthreats_fac_w1536_ls_b8_l16_ft.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_b8psqt"
++path = "../../examples/zqHalfKA8_leanthreats_fac_b8psqt.rs"
++
++[[example]]
++name = "zqHalfKA8_leanthreats_fac_b4psqt"
++path = "../../examples/zqHalfKA8_leanthreats_fac_b4psqt.rs"
++
++[[example]]
++name = "zqHalfKA16_threats_v1_resume"
++path = "../../examples/zqHalfKA16_threats_v1_resume.rs"
++
++[[example]]
++name = "zq_threats_dump_features"
++path = "../../examples/zq_threats_dump_features.rs"
++
++[[example]]
++name = "zqHalfKA16_h768_psqt_ls"
++path = "../../examples/zqHalfKA16_h768_psqt_ls.rs"
++
++[[example]]
++name = "zqHalfKA16_h768_ls_zinit"
++path = "../../examples/zqHalfKA16_h768_ls_zinit.rs"
++
++[[example]]
++name = "zqHalfKA16_h768_ls_zinit_resume"
++path = "../../examples/zqHalfKA16_h768_ls_zinit_resume.rs"
++
++[[example]]
++name = "zqHalfKA16_h768_ls_psqtmat"
++path = "../../examples/zqHalfKA16_h768_ls_psqtmat.rs"
++
++[[example]]
++name = "zqHalfKA8_m3bolt_512_896_relabel26"
++path = "../../examples/zqHalfKA8_m3bolt_512_896_relabel26.rs"
++
++[[example]]
++name = "zqHalfKA9_fullthreats_w1024_relabel26"
++path = "../../examples/zqHalfKA9_fullthreats_w1024_relabel26.rs"
++
++[[example]]
++name = "zq_pack_selfplay"
++path = "../../examples/zq_pack_selfplay.rs"
++
++[[example]]
++name = "zq_corpus_dedup"
++path = "../../examples/zq_corpus_dedup.rs"
++
++[[example]]
++name = "zq_sf_splat"
++path = "../../examples/zq_sf_splat.rs"
++
++[[example]]
++name = "zqHalfKA9_fullthreats_w1024_mixscreen"
++path = "../../examples/zqHalfKA9_fullthreats_w1024_mixscreen.rs"
++
++[[example]]
++name = "zqHalfKA9_fullthreats_w1024_mixscreen_resume"
++path = "../../examples/zqHalfKA9_fullthreats_w1024_mixscreen_resume.rs"
++
++[[example]]
++name = "zq_seeded_stream_probe"
++path = "../../examples/zq_seeded_stream_probe.rs"
++
++[[example]]
++name = "zq_raw_fidelity"
++path = "../../examples/zq_raw_fidelity.rs"
++
++[[example]]
++name = "zq_gpu_repeatability"
++path = "../../examples/zq_gpu_repeatability.rs"
++
++[[example]]
++name = "zq_gpu_cost"
++path = "../../examples/zq_gpu_cost.rs"
++
++[[example]]
++name = "zq_quant_primitives"
++path = "../../examples/zq_quant_primitives.rs"
++
++[[example]]
++name = "zq_integer_ft"
++path = "../../examples/zq_integer_ft.rs"
++
++[[example]]
++name = "zq_quant_head"
++path = "../../examples/zq_quant_head.rs"
++
++[[example]]
++name = "zq_head_update"
++path = "../../examples/zq_head_update.rs"
++
++[[example]]
++name = "zq_head_cost"
++path = "../../examples/zq_head_cost.rs"
++
++[[example]]
++name = "zq_head_pair"
++path = "../../examples/zq_head_pair.rs"
++
++[[example]]
++name = "zq_bt4_head_qat"
++path = "../../examples/zq_bt4_head_qat.rs"
+diff --git a/crates/bullet_lib/src/game/inputs.rs b/crates/bullet_lib/src/game/inputs.rs
+index b907f39133131363f40b74507c107c73d4f2d053..dc374eb873067e1b44b2510de6a54a345a1478c9 100644
+--- a/crates/bullet_lib/src/game/inputs.rs
++++ b/crates/bullet_lib/src/game/inputs.rs
+@@ -3,7 +3,11 @@ mod ataxx147;
+ mod chess768;
+ mod chess_buckets;
+ mod chess_buckets_mk;
++mod halfka_threats;
+ mod factorised;
++mod combined;
++
++pub use combined::Combined;
+ 
+ #[allow(deprecated)]
+ mod legacy;
+@@ -11,6 +15,7 @@ mod legacy;
+ pub use adapter::MarlinFormatAdapter;
+ pub use ataxx147::{Ataxx98, Ataxx147};
+ pub use chess_buckets::{ChessBuckets, ChessBucketsMirrored};
++pub use halfka_threats::{ThreatInputs, LeanThreatInputs, FullThreatInputs60k};
+ pub use chess768::Chess768;
+ pub use factorised::{Factorised, Factorises};
+ 
+diff --git a/crates/bullet_lib/src/game/inputs/combined.rs b/crates/bullet_lib/src/game/inputs/combined.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2224f1f3ab22d7cd36f09575a87ca6e86c6278e5
+--- /dev/null
++++ b/crates/bullet_lib/src/game/inputs/combined.rs
+@@ -0,0 +1,53 @@
++//! Generic concatenation of two INDEPENDENT sparse input sets into ONE index space, so a
++//! SINGLE feature transformer (one affine) sees both. This is the bullet-supported way to
++//! express ADDITIVE fusion of two feature sets: one affine over `[A | B]` produces the
++//! accumulator `W_A·A + W_B·B` — a single shared accumulator with no separate columns for a
++//! readout to rob — identical to summing two FT outputs, but WITHOUT the unsupported
++//! add-of-activations (`CopyOp` in the backward). B's indices are offset past A's input count.
++//! At save, split the FT weight columns back into the A-block and B-block for the engine.
++//!
++//! NB this is NOT `Factorised`: there the second set must be *derived from* the first
++//! (`derive_feature`) and is merged away at save. Here A and B are independent and both persist.
++use super::SparseInputType;
++
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Combined<A, B> {
++    a: A,
++    b: B,
++}
++
++impl<A, B> Combined<A, B> {
++    pub fn new(a: A, b: B) -> Self {
++        Self { a, b }
++    }
++}
++
++impl<A, B> SparseInputType for Combined<A, B>
++where
++    A: SparseInputType,
++    B: SparseInputType<RequiredDataType = A::RequiredDataType>,
++{
++    type RequiredDataType = A::RequiredDataType;
++
++    fn num_inputs(&self) -> usize {
++        self.a.num_inputs() + self.b.num_inputs()
++    }
++
++    fn max_active(&self) -> usize {
++        self.a.max_active() + self.b.max_active()
++    }
++
++    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
++        let offset = self.a.num_inputs();
++        self.a.map_features(pos, |s, n| f(s, n));
++        self.b.map_features(pos, |s, n| f(offset + s, offset + n));
++    }
++
++    fn shorthand(&self) -> String {
++        format!("{}+{}", self.a.shorthand(), self.b.shorthand())
++    }
++
++    fn description(&self) -> String {
++        format!("{} | combined with | {}", self.a.description(), self.b.description())
++    }
++}
+diff --git a/crates/bullet_lib/src/game/inputs/halfka_threats.rs b/crates/bullet_lib/src/game/inputs/halfka_threats.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..feed98b11f35d75fe06b2c6c2291444e994fbd91
+--- /dev/null
++++ b/crates/bullet_lib/src/game/inputs/halfka_threats.rs
+@@ -0,0 +1,671 @@
++//! SFNNv10-style FULL THREAT inputs as a **standalone** sparse feature set with **local**
++//! indices `[0, num_inputs())`, to be used as an AUXILIARY input alongside HalfKA — each
++//! drives its OWN feature transformer, so the threat FT can be narrow (its weight matrix is
++//! `num_inputs() x FT_threats`, not `... x FT_halfka`).
++//!
++//! A threat feature encodes an attack relation **(attacker piece, from) -> (attacked piece,
++//! to)** for every piece on the board (both colours) and every OCCUPIED square in that
++//! piece's attack set (enemy = attack, own = defend; both count). Kings are not threat
++//! *sources* (matches SF's numValidTargets[king]=0) but can be threat *targets*.
++//!
++//! Orientation is identical to HalfKA so the two compose cleanly:
++//!   - stm perspective: square `s`, file-mirrored `^7` iff our king file > 3.
++//!   - ntm perspective: square `s^56` (vertical flip + colour swap), file-mirrored `^7` iff
++//!     opp king file > 3.
++//! Piece colour is perspective-relative (own=0, opp=1); for ntm the colours swap.
++//!
++//! ## Index layout (THIS is the spec the zigqueen engine must replicate bit-for-bit)
++//!   threat_index = base_pairs(attacker_key, from_o) ... compact over geometrically-valid
++//!   (attacker_key, from, to) triples ... then * 12 + attacked_rel.
++//!   - attacker_key in [0,10): {own,opp} x {pawn,knight,bishop,rook,queen}
++//!   - attacked_rel in [0,12): {own,opp} x {pawn,knight,bishop,rook,queen,king}
++//!   - only `to` squares reachable by the attacker's max attack pattern from `from` exist.
++//! The attack *set* at runtime is occupancy-dependent (sliders), but the INDEX SPACE spans
++//! every geometrically-reachable (from,to) so the index is occupancy-independent.
++
++use bulletformat::ChessBoard;
++
++use super::SparseInputType;
++
++// piece types as stored in bulletformat (piece & 7)
++const PAWN: usize = 0;
++const KNIGHT: usize = 1;
++const BISHOP: usize = 2;
++const ROOK: usize = 3;
++const QUEEN: usize = 4;
++const KING: usize = 5;
++
++const NUM_ATTACKER_KEYS: usize = 10; // {own,opp} x {P,N,B,R,Q}
++const NUM_ATTACKED_REL: usize = 12; // {own,opp} x {P,N,B,R,Q,K}
++
++#[inline]
++fn file(sq: usize) -> usize {
++    sq & 7
++}
++#[inline]
++fn rank(sq: usize) -> usize {
++    sq >> 3
++}
++
++/// Max attack pattern (empty-board for leapers; full rays for sliders) of a non-pawn type
++/// from `sq`, as a list of destination squares. Pawns handled separately (colour-specific).
++fn max_pattern(pt: usize, sq: usize) -> Vec<usize> {
++    let r = rank(sq) as i32;
++    let f = file(sq) as i32;
++    let mut out = Vec::new();
++    let mut add = |nr: i32, nf: i32| {
++        if (0..8).contains(&nr) && (0..8).contains(&nf) {
++            out.push((nr * 8 + nf) as usize);
++        }
++    };
++    match pt {
++        KNIGHT => {
++            for (dr, df) in [(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)] {
++                add(r + dr, f + df);
++            }
++        }
++        KING => {
++            for dr in -1..=1 {
++                for df in -1..=1 {
++                    if dr != 0 || df != 0 {
++                        add(r + dr, f + df);
++                    }
++                }
++            }
++        }
++        BISHOP | ROOK | QUEEN => {
++            let mut dirs: Vec<(i32, i32)> = Vec::new();
++            if pt != ROOK {
++                dirs.extend_from_slice(&[(1, 1), (1, -1), (-1, 1), (-1, -1)]);
++            }
++            if pt != BISHOP {
++                dirs.extend_from_slice(&[(1, 0), (-1, 0), (0, 1), (0, -1)]);
++            }
++            for (dr, df) in dirs {
++                let (mut nr, mut nf) = (r + dr, f + df);
++                while (0..8).contains(&nr) && (0..8).contains(&nf) {
++                    out.push((nr * 8 + nf) as usize);
++                    nr += dr;
++                    nf += df;
++                }
++            }
++        }
++        _ => unreachable!("max_pattern: bad piece type"),
++    }
++    out
++}
++
++/// Pawn capture destinations from `sq` for a pawn that advances toward higher ranks if
++/// `up`, else lower ranks. Empty on the rank where it can't exist.
++fn pawn_pattern(sq: usize, up: bool) -> Vec<usize> {
++    let r = rank(sq) as i32;
++    let f = file(sq) as i32;
++    let dr = if up { 1 } else { -1 };
++    let mut out = Vec::new();
++    for df in [-1, 1] {
++        let (nr, nf) = (r + dr, f + df);
++        if (0..8).contains(&nr) && (0..8).contains(&nf) {
++            out.push((nr * 8 + nf) as usize);
++        }
++    }
++    out
++}
++
++/// attacker_key in [0,10): own={P,N,B,R,Q} -> 0..5, opp -> 5..10.
++fn attacker_pattern(key: usize, sq: usize) -> Vec<usize> {
++    let own = key < 5;
++    let pt = key % 5; // 0=P,1=N,2=B,3=R,4=Q
++    match pt {
++        0 => pawn_pattern(sq, own), // own pawns advance up (stm at bottom), opp down
++        1 => max_pattern(KNIGHT, sq),
++        2 => max_pattern(BISHOP, sq),
++        3 => max_pattern(ROOK, sq),
++        4 => max_pattern(QUEEN, sq),
++        _ => unreachable!(),
++    }
++}
++
++/// Precomputed compact index over geometrically-valid (attacker_key, from, to) triples.
++#[derive(Clone, Debug)]
++struct ThreatIndex {
++    base: Vec<usize>,      // [attacker_key*64 + from] -> cumulative pair offset
++    local: Vec<[u16; 64]>, // [attacker_key*64 + from][to] -> local idx (or u16::MAX)
++    num_pairs: usize,
++}
++
++const NO_LOCAL: u16 = u16::MAX;
++
++impl ThreatIndex {
++    fn new() -> Self {
++        let mut base = vec![0usize; NUM_ATTACKER_KEYS * 64];
++        let mut local = vec![[NO_LOCAL; 64]; NUM_ATTACKER_KEYS * 64];
++        let mut running = 0usize;
++        for key in 0..NUM_ATTACKER_KEYS {
++            for from in 0..64 {
++                let slot = key * 64 + from;
++                base[slot] = running;
++                for (i, to) in attacker_pattern(key, from).into_iter().enumerate() {
++                    local[slot][to] = i as u16;
++                    running += 1;
++                }
++            }
++        }
++        Self { base, local, num_pairs: running }
++    }
++
++    #[inline]
++    fn index(&self, attacker_key: usize, from_o: usize, to_o: usize, attacked_rel: usize) -> Option<usize> {
++        let slot = attacker_key * 64 + from_o;
++        let l = self.local[slot][to_o];
++        if l == NO_LOCAL {
++            return None;
++        }
++        Some((self.base[slot] + l as usize) * NUM_ATTACKED_REL + attacked_rel)
++    }
++
++    #[inline]
++    fn num_features(&self) -> usize {
++        self.num_pairs * NUM_ATTACKED_REL
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct ThreatInputs {
++    threats: ThreatIndex,
++}
++
++impl Default for ThreatInputs {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl ThreatInputs {
++    pub fn new() -> Self {
++        Self { threats: ThreatIndex::new() }
++    }
++}
++
++impl SparseInputType for ThreatInputs {
++    type RequiredDataType = ChessBoard;
++
++    fn num_inputs(&self) -> usize {
++        self.threats.num_features()
++    }
++
++    fn max_active(&self) -> usize {
++        128 // SF MaxActiveDimensions for full threats
++    }
++
++    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
++        let mut occ: u64 = 0;
++        let mut squares: Vec<(usize, usize)> = Vec::with_capacity(32); // (piece, square)
++        for (piece, square) in pos.into_iter() {
++            occ |= 1u64 << square;
++            squares.push((usize::from(piece), usize::from(square)));
++        }
++        let piece_at = |sq: usize, sqs: &[(usize, usize)]| -> Option<usize> {
++            sqs.iter().find(|&&(_, s)| s == sq).map(|&(p, _)| p)
++        };
++
++        let our_k = usize::from(pos.our_ksq());
++        let opp_k = usize::from(pos.opp_ksq());
++        let stm_flip = if file(our_k) > 3 { 7 } else { 0 };
++        let ntm_flip = if file(opp_k) > 3 { 7 } else { 0 };
++
++        for &(piece, from) in &squares {
++            let colour = (piece >> 3) & 1; // 0 = stm side (own), 1 = ntm side (opp)
++            let pt = piece & 7;
++            if pt == KING {
++                continue; // king is not a threat source
++            }
++            let attacks = match pt {
++                PAWN => pawn_attacks(from, colour == 0),
++                KNIGHT => knight_attacks(from),
++                KING => 0,
++                _ => slider_attacks(pt, from, occ),
++            } & occ; // only occupied targets
++
++            let mut bb = attacks;
++            while bb != 0 {
++                let to = bb.trailing_zeros() as usize;
++                bb &= bb - 1;
++                let tpiece = match piece_at(to, &squares) {
++                    Some(p) => p,
++                    None => continue,
++                };
++                let tcolour = (tpiece >> 3) & 1;
++                let tpt = tpiece & 7;
++
++                // stm: attacker colour as-is, squares file-mirrored.
++                let stm_idx =
++                    self.threats.index(colour * 5 + pt, from ^ stm_flip, to ^ stm_flip, tcolour * 6 + tpt);
++                // ntm: colours swap, squares vertical-flip ^56 then file-mirror.
++                let ntm_idx = self.threats.index(
++                    (colour ^ 1) * 5 + pt,
++                    (from ^ 56) ^ ntm_flip,
++                    (to ^ 56) ^ ntm_flip,
++                    (tcolour ^ 1) * 6 + tpt,
++                );
++
++                if let (Some(s), Some(n)) = (stm_idx, ntm_idx) {
++                    f(s, n);
++                }
++            }
++        }
++    }
++
++    fn shorthand(&self) -> String {
++        format!("threats{}", self.threats.num_features())
++    }
++
++    fn description(&self) -> String {
++        "SFNNv10-style full threat inputs (standalone auxiliary feature set)".to_string()
++    }
++}
++
++/// LEAN threat inputs: the SAME SFNNv10 attack enumeration as `ThreatInputs`, but the feature key
++/// **drops the attacker's from-square**, keeping `(attacker key) x (TARGET square) x (attacked rel)
++/// = 10 x 64 x 12 = 7680` features (~10x smaller than the full 80304). Rationale: the base HalfKA
++/// already encodes every piece's square, so re-encoding the attacker's location inside every threat
++/// feature is redundant. Multiple attackers of the same type onto the same target now collapse to
++/// ONE feature, so map_features DEDUPES. (Engine-side incremental update must therefore count
++/// attackers per (key,target) rather than toggle independent from->to features.)
++#[derive(Clone, Debug, Default)]
++pub struct LeanThreatInputs;
++
++const LEAN_NUM_FEATURES: usize = NUM_ATTACKER_KEYS * 64 * NUM_ATTACKED_REL; // 10*64*12 = 7680
++
++impl LeanThreatInputs {
++    pub fn new() -> Self {
++        Self
++    }
++
++    #[inline]
++    fn lean_index(attacker_key: usize, to_o: usize, attacked_rel: usize) -> usize {
++        (attacker_key * 64 + to_o) * NUM_ATTACKED_REL + attacked_rel
++    }
++}
++
++impl SparseInputType for LeanThreatInputs {
++    type RequiredDataType = ChessBoard;
++
++    fn num_inputs(&self) -> usize {
++        LEAN_NUM_FEATURES
++    }
++
++    fn max_active(&self) -> usize {
++        128 // <= full ThreatInputs edge count (dedup only merges edges), so 128 is a safe cap
++    }
++
++    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
++        let mut occ: u64 = 0;
++        let mut squares: Vec<(usize, usize)> = Vec::with_capacity(32);
++        for (piece, square) in pos.into_iter() {
++            occ |= 1u64 << square;
++            squares.push((usize::from(piece), usize::from(square)));
++        }
++        let piece_at = |sq: usize, sqs: &[(usize, usize)]| -> Option<usize> {
++            sqs.iter().find(|&&(_, s)| s == sq).map(|&(p, _)| p)
++        };
++
++        let our_k = usize::from(pos.our_ksq());
++        let opp_k = usize::from(pos.opp_ksq());
++        let stm_flip = if file(our_k) > 3 { 7 } else { 0 };
++        let ntm_flip = if file(opp_k) > 3 { 7 } else { 0 };
++
++        // collect (stm_idx, ntm_idx) per attack edge, then dedup (from-square dropped => collisions)
++        let mut seen: Vec<(u32, u32)> = Vec::with_capacity(64);
++        for &(piece, from) in &squares {
++            let colour = (piece >> 3) & 1;
++            let pt = piece & 7;
++            if pt == KING {
++                continue; // king is not a threat source (matches ThreatInputs / SF)
++            }
++            let attacks = match pt {
++                PAWN => pawn_attacks(from, colour == 0),
++                KNIGHT => knight_attacks(from),
++                KING => 0,
++                _ => slider_attacks(pt, from, occ),
++            } & occ; // only occupied targets
++
++            let mut bb = attacks;
++            while bb != 0 {
++                let to = bb.trailing_zeros() as usize;
++                bb &= bb - 1;
++                let tpiece = match piece_at(to, &squares) {
++                    Some(p) => p,
++                    None => continue,
++                };
++                let tcolour = (tpiece >> 3) & 1;
++                let tpt = tpiece & 7;
++                // lean index keeps the TARGET square (oriented like HalfKA), drops `from`.
++                let s = Self::lean_index(colour * 5 + pt, to ^ stm_flip, tcolour * 6 + tpt);
++                let n = Self::lean_index((colour ^ 1) * 5 + pt, (to ^ 56) ^ ntm_flip, (tcolour ^ 1) * 6 + tpt);
++                seen.push((s as u32, n as u32));
++            }
++        }
++        seen.sort_unstable();
++        seen.dedup();
++        for (s, n) in seen {
++            f(s as usize, n as usize);
++        }
++    }
++
++    fn shorthand(&self) -> String {
++        format!("leanthreats{LEAN_NUM_FEATURES}")
++    }
++
++    fn description(&self) -> String {
++        "Lean threat inputs (attacker x TARGET-square x attacked, from-square dropped, deduped)".to_string()
++    }
++}
++
++/// zigqueen v6 FULL-THREATS input: the field-converged 60,144-feature
++/// "SFNNv12-style" space per zigqueen docs/V6_THREATS_SPEC.md (spec r2),
++/// bit-exact vs the source-of-truth grader (tools/fullthreats_grader.py).
++///
++/// Differences vs `ThreatInputs` above: attackers PNBRQ only AND victims
++/// exclude kings entirely; subset-redundant combos removed per attacker type
++/// (P->{P,N,R}, N->{P,N,B,R,Q}, B/R->{P,N,B,R}, Q->{P,N,B,R,Q}); index layout
++/// is the zigqueen spec (ak-major, from ascending, target ascending by SQUARE
++/// ORDER within the empty-board attack set, victim class last). Spec r2: no
++/// activation dedup — both directions of mutual same-type pairs activate
++/// (required for the paired stm/ntm emission below).
++const FT60K_NV: [usize; 5] = [3, 5, 4, 4, 5];
++const FT60K_VRANK: [[i8; 6]; 5] = [
++    [0, 1, -1, 2, -1, -1], // P -> {P,N,R}
++    [0, 1, 2, 3, 4, -1],   // N -> {P,N,B,R,Q}
++    [0, 1, 2, 3, -1, -1],  // B -> {P,N,B,R}
++    [0, 1, 2, 3, -1, -1],  // R -> {P,N,B,R}
++    [0, 1, 2, 3, 4, -1],   // Q -> {P,N,B,R,Q}
++];
++pub const FT60K_FEATURES: usize = 60144;
++
++#[derive(Clone, Debug)]
++pub struct FullThreatInputs60k {
++    ak_offset: [u32; 10],
++    pair_base: [[u16; 64]; 10],
++    empty_att: [[u64; 64]; 10],
++}
++
++impl Default for FullThreatInputs60k {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl FullThreatInputs60k {
++    pub fn new() -> Self {
++        let mut ak_offset = [0u32; 10];
++        let mut pair_base = [[0u16; 64]; 10];
++        let mut empty_att = [[0u64; 64]; 10];
++        let mut off = 0u32;
++        for ak in 0..10 {
++            let own = ak < 5;
++            let pt = ak % 5;
++            ak_offset[ak] = off;
++            let mut pairs = 0u32;
++            for f in 0..64 {
++                pair_base[ak][f] = pairs as u16;
++                let att = match pt {
++                    0 => {
++                        if (8..56).contains(&f) {
++                            pawn_attacks(f, own)
++                        } else {
++                            0 // pawns only on ranks 2..7
++                        }
++                    }
++                    1 => knight_attacks(f),
++                    2 => slider_attacks(BISHOP, f, 0),
++                    3 => slider_attacks(ROOK, f, 0),
++                    _ => slider_attacks(QUEEN, f, 0),
++                };
++                empty_att[ak][f] = att;
++                pairs += att.count_ones();
++            }
++            off += pairs * 2 * FT60K_NV[pt] as u32;
++        }
++        assert_eq!(off as usize, FT60K_FEATURES, "spec r2 table arithmetic");
++        assert_eq!(ak_offset[5], 30072, "per-color block size");
++        Self { ak_offset, pair_base, empty_att }
++    }
++
++    #[inline]
++    fn index(&self, ak: usize, f_o: usize, t_o: usize, victim_own: bool, vrank: usize) -> usize {
++        let att = self.empty_att[ak][f_o];
++        debug_assert!(att >> t_o & 1 == 1, "target not in empty-board set");
++        let pairpos = (att & ((1u64 << t_o) - 1)).count_ones() as usize;
++        let nv = FT60K_NV[ak % 5];
++        let v = if victim_own { 0 } else { nv } + vrank;
++        self.ak_offset[ak] as usize + (self.pair_base[ak][f_o] as usize + pairpos) * 2 * nv + v
++    }
++}
++
++impl SparseInputType for FullThreatInputs60k {
++    type RequiredDataType = ChessBoard;
++
++    fn num_inputs(&self) -> usize {
++        FT60K_FEATURES
++    }
++
++    fn max_active(&self) -> usize {
++        128
++    }
++
++    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
++        let mut occ: u64 = 0;
++        let mut squares: Vec<(usize, usize)> = Vec::with_capacity(32);
++        for (piece, square) in pos.into_iter() {
++            occ |= 1u64 << square;
++            squares.push((usize::from(piece), usize::from(square)));
++        }
++        let piece_at = |sq: usize, sqs: &[(usize, usize)]| -> Option<usize> {
++            sqs.iter().find(|&&(_, s)| s == sq).map(|&(p, _)| p)
++        };
++
++        let stm_flip = if file(usize::from(pos.our_ksq())) > 3 { 7 } else { 0 };
++        let ntm_flip = if file(usize::from(pos.opp_ksq())) > 3 { 7 } else { 0 };
++
++        for &(piece, from) in &squares {
++            let colour = (piece >> 3) & 1; // 0 = stm side
++            let pt = piece & 7;
++            if pt == KING {
++                continue; // kings never attackers
++            }
++            let attacks = match pt {
++                PAWN => pawn_attacks(from, colour == 0),
++                KNIGHT => knight_attacks(from),
++                _ => slider_attacks(pt, from, occ),
++            } & occ;
++
++            let mut bb = attacks;
++            while bb != 0 {
++                let to = bb.trailing_zeros() as usize;
++                bb &= bb - 1;
++                let tpiece = match piece_at(to, &squares) {
++                    Some(p) => p,
++                    None => continue,
++                };
++                let tpt = tpiece & 7;
++                if tpt == KING {
++                    continue; // king victims excluded
++                }
++                let vr = FT60K_VRANK[pt][tpt];
++                if vr < 0 {
++                    continue; // subset-redundant combo
++                }
++                let vrank = vr as usize;
++                let tcolour = (tpiece >> 3) & 1;
++
++                let s = self.index(colour * 5 + pt, from ^ stm_flip, to ^ stm_flip, tcolour == 0, vrank);
++                let n = self.index(
++                    (colour ^ 1) * 5 + pt,
++                    (from ^ 56) ^ ntm_flip,
++                    (to ^ 56) ^ ntm_flip,
++                    tcolour == 1,
++                    vrank,
++                );
++                f(s, n);
++            }
++        }
++    }
++
++    fn shorthand(&self) -> String {
++        format!("fullthreats{FT60K_FEATURES}")
++    }
++
++    fn description(&self) -> String {
++        "zigqueen v6 full-threats inputs (60,144, spec r2, no king threats)".to_string()
++    }
++}
++
++// ---- runtime attack bitboards (occupancy-aware) ----
++
++fn knight_attacks(sq: usize) -> u64 {
++    let mut bb = 0u64;
++    for to in max_pattern(KNIGHT, sq) {
++        bb |= 1u64 << to;
++    }
++    bb
++}
++
++fn pawn_attacks(sq: usize, up: bool) -> u64 {
++    let mut bb = 0u64;
++    for to in pawn_pattern(sq, up) {
++        bb |= 1u64 << to;
++    }
++    bb
++}
++
++fn slider_attacks(pt: usize, sq: usize, occ: u64) -> u64 {
++    let r = rank(sq) as i32;
++    let f = file(sq) as i32;
++    let mut dirs: Vec<(i32, i32)> = Vec::new();
++    if pt != ROOK {
++        dirs.extend_from_slice(&[(1, 1), (1, -1), (-1, 1), (-1, -1)]);
++    }
++    if pt != BISHOP {
++        dirs.extend_from_slice(&[(1, 0), (-1, 0), (0, 1), (0, -1)]);
++    }
++    let mut bb = 0u64;
++    for (dr, df) in dirs {
++        let (mut nr, mut nf) = (r + dr, f + df);
++        while (0..8).contains(&nr) && (0..8).contains(&nf) {
++            let to = (nr * 8 + nf) as usize;
++            bb |= 1u64 << to;
++            if occ & (1u64 << to) != 0 {
++                break; // blocked; this (occupied) square is the target, stop the ray
++            }
++            nr += dr;
++            nf += df;
++        }
++    }
++    bb
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn pair_count_is_compact() {
++        let idx = ThreatIndex::new();
++        assert!(idx.num_pairs > 4000 && idx.num_pairs < 9000, "num_pairs = {}", idx.num_pairs);
++        let n = idx.num_features();
++        for key in 0..NUM_ATTACKER_KEYS {
++            for from in 0..64 {
++                for to in 0..64 {
++                    if let Some(i) = idx.index(key, from, to, NUM_ATTACKED_REL - 1) {
++                        assert!(i < n, "idx {} >= {}", i, n);
++                    }
++                }
++            }
++        }
++        eprintln!("threat features = {} ({} pairs x {})", n, idx.num_pairs, NUM_ATTACKED_REL);
++    }
++
++    #[test]
++    fn rook_ray_blocks_on_first_occupant() {
++        let occ = (1u64 << 0) | (1u64 << 16) | (1u64 << 3);
++        let att = slider_attacks(ROOK, 0, occ);
++        assert!(att & (1u64 << 8) != 0, "a2 attacked");
++        assert!(att & (1u64 << 16) != 0, "a3 attacked (first blocker)");
++        assert!(att & (1u64 << 24) == 0, "a4 NOT attacked (behind blocker)");
++        assert!(att & (1u64 << 3) != 0, "d1 attacked along rank");
++    }
++
++    /// zigqueen spec-r2 grader cross-check (tools/fullthreats_grader.py).
++    /// White-to-move FENs: data frame == absolute frame, stm == grader white
++    /// persp, ntm == grader black persp.
++    #[test]
++    fn ft60k_matches_zigqueen_grader_vectors() {
++        let inputs = FullThreatInputs60k::new();
++        let cases: [(&str, &[u16], &[u16]); 3] = [
++            (
++                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
++                &[
++                    524, 714, 3976, 3984, 4144, 4152, 8345, 8400, 9177, 9184, 16394, 16422, 16432,
++                    16442, 33721, 33911, 38124, 38132, 38292, 38300, 44740, 44749, 45524, 45581,
++                    59419, 59429, 59439, 59491,
++                ],
++                &[
++                    524, 714, 3976, 3984, 4144, 4152, 8345, 8400, 9177, 9184, 16394, 16422, 16432,
++                    16442, 33721, 33911, 38124, 38132, 38292, 38300, 44740, 44749, 45524, 45581,
++                    59419, 59429, 59439, 59491,
++                ],
++            ),
++            (
++                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
++                &[
++                    9, 67, 204, 297, 1506, 1514, 1524, 1544, 2368, 2409, 2429, 2439, 4582, 4609,
++                    8400, 9184, 19462, 19472, 19484, 19497, 19533, 19582, 19628, 30156, 30307,
++                    30444, 30513, 30519, 30537, 30556, 30574, 32886, 32906, 32931, 33216, 33231,
++                    33254, 37378, 37533, 37543, 44708, 45524, 57399, 57440, 57449, 57489, 57499,
++                ],
++                &[
++                    18, 24, 42, 61, 79, 123, 322, 339, 1274, 1299, 1319, 1577, 1584, 1599, 4371,
++                    4393, 5454, 8432, 9184, 17912, 17922, 17963, 17972, 18042, 30282, 30363, 30498,
++                    30562, 31916, 31926, 31936, 31985, 33121, 33141, 33163, 33171, 37626, 37749,
++                    44740, 45524, 55265, 55339, 55344, 55390, 55419, 55429, 55441,
++                ],
++            ),
++            (
++                "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
++                &[11204, 11224, 30519, 42824],
++                &[54, 11100, 42700, 42720],
++            ),
++        ];
++        for (fen, want_stm, want_ntm) in cases {
++            let board: ChessBoard = format!("{fen} | 0 | 0.5").parse().unwrap();
++            let mut stm = std::collections::BTreeSet::new();
++            let mut ntm = std::collections::BTreeSet::new();
++            inputs.map_features(&board, |s, n| {
++                stm.insert(s);
++                ntm.insert(n);
++            });
++            let want_s: std::collections::BTreeSet<usize> =
++                want_stm.iter().map(|&x| x as usize).collect();
++            let want_n: std::collections::BTreeSet<usize> =
++                want_ntm.iter().map(|&x| x as usize).collect();
++            assert_eq!(stm, want_s, "stm mismatch for {fen}");
++            assert_eq!(ntm, want_n, "ntm mismatch for {fen}");
++        }
++    }
++
++    #[test]
++    fn lean_index_is_a_bijection_onto_range() {
++        // every (attacker_key, to, attacked_rel) maps to a UNIQUE index in [0, 7680)
++        let mut seen = std::collections::HashSet::new();
++        for key in 0..NUM_ATTACKER_KEYS {
++            for to in 0..64 {
++                for ar in 0..NUM_ATTACKED_REL {
++                    let i = LeanThreatInputs::lean_index(key, to, ar);
++                    assert!(i < LEAN_NUM_FEATURES, "idx {i} >= {LEAN_NUM_FEATURES}");
++                    assert!(seen.insert(i), "collision at idx {i}");
++                }
++            }
++        }
++        assert_eq!(seen.len(), LEAN_NUM_FEATURES, "must cover all 7680 exactly");
++    }
++}
+diff --git a/crates/bullet_lib/src/value.rs b/crates/bullet_lib/src/value.rs
+index 5c459f9da746a97e924ce5c252ef1c0e580bde0f..e3eecff08068e222130c8e7750c742a9952e7f08 100644
+--- a/crates/bullet_lib/src/value.rs
++++ b/crates/bullet_lib/src/value.rs
+@@ -24,7 +24,7 @@ use crate::{
+ };
+ 
+ use dataloader::ValueDataLoader;
+-use loader::{DefaultDataLoader, LoadableDataType, PreparedData};
++use loader::{AuxInputHandle, DefaultDataLoader, LoadableDataType, PreparedData};
+ 
+ /// Value network trainer, generally for training NNUE networks.
+ pub struct ValueTrainer<
+@@ -63,9 +63,13 @@ type Wgt<I> = fn(&<I as SparseInputType>::RequiredDataType) -> f32;
+ #[derive(Clone)]
+ pub struct ValueTrainerState<Inp: SparseInputType, Out> {
+     input_getter: Inp,
++    /// Optional second [`SparseInputType`] feeding its own feature transformer (`stm2`/`nstm2`).
++    aux_getter: Option<AuxInputHandle<Inp::RequiredDataType>>,
+     output_getter: Out,
+     blend_getter: B<Inp>,
+     weight_getter: Option<Wgt<Inp>>,
++    /// Named per-datapoint dense scalar inputs (see `ValueTrainerBuilder::extra_datapoint_input`).
++    extra_getters: Vec<(String, Wgt<Inp>)>,
+     saved_format: Vec<SavedFormat>,
+     use_win_rate_model: bool,
+     wdl: bool,
+@@ -75,9 +79,11 @@ impl<I: SparseInputType, O: OutputBuckets<I::RequiredDataType>> ValueTrainerStat
+     pub fn make_dataloader<D>(&self, dataloader: D, scale: f32) -> DefaultDataLoader<I, O, D> {
+         DefaultDataLoader::new(
+             self.input_getter.clone(),
++            self.aux_getter.clone(),
+             self.output_getter,
+             self.blend_getter,
+             self.weight_getter,
++            self.extra_getters.clone(),
+             self.use_win_rate_model,
+             self.wdl,
+             scale,
+@@ -101,9 +107,11 @@ where
+     ) -> PreparedBatchHost {
+         PreparedBatchHost::from(PreparedData::new(
+             self.input_getter.clone(),
++            self.aux_getter.as_ref(),
+             self.output_getter,
+             self.blend_getter,
+             self.weight_getter,
++            &self.extra_getters,
+             self.use_win_rate_model,
+             self.wdl,
+             batch,
+diff --git a/crates/bullet_lib/src/value/builder.rs b/crates/bullet_lib/src/value/builder.rs
+index f6ce198d304e58649869241c7300acd876825f09..c6e462934f0cbaadf82a76ff92bdf4b21ddecc0b 100644
+--- a/crates/bullet_lib/src/value/builder.rs
++++ b/crates/bullet_lib/src/value/builder.rs
+@@ -10,7 +10,7 @@ use bullet_trainer::{
+ use crate::{
+     game::{inputs::SparseInputType, outputs::OutputBuckets},
+     nn::{ExecutionContext, ModelBuilder, ModelNode, optimiser::OptimiserType},
+-    value::ValueTrainerState,
++    value::{ValueTrainerState, loader::AuxInputHandle},
+ };
+ 
+ use super::{B, ValueTrainer};
+@@ -20,12 +20,19 @@ type LossFn = for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a>;
+ 
+ pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
+     input_getter: Option<I>,
++    aux_getter: Option<AuxInputHandle<I::RequiredDataType>>,
+     saved_format: Option<Vec<SavedFormat>>,
+     optimiser: Option<O>,
+     perspective: PhantomData<P>,
+     output_buckets: Out,
+     blend_getter: B<I>,
+     weight_getter: Option<Wgt<I>>,
++    /// Named per-datapoint dense scalar inputs (e.g. per-head loss masks): each `(name, f)`
++    /// entry is materialised per batch as a `batch_size` f32 buffer keyed by `name`. The GRAPH
++    /// side is the caller's responsibility: declare `builder.new_dense_input(name, (1, 1))`
++    /// with the SAME name inside the build closure (the graph joins data by name; declaring
++    /// an input with no matching getter — or vice versa — fails at the first batch).
++    extra_getters: Vec<(String, Wgt<I>)>,
+     loss_fn: Option<LossFn>,
+     factorised: Vec<String>,
+     wdl_output: bool,
+@@ -40,12 +47,14 @@ where
+     fn default() -> Self {
+         Self {
+             input_getter: None,
++            aux_getter: None,
+             saved_format: None,
+             optimiser: None,
+             perspective: PhantomData,
+             output_buckets: NoOutputBuckets,
+             blend_getter: |_, wdl| wdl,
+             weight_getter: None,
++            extra_getters: Vec::new(),
+             loss_fn: None,
+             wdl_output: false,
+             use_win_rate_model: false,
+@@ -66,6 +75,20 @@ where
+         self
+     }
+ 
++    /// Add a SECOND sparse input that feeds its OWN feature transformer. Its accumulator is
++    /// concatenated with the primary FT's, so e.g. a narrow threat FT can sit beside HalfKA. The
++    /// aux input must share the primary's `RequiredDataType` (same data rows). It is used for BOTH
++    /// graph sizing (`num_inputs()`/`max_active()`) and the loader's second `map_features` pass.
++    /// Only the dual-perspective + output-buckets [`build`](Self::build) honours it.
++    pub fn aux_inputs<J>(mut self, aux: J) -> Self
++    where
++        J: SparseInputType<RequiredDataType = I::RequiredDataType>,
++    {
++        assert!(self.aux_getter.is_none(), "Aux inputs already set!");
++        self.aux_getter = Some(std::sync::Arc::new(aux));
++        self
++    }
++
+     pub fn optimiser(mut self, optimiser: O) -> Self {
+         assert!(self.optimiser.is_none(), "Optimiser already set!");
+         self.optimiser = Some(optimiser);
+@@ -113,6 +136,17 @@ where
+         self
+     }
+ 
++    /// Register a named per-datapoint dense scalar input (see the `extra_getters` field docs).
++    /// Unlike [`datapoint_weight_function`](Self::datapoint_weight_function) (which multiplies
++    /// the TOTAL loss), these are raw inputs — declare a matching
++    /// `builder.new_dense_input(name, Shape::new(1, 1))` in the build closure and use it freely
++    /// (e.g. multiply one head's per-sample loss by an exact 0/1 mask pre-reduction).
++    pub fn extra_datapoint_input(mut self, name: &str, f: Wgt<I>) -> Self {
++        assert!(self.extra_getters.iter().all(|(n, _)| n != name), "Duplicate extra datapoint input {name}!");
++        self.extra_getters.push((name.to_string(), f));
++        self
++    }
++
+     pub fn use_win_rate_model(mut self) -> Self {
+         self.use_win_rate_model = true;
+         self
+@@ -148,9 +182,11 @@ where
+             optimiser: Optimiser::new(model, Default::default()).unwrap(),
+             state: ValueTrainerState {
+                 input_getter: input_getter.clone(),
++                aux_getter: self.aux_getter.clone(),
+                 output_getter: buckets,
+                 blend_getter: self.blend_getter,
+                 weight_getter: self.weight_getter,
++                extra_getters: self.extra_getters.clone(),
+                 use_win_rate_model: self.use_win_rate_model,
+                 wdl: self.wdl_output,
+                 saved_format,
+@@ -227,12 +263,14 @@ where
+     pub fn dual_perspective(self) -> ValueTrainerBuilder<O, I, DualPerspective, Out> {
+         ValueTrainerBuilder {
+             input_getter: self.input_getter,
++            aux_getter: self.aux_getter,
+             saved_format: self.saved_format,
+             optimiser: self.optimiser,
+             perspective: PhantomData,
+             output_buckets: self.output_buckets,
+             blend_getter: self.blend_getter,
+             weight_getter: self.weight_getter,
++            extra_getters: self.extra_getters,
+             loss_fn: self.loss_fn,
+             factorised: self.factorised,
+             wdl_output: self.wdl_output,
+@@ -255,12 +293,14 @@ where
+ 
+         ValueTrainerBuilder {
+             input_getter: self.input_getter,
++            aux_getter: self.aux_getter,
+             saved_format: self.saved_format,
+             optimiser: self.optimiser,
+             perspective: self.perspective,
+             output_buckets: OutputBucket(buckets),
+             blend_getter: self.blend_getter,
+             weight_getter: self.weight_getter,
++            extra_getters: self.extra_getters,
+             loss_fn: self.loss_fn,
+             factorised: self.factorised,
+             wdl_output: self.wdl_output,
+@@ -341,6 +381,31 @@ where
+             f(builder, stm, ntm, buckets)
+         })
+     }
++
++    /// Dual-perspective + output-buckets build path with a SECOND feature transformer fed by the
++    /// [`aux_inputs`](Self::aux_inputs) sparse set. Creates the primary `stm`/`nstm` plus the
++    /// auxiliary `stm2`/`nstm2` sparse inputs (sized from the aux input's `num_inputs()`/
++    /// `max_active()`) and hands all of them to `f` alongside `output_buckets`. The aux indices are
++    /// LOCAL to `[0, aux.num_inputs())`; the sparse matmul ignores the `-1` padding.
++    ///
++    /// Closure signature: `Fn(builder, stm, ntm, stm2, ntm2, output_buckets) -> Node`.
++    pub fn build_dual_aux<F>(self, f: F) -> ValueTrainer<O::Optimiser, I, Out>
++    where
++        F: for<'a> Fn(Nb<'a>, Nbn<'a>, Nbn<'a>, Nbn<'a>, Nbn<'a>, Nbn<'a>) -> Nbn<'a>,
++    {
++        let aux = self.aux_getter.clone().expect("build_dual_aux requires .aux_inputs(..) to be set!");
++        let aux_inputs = aux.aux_num_inputs();
++        let aux_nnz = aux.aux_max_active();
++
++        self.build_internal(move |inputs, nnz, builder| {
++            let stm = builder.new_sparse_input("stm", Shape::new(inputs, 1), nnz);
++            let ntm = builder.new_sparse_input("nstm", Shape::new(inputs, 1), nnz);
++            let stm2 = builder.new_sparse_input("stm2", Shape::new(aux_inputs, 1), aux_nnz);
++            let ntm2 = builder.new_sparse_input("nstm2", Shape::new(aux_inputs, 1), aux_nnz);
++            let buckets = builder.new_sparse_input("buckets", Shape::new(Out::BUCKETS, 1), 1);
++            f(builder, stm, ntm, stm2, ntm2, buckets)
++        })
++    }
+ }
+ 
+ impl<O, I> ValueTrainerBuilder<O, I, SinglePerspective, NoOutputBuckets>
+diff --git a/crates/bullet_lib/src/value/dataloader.rs b/crates/bullet_lib/src/value/dataloader.rs
+index ff924124e40f73426ee344f7a62eebaa9d8e4c23..5c7941b4511f86c467432231d218799de85edce4 100644
+--- a/crates/bullet_lib/src/value/dataloader.rs
++++ b/crates/bullet_lib/src/value/dataloader.rs
+@@ -64,16 +64,29 @@ where
+ 
+ impl<I: SparseInputType, O> From<PreparedData<I, O>> for PreparedBatchHost {
+     fn from(prepared_data: PreparedData<I, O>) -> Self {
+-        PreparedBatchHost {
+-            batch_size: prepared_data.batch_size,
+-            inputs: [
+-                ("stm".to_string(), TValue::I32(prepared_data.stm)),
+-                ("nstm".to_string(), TValue::I32(prepared_data.nstm)),
+-                ("buckets".to_string(), TValue::I32(prepared_data.buckets)),
+-                ("targets".to_string(), TValue::F32(prepared_data.targets)),
+-                ("entry_weights".to_string(), TValue::F32(prepared_data.weights)),
+-            ]
+-            .into(),
++        let mut inputs: std::collections::BTreeMap<String, TValue> = [
++            ("stm".to_string(), TValue::I32(prepared_data.stm)),
++            ("nstm".to_string(), TValue::I32(prepared_data.nstm)),
++            ("buckets".to_string(), TValue::I32(prepared_data.buckets)),
++            ("targets".to_string(), TValue::F32(prepared_data.targets)),
++            ("entry_weights".to_string(), TValue::F32(prepared_data.weights)),
++        ]
++        .into();
++
++        // Auxiliary feature-transformer indices (second sparse pair). Only registered when an aux
++        // input is configured — the graph joins data to tensors purely by NAME, so the keys must be
++        // present iff the "stm2"/"nstm2" sparse inputs exist in the model.
++        if !prepared_data.stm2.is_empty() {
++            inputs.insert("stm2".to_string(), TValue::I32(prepared_data.stm2));
++            inputs.insert("nstm2".to_string(), TValue::I32(prepared_data.nstm2));
++        }
++
++        // Extra per-datapoint dense scalars (`extra_datapoint_input`): present iff registered,
++        // and the graph must declare a same-named dense input iff registered (name-joined).
++        for (name, vals) in prepared_data.extras {
++            assert!(inputs.insert(name.clone(), TValue::F32(vals)).is_none(), "extra input {name} clashes");
+         }
++
++        PreparedBatchHost { batch_size: prepared_data.batch_size, inputs }
+     }
+ }
+diff --git a/crates/bullet_lib/src/value/loader.rs b/crates/bullet_lib/src/value/loader.rs
+index 37c73aea5797478880025bf41285e5281c8e43c8..67f11c2c01f3b876c45b38507eb5727798353e98 100644
+--- a/crates/bullet_lib/src/value/loader.rs
++++ b/crates/bullet_lib/src/value/loader.rs
+@@ -11,12 +11,44 @@ pub use sfbinpack::SfBinpackLoader;
+ pub use text::InMemoryTextLoader;
+ pub use viribinpack::{ViriBinpackLoader, ViriFilter};
+ 
++use std::sync::Arc;
++
+ use bulletformat::BulletFormat;
+ 
+ use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
+ 
+ use super::Wgt;
+ 
++/// Object-safe view over a secondary (auxiliary) [`SparseInputType`] sharing the primary input's
++/// `RequiredDataType`. Lets a second feature transformer be fed without threading a second concrete
++/// generic through `PreparedData`/`DefaultDataLoader`/`ValueTrainerState`. The aux input maps each
++/// position to indices LOCAL to `[0, aux_num_inputs())`, emitted into the `stm2`/`nstm2` tensors.
++pub trait AuxInput<T>: Send + Sync {
++    fn aux_num_inputs(&self) -> usize;
++    fn aux_max_active(&self) -> usize;
++    fn aux_map_features(&self, pos: &T, f: &mut dyn FnMut(usize, usize));
++}
++
++impl<J> AuxInput<J::RequiredDataType> for J
++where
++    J: SparseInputType,
++{
++    fn aux_num_inputs(&self) -> usize {
++        self.num_inputs()
++    }
++
++    fn aux_max_active(&self) -> usize {
++        self.max_active()
++    }
++
++    fn aux_map_features(&self, pos: &J::RequiredDataType, f: &mut dyn FnMut(usize, usize)) {
++        self.map_features(pos, f);
++    }
++}
++
++/// Type-erased, cheaply-cloneable handle to an [`AuxInput`].
++pub type AuxInputHandle<T> = Arc<dyn AuxInput<T>>;
++
+ unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::ChessBoard {}
+ unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::AtaxxBoard {}
+ unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::chess::CudADFormat {}
+@@ -64,9 +96,11 @@ pub(crate) type B<I> = fn(&<I as SparseInputType>::RequiredDataType, f32) -> f32
+ #[derive(Clone)]
+ pub struct DefaultDataLoader<I: SparseInputType, O, D> {
+     input_getter: I,
++    aux_getter: Option<AuxInputHandle<I::RequiredDataType>>,
+     output_getter: O,
+     blend_getter: B<I>,
+     weight_getter: Option<Wgt<I>>,
++    extra_getters: Vec<(String, Wgt<I>)>,
+     use_win_rate_model: bool,
+     wdl: bool,
+     scale: f32,
+@@ -77,15 +111,28 @@ impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         input_getter: I,
++        aux_getter: Option<AuxInputHandle<I::RequiredDataType>>,
+         output_getter: O,
+         blend_getter: B<I>,
+         weight_getter: Option<Wgt<I>>,
++        extra_getters: Vec<(String, Wgt<I>)>,
+         use_win_rate_model: bool,
+         wdl: bool,
+         scale: f32,
+         loader: D,
+     ) -> Self {
+-        Self { input_getter, output_getter, blend_getter, weight_getter, use_win_rate_model, wdl, scale, loader }
++        Self {
++            input_getter,
++            aux_getter,
++            output_getter,
++            blend_getter,
++            weight_getter,
++            extra_getters,
++            use_win_rate_model,
++            wdl,
++            scale,
++            loader,
++        }
+     }
+ }
+ 
+@@ -145,9 +192,11 @@ where
+     pub fn prepare(&self, data: &[I::RequiredDataType], threads: usize, blend: f32) -> PreparedData<I, O> {
+         PreparedData::new(
+             self.input_getter.clone(),
++            self.aux_getter.as_ref(),
+             self.output_getter,
+             self.blend_getter,
+             self.weight_getter,
++            &self.extra_getters,
+             self.use_win_rate_model,
+             self.wdl,
+             data,
+@@ -165,9 +214,17 @@ pub struct PreparedData<I: SparseInputType, O> {
+     pub(crate) batch_size: usize,
+     pub(crate) stm: Vec<i32>,
+     pub(crate) nstm: Vec<i32>,
++    /// Auxiliary (second feature transformer) sparse indices, `aux_max_active * batch_size`,
++    /// unused slots padded with `-1`. Empty when no aux input is configured.
++    pub(crate) stm2: Vec<i32>,
++    pub(crate) nstm2: Vec<i32>,
+     pub(crate) buckets: Vec<i32>,
+     pub(crate) targets: Vec<f32>,
+     pub(crate) weights: Vec<f32>,
++    /// Named per-datapoint dense scalars (`ValueTrainerBuilder::extra_datapoint_input`),
++    /// one `batch_size`-long f32 buffer per registered name. Pub for offline inspection
++    /// (mask-verification tooling).
++    pub extras: Vec<(String, Vec<f32>)>,
+ }
+ 
+ impl<I, O> PreparedData<I, O>
+@@ -179,9 +236,11 @@ where
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         input_getter: I,
++        aux_getter: Option<&AuxInputHandle<I::RequiredDataType>>,
+         output_getter: O,
+         blend_getter: B<I>,
+         weight_getter: Option<Wgt<I>>,
++        extra_getters: &[(String, Wgt<I>)],
+         use_win_rate_model: bool,
+         wdl: bool,
+         data: &[I::RequiredDataType],
+@@ -197,15 +256,24 @@ where
+         let output_size = if wdl { 3 } else { 1 };
+         let sparse_size = max_active * batch_size;
+ 
++        // Auxiliary FT sizing — zero-sized (empty vecs) when no aux input is configured.
++        let aux = aux_getter.map(|a| a.as_ref());
++        let aux_max_active = aux.map_or(0, |a| a.aux_max_active());
++        let aux_input_size = aux.map_or(0, |a| a.aux_num_inputs());
++        let aux_sparse_size = aux_max_active * batch_size;
++
+         let mut prep = Self {
+             input_getter,
+             output_getter,
+             batch_size,
+             stm: vec![0; sparse_size],
+             nstm: vec![0; sparse_size],
++            stm2: vec![0; aux_sparse_size],
++            nstm2: vec![0; aux_sparse_size],
+             buckets: vec![0; batch_size],
+             targets: vec![0.0; output_size * batch_size],
+             weights: vec![0.0; batch_size],
++            extras: Vec::new(),
+         };
+ 
+         let sparse_chunk_size = max_active * chunk_size;
+@@ -273,6 +341,63 @@ where
+                 );
+         });
+ 
++        // Second generator (auxiliary feature transformer). Separate pass so the primary loop above
++        // is byte-for-byte unchanged in the (common) no-aux case and there is no zip-length mismatch
++        // between the empty stm2/nstm2 vectors and the data chunks. Indices are LOCAL to
++        // [0, aux_input_size); each position writes `aux_max_active` slots, padded with -1.
++        if let Some(aux) = aux {
++            let aux_sparse_chunk_size = aux_max_active * chunk_size;
++            std::thread::scope(|s| {
++                data.chunks(chunk_size)
++                    .zip(prep.stm2.chunks_mut(aux_sparse_chunk_size))
++                    .zip(prep.nstm2.chunks_mut(aux_sparse_chunk_size))
++                    .for_each(|((data_chunk, stm2_chunk), nstm2_chunk)| {
++                        s.spawn(move || {
++                            for (i, pos) in data_chunk.iter().enumerate() {
++                                let mut k = 0;
++                                let aux_offset = aux_max_active * i;
++
++                                aux.aux_map_features(pos, &mut |our, opp| {
++                                    assert!(
++                                        our < aux_input_size && opp < aux_input_size,
++                                        "Aux input feature index exceeded aux input size!"
++                                    );
++                                    assert!(k < aux_max_active, "More aux inputs provided than the specified maximum!");
++
++                                    stm2_chunk[aux_offset + k] = our as i32;
++                                    nstm2_chunk[aux_offset + k] = opp as i32;
++
++                                    k += 1;
++                                });
++
++                                for k in k..aux_max_active {
++                                    stm2_chunk[aux_offset + k] = -1;
++                                    nstm2_chunk[aux_offset + k] = -1;
++                                }
++                            }
++                        });
++                    });
++            });
++        }
++
++        // Extra per-datapoint dense scalars (e.g. per-head loss masks). Separate pass so the
++        // primary loop above stays byte-for-byte unchanged when unused (same rationale as the
++        // aux pass); sample ORDER and MEMBERSHIP are untouched — these are pure extra buffers.
++        for (name, getter) in extra_getters {
++            let mut vals = vec![0.0f32; batch_size];
++            std::thread::scope(|s| {
++                data.chunks(chunk_size).zip(vals.chunks_mut(chunk_size)).for_each(|(data_chunk, val_chunk)| {
++                    let g = *getter;
++                    s.spawn(move || {
++                        for (v, pos) in val_chunk.iter_mut().zip(data_chunk) {
++                            *v = g(pos);
++                        }
++                    });
++                });
++            });
++            prep.extras.push((name.clone(), vals));
++        }
++
+         prep
+     }
+ }
+diff --git a/crates/bullet_lib/src/value/loader/rng.rs b/crates/bullet_lib/src/value/loader/rng.rs
+index 45dad914e2986b3ae4bb0e7a9fb090271da29eed..4fe05e08d1e4cb3842e5b66eefeab0403bdfc742 100644
+--- a/crates/bullet_lib/src/value/loader/rng.rs
++++ b/crates/bullet_lib/src/value/loader/rng.rs
+@@ -3,6 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
+ pub struct SimpleRand(u64);
+ 
+ impl SimpleRand {
++    /// Zero is the absorbing state of this generator and is not a valid seed.
++    pub fn from_seed(seed: u64) -> Self {
++        assert_ne!(seed, 0, "shuffle seed must be nonzero");
++        Self(seed)
++    }
++
+     pub fn with_seed() -> Self {
+         let seed = SystemTime::now().duration_since(UNIX_EPOCH).expect("Guaranteed increasing.").as_micros() as u64
+             & 0xFFFF_FFFF;
+diff --git a/crates/bullet_lib/src/value/loader/sfbinpack.rs b/crates/bullet_lib/src/value/loader/sfbinpack.rs
+index ada363a42e28cc76f564a03297eefaa8fd364550..68affcff1a2492a5c8ed17b37a599e6c22f4afa1 100644
+--- a/crates/bullet_lib/src/value/loader/sfbinpack.rs
++++ b/crates/bullet_lib/src/value/loader/sfbinpack.rs
+@@ -47,9 +47,19 @@ pub struct SfBinpackLoader<T: Fn(&TrainingDataEntry) -> bool> {
+     buffer_size: usize,
+     threads: usize,
+     filter: T,
++    seed: Option<u64>,
+ }
+ 
+ impl<T: Fn(&TrainingDataEntry) -> bool> SfBinpackLoader<T> {
++    /// Fix shuffle and conversion order for a pure filter and fixed file contents,
++    /// file order and buffer size. Seeded resume replays/skips the accepted prefix.
++    pub fn with_seed(mut self, seed: u64) -> Self {
++        assert_ne!(seed, 0, "shuffle seed must be nonzero");
++        assert!(self.threads > 0 && self.buffer_size > 0 && !self.file_paths.is_empty());
++        self.seed = Some(seed);
++        self
++    }
++
+     pub fn new(path: &str, buffer_size_mb: usize, threads: usize, filter: T) -> Self {
+         Self::new_concat_multiple(&[path], buffer_size_mb, threads, filter)
+     }
+@@ -60,6 +70,7 @@ impl<T: Fn(&TrainingDataEntry) -> bool> SfBinpackLoader<T> {
+             buffer_size: buffer_size_mb * 1024 * 1024 / std::mem::size_of::<ChessBoard>() / 2,
+             threads,
+             filter,
++            seed: None,
+         }
+     }
+ }
+@@ -76,17 +87,18 @@ where
+         None
+     }
+ 
+-    fn map_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, _: usize, mut f: F) {
++    fn map_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, start_position: usize, mut f: F) {
+         let file_paths = self.file_paths.clone();
+         let buffer_size = self.buffer_size;
+         let threads = self.threads;
+         let filter = self.filter.clone();
++        let seed = self.seed;
+ 
+         let reader_buffer_size = 16384 * threads;
+         let (reader_sender, reader_receiver) = mpsc::sync_channel::<Vec<TrainingDataEntry>>(8);
+         let (reader_msg_sender, reader_msg_receiver) = mpsc::sync_channel::<bool>(1);
+ 
+-        std::thread::spawn(move || {
++        let reader_handle = std::thread::spawn(move || {
+             let mut buffer = Vec::with_capacity(reader_buffer_size);
+ 
+             'dataloading: loop {
+@@ -112,12 +124,12 @@ where
+         let (converted_sender, converted_receiver) = mpsc::sync_channel::<Vec<ChessBoard>>(4 * threads);
+         let (converted_msg_sender, converted_msg_receiver) = mpsc::sync_channel::<bool>(1);
+ 
+-        std::thread::spawn(move || {
++        let converter_handle = std::thread::spawn(move || {
+             let filter = &filter;
+             let mut should_break = false;
+             'dataloading: while let Ok(unfiltered) = reader_receiver.recv() {
+                 if should_break || converted_msg_receiver.try_recv().unwrap_or(false) {
+-                    reader_msg_sender.send(true).unwrap();
++                    let _ = reader_msg_sender.send(true);
+                     break 'dataloading;
+                 }
+ 
+@@ -136,21 +148,31 @@ where
+                                 }
+                             }
+ 
+-                            this_sender.send(buffer).is_err()
++                            if seed.is_some() {
++                                Ok(buffer)
++                            } else if this_sender.send(buffer).is_err() {
++                                Err(())
++                            } else {
++                                Ok(Vec::new())
++                            }
+                         });
+ 
+                         handles.push(handle);
+                     }
+ 
+                     for handle in handles {
+-                        if handle.join().unwrap() {
+-                            should_break = true;
++                        match handle.join().unwrap() {
++                            Ok(buffer) if seed.is_some() => {
++                                should_break |= converted_sender.send(buffer).is_err();
++                            }
++                            Err(()) => should_break = true,
++                            _ => {}
+                         }
+                     }
+                 });
+ 
+                 if should_break {
+-                    reader_msg_sender.send(true).unwrap();
++                    let _ = reader_msg_sender.send(true);
+                     break 'dataloading;
+                 }
+             }
+@@ -159,20 +181,31 @@ where
+         let (buffer_sender, buffer_receiver) = mpsc::sync_channel::<Vec<ChessBoard>>(0);
+         let (buffer_msg_sender, buffer_msg_receiver) = mpsc::sync_channel::<bool>(1);
+ 
+-        std::thread::spawn(move || {
++        let shuffle_handle = std::thread::spawn(move || {
+             let mut shuffle_buffer = Vec::with_capacity(buffer_size);
++            let mut seeded_rng = seed.map(SimpleRand::from_seed);
+ 
+             'dataloading: while let Ok(converted) = converted_receiver.recv() {
++                // Honour cancellation even when subsequent converted chunks are
++                // empty or would take a long time to fill the shuffle buffer.
++                if buffer_msg_receiver.try_recv().unwrap_or(false) {
++                    let _ = converted_msg_sender.send(true);
++                    break 'dataloading;
++                }
+                 for entry in converted {
+                     shuffle_buffer.push(entry);
+ 
+                     if shuffle_buffer.len() == buffer_size {
+-                        shuffle(&mut shuffle_buffer);
++                        if let Some(rng) = &mut seeded_rng {
++                            shuffle_with_rng(&mut shuffle_buffer, rng);
++                        } else {
++                            shuffle(&mut shuffle_buffer);
++                        }
+ 
+                         if buffer_msg_receiver.try_recv().unwrap_or(false)
+                             || buffer_sender.send(shuffle_buffer).is_err()
+                         {
+-                            converted_msg_sender.send(true).unwrap();
++                            let _ = converted_msg_sender.send(true);
+                             break 'dataloading;
+                         }
+ 
+@@ -182,20 +215,134 @@ where
+             }
+         });
+ 
++        let mut skip = if seed.is_some() { start_position } else { 0 };
+         'dataloading: while let Ok(shuffle_buffer) = buffer_receiver.recv() {
+-            if f(&shuffle_buffer) {
++            let offset = skip.min(shuffle_buffer.len());
++            skip -= offset;
++            if offset == shuffle_buffer.len() {
++                continue;
++            }
++            if f(&shuffle_buffer[offset..]) {
+                 buffer_msg_sender.send(true).unwrap();
+                 break 'dataloading;
+             }
+         }
++        // Release receivers before joining, including when the consumer stops
++        // while a producer is blocked sending its next buffered chunk.
++        drop(buffer_receiver);
++        drop(buffer_msg_sender);
++        shuffle_handle.join().unwrap();
++        converter_handle.join().unwrap();
++        reader_handle.join().unwrap();
+     }
+ }
+ 
+ fn shuffle(data: &mut [ChessBoard]) {
+-    let mut rng = SimpleRand::with_seed();
++    shuffle_with_rng(data, &mut SimpleRand::with_seed());
++}
+ 
++fn shuffle_with_rng(data: &mut [ChessBoard], rng: &mut SimpleRand) {
+     for i in (0..data.len()).rev() {
+         let idx = rng.rng() as usize % (i + 1);
+         data.swap(idx, i);
+     }
+ }
++
++#[cfg(test)]
++mod determinism_tests {
++    use super::*;
++    use sfbinpack::{
++        CompressedTrainingDataEntryWriter,
++        chess::{coords::Square, piece::Piece, position::Position},
++    };
++    use std::{
++        path::PathBuf,
++        sync::atomic::{AtomicUsize, Ordering},
++        time::Duration,
++    };
++
++    struct Fixture(PathBuf);
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            std::fs::remove_dir_all(&self.0).unwrap();
++        }
++    }
++    fn fixture() -> Fixture {
++        static ID: AtomicUsize = AtomicUsize::new(0);
++        let p = std::env::temp_dir().join(format!(
++            "zq-loader-{}-{}",
++            std::process::id(),
++            ID.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir(&p).unwrap();
++        for file in 0..2 {
++            let mut writer =
++                CompressedTrainingDataEntryWriter::new(File::create(p.join(format!("{file}.binpack"))).unwrap())
++                    .unwrap();
++            for i in 0..512 {
++                let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
++                writer
++                    .write_entry(&TrainingDataEntry {
++                        pos,
++                        mv: Move::new(Square::new(12), Square::new(28), MoveType::Normal, Piece::none()),
++                        score: (512 * file + i) as i16,
++                        ply: 0,
++                        result: 0,
++                    })
++                    .unwrap();
++            }
++        }
++        Fixture(p)
++    }
++    fn collect(p: &Fixture, threads: usize, seed: Option<u64>, start: usize, count: usize) -> Vec<ChessBoard> {
++        let paths: Vec<_> = (0..2).map(|i| p.0.join(format!("{i}.binpack")).to_str().unwrap().to_string()).collect();
++        let refs: Vec<_> = paths.iter().map(String::as_str).collect();
++        let mut loader = SfBinpackLoader::new_concat_multiple(&refs, 1, threads, |e| {
++            // Deliberately skew completion order without changing acceptance.
++            if e.score % 128 == 0 {
++                thread::sleep(Duration::from_millis(1));
++            }
++            e.score % 3 != 0
++        });
++        loader.buffer_size = 97;
++        if let Some(seed) = seed {
++            loader = loader.with_seed(seed);
++        }
++        let mut result = Vec::new();
++        loader.map_chunks(start, |chunk| {
++            result.extend_from_slice(&chunk[..chunk.len().min(count - result.len())]);
++            result.len() == count
++        });
++        result
++    }
++    #[test]
++    fn seeded_stream_survives_scheduling_epoch_boundaries_and_prefix_resume() {
++        let p = fixture();
++        let first = collect(&p, 1, Some(62020907), 0, 1940);
++        assert_eq!(first.len(), 1940);
++        for threads in [1, 2, 4, 8, 4] {
++            assert_eq!(first, collect(&p, threads, Some(62020907), 0, 1940));
++        }
++        let other = collect(&p, 4, Some(62020908), 0, 1940);
++        assert_ne!(first, other);
++        // A new shuffle seed preserves membership of every completed buffer.
++        use crate::game::formats::bulletformat::BulletFormat;
++        for (a, b) in first.chunks(97).zip(other.chunks(97)) {
++            let mut a: Vec<_> = a.iter().map(|x| x.score()).collect();
++            let mut b: Vec<_> = b.iter().map(|x| x.score()).collect();
++            a.sort();
++            b.sort();
++            assert_eq!(a, b);
++            assert!(a.iter().all(|x| x % 3 != 0));
++        }
++        assert_eq!(first[113..590], collect(&p, 4, Some(62020907), 113, 477));
++        // Both modes join their workers after a consumer stops immediately.
++        assert_eq!(collect(&p, 4, Some(1), 0, 1).len(), 1);
++        assert_eq!(collect(&p, 4, None, 0, 1).len(), 1);
++    }
++    #[test]
++    #[should_panic(expected = "shuffle seed must be nonzero")]
++    fn reject_zero_seed() {
++        SfBinpackLoader::new("unused", 1, 1, |_| true).with_seed(0);
++    }
++}
+diff --git a/crates/gpu/src/function.rs b/crates/gpu/src/function.rs
+index c791c55a2505bcd17c2de6f84c627fb0488fe0e8..59e57da96005586394c314312391a7080fea9d8c 100644
+--- a/crates/gpu/src/function.rs
++++ b/crates/gpu/src/function.rs
+@@ -76,6 +76,23 @@ impl<G: Gpu> Drop for Function<G> {
+ }
+ 
+ impl<G: Gpu> Function<G> {
++    /// Number of compiled instructions of each kind, keyed by
++    /// "malloc"/"free"/"zero"/"kernel"/"matmul". Introspection only.
++    pub fn inst_counts(&self) -> BTreeMap<&'static str, usize> {
++        let mut counts = BTreeMap::new();
++        for inst in &self.insts {
++            let key = match inst {
++                Inst::Malloc { .. } => "malloc",
++                Inst::Free { .. } => "free",
++                Inst::Zero { .. } => "zero",
++                Inst::LaunchKernel { .. } => "kernel",
++                Inst::Matmul { .. } => "matmul",
++            };
++            *counts.entry(key).or_insert(0) += 1;
++        }
++        counts
++    }
++
+     pub fn dealloc_preallocs(&mut self) -> Result<(), G::Error> {
+         if self.prealloc_size == 0 {
+             return Ok(());
+diff --git a/crates/trainer/src/model.rs b/crates/trainer/src/model.rs
+index 962189e6bb78ce550d3e110f2a66de10a69056b1..5602234473ad9fab22a644ae55bd64b0fd111986 100644
+--- a/crates/trainer/src/model.rs
++++ b/crates/trainer/src/model.rs
+@@ -64,6 +64,14 @@ impl<G: Gpu> Model<G> {
+         &self.weights
+     }
+ 
++    pub fn forward_fn(&self) -> &Function<G> {
++        &self.forward
++    }
++
++    pub fn backward_fn(&self) -> &Function<G> {
++        &self.backward
++    }
++
+     pub fn get_weights(&self, id: impl Into<String>) -> Option<TValue> {
+         self.weights.get(&id.into()).cloned().map(|tensor| tensor.clone().to_host().unwrap())
+     }
+@@ -112,6 +120,9 @@ impl<G: Gpu> Model<G> {
+     pub fn make_gradient_tensors(&self) -> Result<TensorMap<G>, G::Error> {
+         self.weights()
+             .iter()
++            // A zero gradient still allows optimizer decay, clipping and momentum.
++            // Only expose gradients actually produced by the backward graph.
++            .filter(|(id, _)| self.bwd_map.contains_key(&format!("gradients/{id}")))
+             .map(|(id, weight)| {
+                 Buffer::from_host(&self.device, &TValue::zeros(weight.dtype(), weight.size()))
+                     .map(|buf| (id.clone(), buf))
+diff --git a/crates/trainer/src/model/builder.rs b/crates/trainer/src/model/builder.rs
+index 141ca28059d7994e84963e1af911b3230beedd5e..f6491aaba9945c045ff401cd2a83c26cbb0d676b 100644
+--- a/crates/trainer/src/model/builder.rs
++++ b/crates/trainer/src/model/builder.rs
+@@ -65,6 +65,7 @@ impl From<NodeType> for bullet_compiler::tensor::Shape {
+ #[derive(Default)]
+ pub struct ModelBuilder {
+     ir: IRBuilder,
++    initialization_seed: Mutex<Option<u64>>,
+     init: Mutex<BTreeMap<NodeId, InitSettings>>,
+     inputs: Mutex<BTreeMap<NodeId, InputDesc>>,
+     no_grad: AtomicBool,
+@@ -72,6 +73,25 @@ pub struct ModelBuilder {
+ }
+ 
+ impl ModelBuilder {
++    /// Seed initial weights by their stable tensor names. Set before build.
++    /// This does not assert determinism of subsequent GPU training operations.
++    pub fn set_initialization_seed(&self, seed: u64) {
++        *self.initialization_seed.lock().unwrap() = Some(seed);
++    }
++
++    fn initial_values(&self, id: NodeId, name: &str, shape: Shape) -> Vec<f32> {
++        let seed = *self.initialization_seed.lock().unwrap();
++        let random = |mean, stdev, gaussian| match seed {
++            Some(seed) => rng::vec_f32_seeded(shape.size(), mean, stdev, gaussian, seed, name),
++            None => rng::vec_f32(shape.size(), mean, stdev, gaussian),
++        };
++        match self.init.lock().unwrap().get(&id).unwrap() {
++            InitSettings::Zeroed => vec![0.0; shape.size()],
++            InitSettings::Uniform { mean, stdev } => random(*mean, *stdev, false),
++            InitSettings::Normal { mean, stdev } => random(*mean, *stdev, true),
++        }
++    }
++
+     fn init(&self) -> MutexGuard<'_, BTreeMap<NodeId, InitSettings>> {
+         self.init.try_lock().unwrap()
+     }
+@@ -197,11 +217,7 @@ impl ModelBuilder {
+             }
+ 
+             if name.starts_with("weights/") {
+-                let init = match self.init.lock().unwrap().get(&id).unwrap() {
+-                    InitSettings::Zeroed => vec![0.0; shape.size()],
+-                    InitSettings::Uniform { mean, stdev } => rng::vec_f32(shape.size(), *mean, *stdev, false),
+-                    InitSettings::Normal { mean, stdev } => rng::vec_f32(shape.size(), *mean, *stdev, true),
+-                };
++                let init = self.initial_values(id, &name, shape);
+                 let init = TValue::F32(init);
+                 let tensor = Buffer::from_host(&device, &init).unwrap();
+                 let name = name.strip_prefix("weights/").unwrap().to_string();
+@@ -673,3 +689,41 @@ impl<'a> Div<ModelNode<'a>> for f32 {
+         self * rhs.unary(Unary::Reciprocal)
+     }
+ }
++
++#[cfg(test)]
++mod initialization_tests {
++    use super::*;
++
++    fn weights(seed: u64, insert_extra_first: bool) -> BTreeMap<String, Vec<u32>> {
++        let builder = ModelBuilder::default();
++        builder.set_initialization_seed(seed);
++        if insert_extra_first {
++            builder.new_affine("extra", 3, 7);
++        }
++        builder.new_affine("shared", 8, 16);
++        builder.new_weights("uniform", Shape::new(64, 1), InitSettings::Uniform { mean: 0.5, stdev: 0.25 });
++        let descriptors = builder.inputs().clone();
++        descriptors
++            .into_iter()
++            .map(|(id, (name, shape, _))| {
++                let bits = builder.initial_values(id, &name, shape).into_iter().map(f32::to_bits).collect();
++                (name, bits)
++            })
++            .collect()
++    }
++
++    #[test]
++    fn named_initialization_is_repeatable_and_independent_of_graph_insertion() {
++        let first = weights(62020907, false);
++        assert_eq!(first, weights(62020907, false));
++        let extra = weights(62020907, true);
++        for (name, bits) in &first {
++            assert_eq!(bits, &extra[name]);
++        }
++        let different = weights(62020908, false);
++        assert_ne!(first["weights/sharedw"], different["weights/sharedw"]);
++        assert_ne!(first["weights/uniform"], different["weights/uniform"]);
++        assert!(first["weights/sharedb"].iter().all(|&x| x == 0));
++        assert!(first["weights/uniform"].iter().all(|&x| (0.25..0.75).contains(&f32::from_bits(x))));
++    }
++}
+diff --git a/crates/trainer/src/model/rng.rs b/crates/trainer/src/model/rng.rs
+index 1d05dccd4acc4110d7004ac8afac50e23ff7580c..74c74a9500f54156464e9ef50bff7eb3ccc7d652 100644
+--- a/crates/trainer/src/model/rng.rs
++++ b/crates/trainer/src/model/rng.rs
+@@ -1,4 +1,4 @@
+-use rand::rngs::ThreadRng;
++use rand::{Rng, SeedableRng, rngs::StdRng};
+ use rand_distr::{Distribution, Normal, Uniform};
+ 
+ enum Dist {
+@@ -15,7 +15,7 @@ impl Dist {
+         }
+     }
+ 
+-    fn sample(&self, rng: &mut ThreadRng) -> f32 {
++    fn sample(&self, rng: &mut impl Rng) -> f32 {
+         match self {
+             Dist::Normal(x) => x.sample(rng),
+             Dist::Uniform(x) => x.sample(rng),
+@@ -24,13 +24,25 @@ impl Dist {
+ }
+ 
+ pub fn vec_f32(length: usize, mean: f32, stdev: f32, use_gaussian: bool) -> Vec<f32> {
+-    let mut res = Vec::with_capacity(length);
++    sample_vec(length, mean, stdev, use_gaussian, &mut rand::rng())
++}
++
++/// Reproducible within the pinned rand/rand_distr build. Names, not graph node
++/// numbers or traversal order, isolate each tensor's stream.
++pub fn vec_f32_seeded(length: usize, mean: f32, stdev: f32, use_gaussian: bool, seed: u64, name: &str) -> Vec<f32> {
++    let mut key = 0xcbf29ce484222325u64;
++    for byte in name.bytes() {
++        key = (key ^ u64::from(byte)).wrapping_mul(0x100000001b3);
++    }
++    sample_vec(length, mean, stdev, use_gaussian, &mut StdRng::seed_from_u64(key ^ seed))
++}
+ 
+-    let mut rng = rand::rng();
++fn sample_vec(length: usize, mean: f32, stdev: f32, use_gaussian: bool, rng: &mut impl Rng) -> Vec<f32> {
++    let mut res = Vec::with_capacity(length);
+     let dist = Dist::new(mean, stdev, use_gaussian);
+ 
+     for _ in 0..length {
+-        res.push(dist.sample(&mut rng));
++        res.push(dist.sample(rng));
+     }
+ 
+     res
+diff --git a/examples/zq_bt4_head_qat.rs b/examples/zq_bt4_head_qat.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f50a336d13204601f2a102580719c4a1336d361b
+--- /dev/null
++++ b/examples/zq_bt4_head_qat.rs
+@@ -0,0 +1,778 @@
++//! New averaged BT4 head-QAT. Graph inherited from our accepted production
++//! zq_head_pair.rs SHA7365a85f1c3725ba35dbd50d46cc2f3a6542c2c74bed6247a131c22f093ecce0.
++//! Source mixing/holdout/targets are supplied by the shared new BT4 loader.
++use bullet_lib::{
++    game::{
++        inputs::{Chess768, ChessBucketsMirrored, Combined, Factorised, FullThreatInputs60k},
++        outputs::MaterialCount,
++    },
++    nn::optimiser::AdamW,
++    trainer::save::SavedFormat,
++    value::ValueTrainerBuilder,
++};
++use std::{collections::BTreeMap, path::Path};
++use zq_bt4_loader::PrefetchStream as Bt4Stream;
++use sha2::{Digest, Sha256};
++const DECODE_WORKERS: usize = 4;
++const FT: usize = 1024;
++const FAC: usize = 768;
++const HALFKA: usize = 6144;
++const THREAT: usize = 60144;
++const FAC_COMBINED: usize = FAC + HALFKA + THREAT;
++const DEPLOYED: usize = HALFKA + THREAT;
++const L2: usize = 16;
++const NUM_OUTPUT_BUCKETS: usize = 8;
++const L3: usize = 32;
++const BUCKET_LAYOUT: [usize; 32] = [
++    0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
++];
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    if args.len() == 3 && args[1] == "--check-config" {
++        let cfg = preflight(&args[2]);
++        // Metadata-only source validation: no records, network fetch or GPU.
++        Bt4Stream::snapshot_for(
++            &cfg["source_index"],
++            cfg["seed"].parse().unwrap(),
++            number(&cfg, "shuffle_records"),
++            0,
++        )
++        .unwrap();
++        println!("qat_config_pass");
++        return;
++    }
++    assert!(
++        args.len() == 3 || args.len() == 4,
++        "CONFIG_TSV NEW_OUTPUT_DIR [OWN_QAT_CHECKPOINT]"
++    );
++    let cfg = preflight(&args[1]);
++    let config_sha = digest(&args[1]);
++    let output = Path::new(&args[2]);
++    std::fs::create_dir(output).expect("output must be new");
++    std::fs::write(output.join("config.tsv"), std::fs::read(&args[1]).unwrap()).unwrap();
++    let mut start_sb = 1;
++    if args.len() == 4 {
++        let checkpoint = Path::new(&args[3]);
++        verify_checksums(checkpoint);
++        validate_checkpoint_tensors(checkpoint, Path::new(&cfg["weights"]));
++        let state = read_tsv(checkpoint.join("state.tsv"));
++        assert_eq!(state["schema"], "zq_bt4_head_qat_checkpoint_v1");
++        assert_eq!(
++            state["config_sha256"], config_sha,
++            "resume only this QAT run"
++        );
++        assert_eq!(state["preparation_sha256"], cfg["preparation_sha256"]);
++        start_sb = number(&state, "completed_sb") + 1;
++        assert_eq!(
++            number(&state, "consumed_position"),
++            (start_sb - 1) * number(&cfg, "batches_per_sb") * 16384
++        );
++        let expected = Bt4Stream::snapshot_for(
++            &cfg["source_index"],
++            cfg["seed"].parse().unwrap(),
++            number(&cfg, "shuffle_records"),
++            number(&state, "consumed_position") as u64,
++        )
++        .unwrap();
++        assert_eq!(
++            std::fs::read_to_string(checkpoint.join("source-state.json")).unwrap(),
++            expected
++        );
++    }
++    let end_sb = number(&cfg, "superbatches");
++    assert!(start_sb <= end_sb + 1, "checkpoint beyond endpoint");
++    let qbytes = std::fs::read(&cfg["psqt"]).unwrap();
++    assert_eq!(qbytes.len(), (DEPLOYED + 1) * 8);
++    let q: Vec<i64> = qbytes
++        .chunks_exact(8)
++        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
++        .collect();
++    assert!(PSQT.set(q).is_ok());
++    let init_seed = Some(20260907_u64); // Every checkpoint tensor is loaded below.
++    let mut trainer = ValueTrainerBuilder::default()
++        .dual_perspective()
++        .optimiser(AdamW)
++        .inputs(Combined::new(
++            Factorised::from_parts(ChessBucketsMirrored::new(BUCKET_LAYOUT), Chess768),
++            FullThreatInputs60k::new(),
++        ))
++        .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>)
++        .save_format(&[
++            SavedFormat::id("l1w"),
++            SavedFormat::id("l1b"),
++            SavedFormat::id("l2w"),
++            SavedFormat::id("l2b"),
++            SavedFormat::id("l3w"),
++            SavedFormat::id("l3b"),
++        ])
++        .extra_datapoint_input("psqt_exact", exact_psqt)
++        .loss_fn(|output, target| output.sigmoid().squared_error(target))
++        .build(|builder, stm, ntm, output_buckets| {
++            if let Some(seed) = init_seed {
++                builder.set_initialization_seed(seed);
++            }
++            let l0 = builder.no_grad(|| builder.new_affine("l0", FAC_COMBINED, FT));
++            let comb = builder.no_grad(|| builder.new_affine("comb", 2, 1));
++            let l1 = builder.new_affine("l1", FT, NUM_OUTPUT_BUCKETS * L2);
++            let l2 = builder.new_affine("l2", L2, NUM_OUTPUT_BUCKETS * L3);
++            let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
++            let s = (l0.forward(stm).max(0.0).min(255.0).pairwise_mul() / 256.0)
++                .faux_quantise(1.0, false);
++            let n = (l0.forward(ntm).max(0.0).min(255.0).pairwise_mul() / 256.0)
++                .faux_quantise(1.0, false);
++            let weight = l1.weights.faux_quantise(64.0, true) * 64.0;
++            let z1 = (weight.matmul(s.concat(n)) * (256.0 / (64.0 * 255.0 * 255.0)) + l1.bias)
++                .select(output_buckets);
++            let h2 = z1.screlu();
++            let h3 = l2.forward(h2).select(output_buckets).screlu();
++            let main = l3.forward(h3).select(output_buckets);
++            let psqt = builder.new_dense_input("psqt_exact", bullet_lib::nn::Shape::new(1, 1));
++            comb.forward(main.concat(psqt))
++        });
++
++    // New phase: only new averaged head weights, with newly allocated Adam moments.
++    trainer
++        .optimiser
++        .load_weights_from_file(&cfg["weights"])
++        .unwrap();
++    trainer.optimiser.reset_state().unwrap();
++    if args.len() == 4 {
++        trainer.optimiser.load_from_checkpoint(&args[3]).unwrap();
++        let roundtrip = output.join("resume-roundtrip.tmp"); std::fs::create_dir(&roundtrip).unwrap();
++        trainer.optimiser.write_to_checkpoint(roundtrip.to_str().unwrap()).unwrap();
++        let mut proof = BTreeMap::new();
++        for name in ["weights.bin", "momentum.bin", "velocity.bin"] {
++            let loaded = digest(roundtrip.join(name));
++            assert_eq!(loaded, digest(Path::new(&args[3]).join(name)), "resume load/save changed {name}");
++            proof.insert(name, loaded);
++        }
++        std::fs::write(output.join("resume-roundtrip.json"), serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
++        std::fs::remove_dir_all(roundtrip).unwrap();
++    }
++    let gradients = trainer.optimiser.model.make_gradient_tensors().unwrap();
++    assert_eq!(
++        gradients.keys().map(String::as_str).collect::<Vec<_>>(),
++        vec!["l1b", "l1w", "l2b", "l2w", "l3b", "l3w"]
++    );
++    trainer
++        .optimiser
++        .model
++        .write_to(&mut std::fs::File::create(output.join("named-before.bin")).unwrap())
++        .unwrap();
++    evaluate_holdout(&mut trainer, &cfg, output, "before");
++    write_parity_features(&cfg, output);
++    let steps = bullet_trainer::run::schedule::TrainingSteps {
++        batch_size: 16384,
++        batches_per_superbatch: number(&cfg, "batches_per_sb"),
++        start_superbatch: start_sb,
++        end_superbatch: end_sb,
++    };
++    let logical = SharedLoader {
++        manifest: cfg["source_index"].clone(),
++        paths: vec![cfg["source_index"].clone()],
++        seed: cfg["seed"].parse().unwrap(),
++        shuffle: number(&cfg, "shuffle_records"),
++        end_position: end_sb * steps.batches_per_superbatch * 16384,
++        proof_sb_records: if cfg["mode"] == "readiness" { steps.batches_per_superbatch * 16384 } else { 0 },
++        feature_threads: number(&cfg, "threads"),
++        start_snapshot: output
++            .join("source-start.json")
++            .to_string_lossy()
++            .into_owned(),
++    };
++    let divisor = zq_bt4_loader::target_divisor() as f32;
++    assert_eq!(
++        divisor.to_bits(),
++        cfg["target_divisor_f32_bits"].parse::<u32>().unwrap()
++    );
++    let loader = bullet_lib::value::dataloader::ValueDataLoader {
++        dataloader: trainer.state.make_dataloader(logical, divisor),
++        steps,
++        threads: number(&cfg, "threads"),
++        wdl: bullet_lib::trainer::schedule::wdl::ConstantWDL { value: 0.1 },
++    };
++    let mut updates = 0_usize;
++    let started = std::time::Instant::now();
++    if start_sb <= end_sb { trainer.train_custom(
++        bullet_trainer::run::schedule::TrainingSchedule { steps, lr_schedule: Box::new(|_, _| 0.00001), log_rate: 512 },
++        loader,
++        |_, sb, batch, loss| {
++            assert!(loss.is_finite(), "nonfinite QAT update");
++            updates += 1;
++            let complete = (sb - 1) * steps.batches_per_superbatch + batch;
++            if batch % 64 == 0 || batch == 1 {
++                println!("qat_progress\t{}\t{}\t{:.9e}\t{:.6}", complete, complete * 16384, loss, started.elapsed().as_secs_f64());
++            }
++        },
++        |trainer, sb| {
++            let temporary = output.join(format!("checkpoint-{sb}.tmp"));
++            let final_path = output.join(format!("checkpoint-{sb}"));
++            std::fs::create_dir(&temporary).unwrap();
++            trainer.optimiser.write_to_checkpoint(temporary.to_str().unwrap()).unwrap();
++            let position = sb * steps.batches_per_superbatch * 16384;
++            std::fs::write(temporary.join("state.tsv"), format!(
++                "schema\tzq_bt4_head_qat_checkpoint_v1\nconfig_sha256\t{config_sha}\npreparation_sha256\t{}\ncompleted_sb\t{sb}\nconsumed_position\t{position}\n",
++                cfg["preparation_sha256"])).unwrap();
++            std::fs::write(temporary.join("source-state.json"), Bt4Stream::snapshot_for(
++                &cfg["source_index"], cfg["seed"].parse().unwrap(),
++                number(&cfg, "shuffle_records"), position as u64,
++            ).unwrap()).unwrap();
++            write_checksums(&temporary);
++            for entry in std::fs::read_dir(&temporary).unwrap() {
++                std::fs::File::open(entry.unwrap().path()).unwrap().sync_all().unwrap();
++            }
++            std::fs::File::open(&temporary).unwrap().sync_all().unwrap();
++            std::fs::rename(&temporary, &final_path).unwrap();
++            std::fs::File::open(output).unwrap().sync_all().unwrap();
++            // Only this newly owned run directory; never remove a resume input.
++            if sb >= start_sb + 2 {
++                std::fs::remove_dir_all(output.join(format!("checkpoint-{}", sb - 2))).unwrap();
++            }
++            println!("qat_checkpoint\t{sb}\t{position}\t{}", final_path.display());
++        },
++    ).unwrap(); }
++    assert_eq!(
++        updates,
++        remaining_updates(start_sb, end_sb, steps.batches_per_superbatch)
++    );
++    evaluate_holdout(&mut trainer, &cfg, output, "after");
++    let after = output.join("named-after.bin");
++    trainer
++        .optimiser
++        .model
++        .write_to(&mut std::fs::File::create(&after).unwrap())
++        .unwrap();
++    let completed_batches = end_sb * steps.batches_per_superbatch;
++    for name in [
++        "weights",
++        "psqt",
++        "source_index",
++        "target_contract",
++        "preparation",
++        "validation_records",
++    ] {
++        assert_eq!(
++            digest(&cfg[name]),
++            cfg[&format!("{name}_sha256")],
++            "input changed {name}"
++        );
++    }
++    let loader_runtime_fields = if start_sb <= end_sb {
++        format!("loader_runtime_used\ttrue\nloader_runtime_sha256\t{}\n", digest(output.join("loader-runtime.json")))
++    } else {
++        "loader_runtime_used\tfalse\n".to_string()
++    };
++    std::fs::write(output.join("result.tsv"), format!(
++        "status\tcomplete\nmode\t{}\npreparation_sha256\t{}\nconfig_sha256\t{config_sha}\ncompleted_batches\t{completed_batches}\npresentations\t{}\nnamed_after_sha256\t{}\nelapsed_seconds\t{:.6}\nloader\tPrefetchStream\ndecoder_workers\t{DECODE_WORKERS}\nfeature_preparation_workers\t{}\n{loader_runtime_fields}",
++        cfg["mode"], cfg["preparation_sha256"], completed_batches * 16384, digest(&after), started.elapsed().as_secs_f64(), number(&cfg, "threads"))).unwrap();
++    println!(
++        "qat_complete\t{completed_batches}\t{}",
++        completed_batches * 16384
++    );
++}
++
++#[derive(Clone)]
++struct SharedLoader {
++    manifest: String,
++    paths: Vec<String>,
++    seed: u64,
++    shuffle: usize,
++    end_position: usize,
++    start_snapshot: String,
++    proof_sb_records: usize,
++    feature_threads: usize,
++}
++impl bullet_lib::value::loader::DataLoader<bulletformat::ChessBoard> for SharedLoader {
++    fn data_file_paths(&self) -> &[String] {
++        &self.paths
++    }
++    fn map_chunks<F: FnMut(&[bulletformat::ChessBoard]) -> bool>(
++        &self,
++        start_position: usize,
++        mut f: F,
++    ) {
++        assert!(start_position < self.end_position && start_position % 16384 == 0);
++        let mut stream = Bt4Stream::open(
++            &self.manifest,
++            self.seed,
++            self.shuffle,
++            start_position as u64,
++        )
++        .unwrap();
++        let runtime = loader_runtime(stream.decode_workers(), self.feature_threads);
++        let runtime_path = Path::new(&self.start_snapshot).parent().unwrap().join("loader-runtime.json");
++        std::fs::write(&runtime_path, serde_json::to_vec_pretty(&runtime).unwrap()).unwrap();
++        println!("qat_loader\tprefetch\t{}\t{}", stream.decode_workers(), self.feature_threads);
++        std::fs::write(
++            &self.start_snapshot,
++            stream.snapshot(start_position as u64).unwrap(),
++        )
++        .unwrap();
++        let mut position = start_position;
++        let mut proof = Sha256::new();
++        loop {
++            let rows = stream.next_batch(16384).unwrap();
++            assert_eq!(rows.len(), 16384, "full QAT batches required");
++            if self.proof_sb_records > 0 {
++                // Canonical logical records, not host-memory padding. Readiness only.
++                for row in &rows {
++                    proof.update(row.occ.to_le_bytes()); proof.update(row.pcs);
++                    proof.update(row.score.to_le_bytes());
++                    proof.update([row.result, row.ksq, row.opp_ksq]); proof.update(row.extra);
++                }
++            }
++            position += rows.len();
++            if self.proof_sb_records > 0 && position % self.proof_sb_records == 0 {
++                let path = Path::new(&self.start_snapshot).parent().unwrap().join(
++                    format!("logical-sb-{}.sha256", position / self.proof_sb_records));
++                std::fs::write(path, format!("{:x}\n", proof.finalize_reset())).unwrap();
++            }
++            assert!(position <= self.end_position);
++            let stop = f(&rows);
++            assert_eq!(
++                stop,
++                position == self.end_position,
++                "unexpected QAT data stop"
++            );
++            if stop {
++                break;
++            }
++        }
++    }
++}
++
++fn loader_runtime(decoder_workers: usize, feature_preparation_workers: usize) -> serde_json::Value {
++    assert_eq!(decoder_workers, DECODE_WORKERS, "prefetch decoder-worker default changed");
++    assert!((1..=8).contains(&feature_preparation_workers));
++    serde_json::json!({"schema": "zq_bt4_qat_loader_runtime_v1", "loader": "PrefetchStream",
++        "decoder_workers": decoder_workers, "feature_preparation_workers": feature_preparation_workers,
++        "source_cursor": "consumed; producer lookahead is not checkpoint state"})
++}
++
++fn read_tsv(path: impl AsRef<Path>) -> BTreeMap<String, String> {
++    let mut out = BTreeMap::new();
++    for line in std::fs::read_to_string(path).unwrap().lines() {
++        let (key, value) = line.split_once('\t').unwrap();
++        assert!(
++            out.insert(key.to_string(), value.to_string()).is_none(),
++            "duplicate config key"
++        );
++    }
++    out
++}
++fn number(cfg: &BTreeMap<String, String>, key: &str) -> usize {
++    cfg[key].parse().unwrap()
++}
++fn preflight(path: &str) -> BTreeMap<String, String> {
++    let cfg = read_tsv(path);
++    validate_config(&cfg);
++    for name in [
++        "weights",
++        "psqt",
++        "source_index",
++        "target_contract",
++        "preparation",
++        "validation_records",
++    ] {
++        assert_eq!(
++            digest(&cfg[name]),
++            cfg[&format!("{name}_sha256")],
++            "input hash {name}"
++        );
++    }
++    bind_preparation(&cfg);
++    cfg
++}
++fn bind_preparation(cfg: &BTreeMap<String, String>) {
++    let receipt: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(&cfg["preparation"]).unwrap()).unwrap();
++    assert_eq!(receipt["schema"], "zigqueen-bt4-head-qat-input-v1");
++    assert_eq!(receipt["mode"].as_str().unwrap(), cfg["mode"]);
++    assert_eq!(
++        receipt["recipe"]["batches"].as_u64().unwrap(),
++        (number(cfg, "superbatches") * number(cfg, "batches_per_sb")) as u64
++    );
++    assert_eq!(receipt["recipe"]["batch_size"], 16384);
++    assert_eq!(
++        receipt["recipe"]["learning_rate"].as_f64().unwrap(),
++        0.00001
++    );
++    assert_eq!(
++        receipt["recipe"]["target_divisor"]
++            .as_f64()
++            .unwrap()
++            .to_bits(),
++        zq_bt4_loader::target_divisor().to_bits()
++    );
++    for name in ["source_index", "target_contract", "validation_records"] {
++        assert_eq!(receipt["inputs"][name]["path"].as_str().unwrap(), cfg[name]);
++        assert_eq!(
++            receipt["inputs"][name]["sha256"].as_str().unwrap(),
++            cfg[&format!("{name}_sha256")]
++        );
++    }
++    for (name, filename) in [("weights", "weights.bin"), ("psqt", "psqt-q20.bin")] {
++        assert_eq!(
++            receipt["output_sha256"][filename].as_str().unwrap(),
++            cfg[&format!("{name}_sha256")]
++        );
++    }
++    assert_eq!(receipt["full_training_identity"]["run-identity"].as_str().unwrap(), cfg["run_identity"]);
++    for name in ["seed", "shuffle_records"] {
++        assert_eq!(receipt["qat_data_identity"][name].as_str().unwrap(), cfg[name]);
++        if cfg["mode"] == "production" || name == "seed" {
++            assert_eq!(receipt["full_training_identity"][name].as_str().unwrap(), cfg[name]);
++        }
++    }
++}
++fn validate_config(cfg: &BTreeMap<String, String>) {
++    assert_eq!(cfg["schema"], "zq_bt4_head_qat_v1");
++    assert_eq!(number(cfg, "batch_size"), 16384);
++    assert_eq!(number(cfg, "output_scale"), 400);
++    assert!((1..=8).contains(&number(cfg, "threads")));
++    assert!((1..=65536).contains(&number(cfg, "validation_count")));
++    assert_eq!(
++        (800.0_f64 / 0.9256841495771224) as f32,
++        zq_bt4_loader::target_divisor() as f32
++    );
++    let total = number(cfg, "superbatches") * number(cfg, "batches_per_sb");
++    match cfg["mode"].as_str() {
++        "production" => {
++            assert_eq!(number(cfg, "superbatches"), 16);
++            assert_eq!(number(cfg, "batches_per_sb"), 4096);
++        }
++        "readiness" => assert!((1..=256).contains(&total)),
++        _ => panic!("unknown QAT mode"),
++    }
++}
++
++type HeadTrainer = bullet_lib::value::ValueTrainer<
++    bullet_lib::nn::optimiser::AdamWOptimiser,
++    OwnInputs,
++    MaterialCount<NUM_OUTPUT_BUCKETS>,
++>;
++
++fn write_parity_features(cfg: &BTreeMap<String, String>, output: &Path) {
++    use bullet_lib::game::{inputs::SparseInputType, outputs::OutputBuckets};
++    use std::io::Write;
++    let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfg["preparation"]).unwrap()).unwrap();
++    let meta = &receipt["inputs"]["validation_metadata"];
++    let meta_path = meta["path"].as_str().unwrap();
++    assert_eq!(digest(meta_path), meta["sha256"].as_str().unwrap());
++    let mut selected: BTreeMap<(String, u64, String), (String, usize)> = BTreeMap::new();
++    let text = std::fs::read_to_string(meta_path).unwrap();
++    assert_eq!(text.lines().count(), number(cfg, "validation_count"));
++    for (index, line) in text.lines().enumerate() {
++        let row: serde_json::Value = serde_json::from_str(line).unwrap();
++        assert_eq!(row["record_index"].as_u64().unwrap(), index as u64);
++        let cell = (row["source_id"].to_string(), row["material_bucket"].as_u64().unwrap(), row["original_stm"].as_str().unwrap().to_string());
++        let choice = (row["canonical_key"].as_str().unwrap().to_string(), index);
++        if selected.get(&cell).map_or(true, |prior| choice < *prior) { selected.insert(cell, choice); }
++    }
++    assert!(!selected.is_empty() && selected.len() <= 672);
++    let mut indices: Vec<usize> = selected.values().map(|row| row.1).collect(); indices.sort_unstable();
++    let bytes = std::fs::read(&cfg["validation_records"]).unwrap();
++    let inputs = Combined::new(Factorised::from_parts(ChessBucketsMirrored::new(BUCKET_LAYOUT), Chess768), FullThreatInputs60k::new());
++    let mut file = std::fs::File::create(output.join("parity-features.tsv")).unwrap();
++    writeln!(file, "index\tbucket\tstm_features\tntm_features").unwrap();
++    for index in indices {
++        let raw = &bytes[index * 32..(index + 1) * 32];
++        let row = bulletformat::ChessBoard { occ: u64::from_le_bytes(raw[..8].try_into().unwrap()), pcs: raw[8..24].try_into().unwrap(),
++            score: i16::from_le_bytes(raw[24..26].try_into().unwrap()), result: raw[26], ksq: raw[27], opp_ksq: raw[28], extra: raw[29..32].try_into().unwrap() };
++        let mut stm = Vec::new(); let mut ntm = Vec::new();
++        inputs.map_features(&row, |s,n| { stm.push(s.to_string()); ntm.push(n.to_string()); });
++        writeln!(file, "{}\t{}\t{}\t{}", index, MaterialCount::<8>::default().bucket(&row), stm.join(","), ntm.join(",")).unwrap();
++    }
++}
++
++fn evaluate_holdout(
++    trainer: &mut HeadTrainer,
++    cfg: &BTreeMap<String, String>,
++    output: &Path,
++    label: &str,
++) {
++    use bullet_compiler::tensor::TValue;
++    use std::io::Write;
++    let bytes = std::fs::read(&cfg["validation_records"]).unwrap();
++    assert_eq!(bytes.len(), number(cfg, "validation_count") * 32);
++    let rows: Vec<bulletformat::ChessBoard> = bytes
++        .chunks_exact(32)
++        .map(|raw| {
++            assert!(raw[26] <= 2 && raw[27] < 64 && raw[28] < 64);
++            bulletformat::ChessBoard {
++                occ: u64::from_le_bytes(raw[..8].try_into().unwrap()),
++                pcs: raw[8..24].try_into().unwrap(),
++                score: i16::from_le_bytes(raw[24..26].try_into().unwrap()),
++                result: raw[26],
++                ksq: raw[27],
++                opp_ksq: raw[28],
++                extra: raw[29..32].try_into().unwrap(),
++            }
++        })
++        .collect();
++    let mut outputs_file = std::io::BufWriter::new(
++        std::fs::File::create(output.join(format!("heldout-{label}.outputs.f32le"))).unwrap(),
++    );
++    let mut targets_file = std::io::BufWriter::new(
++        std::fs::File::create(output.join(format!("heldout-{label}.targets.f32le"))).unwrap(),
++    );
++    let mut squared_error = 0.0_f64;
++    for batch in rows.chunks(4096) {
++        trainer
++            .optimiser
++            .model
++            .set_fwd_batch_size(batch.len())
++            .unwrap();
++        let host = trainer.state.prepare(
++            batch,
++            number(cfg, "threads"),
++            0.1,
++            zq_bt4_loader::target_divisor() as f32,
++        );
++        let TValue::F32(targets) = &host.inputs["targets"] else {
++            panic!("nonfloat targets")
++        };
++        let targets = targets.clone();
++        let model = &trainer.optimiser.model;
++        let device = model.device();
++        let stream = device.new_stream().unwrap();
++        let inputs = host.to_device(&device).unwrap();
++        let outputs = model.make_forward_output_tensors(batch.len()).unwrap();
++        model
++            .forward(&stream, &inputs, &outputs)
++            .unwrap()
++            .value()
++            .unwrap();
++        let TValue::F32(raw) = outputs["outputs/output"].to_host().unwrap() else {
++            panic!("nonfloat prediction")
++        };
++        assert_eq!(raw.len(), batch.len());
++        assert_eq!(targets.len(), batch.len());
++        for (prediction, target) in raw.into_iter().zip(targets) {
++            assert!(prediction.is_finite() && target.is_finite());
++            let probability = 1.0 / (1.0 + (-f64::from(prediction)).exp());
++            squared_error += (probability - f64::from(target)).powi(2);
++            outputs_file.write_all(&prediction.to_le_bytes()).unwrap();
++            targets_file.write_all(&target.to_le_bytes()).unwrap();
++        }
++    }
++    outputs_file.flush().unwrap();
++    targets_file.flush().unwrap();
++    let mse = squared_error / rows.len() as f64;
++    std::fs::write(output.join(format!("heldout-{label}.tsv")), format!(
++        "count\t{}\nmse\t{mse:.12e}\nfixture_records_sha256\t{}\noutput_units\tcontinuous-main-plus-Q20-PSQT\n",
++        rows.len(), cfg["validation_records_sha256"])).unwrap();
++    println!("qat_holdout\t{label}\t{}\t{mse:.12e}", rows.len());
++}
++
++fn digest(path: impl AsRef<Path>) -> String {
++    let output = std::process::Command::new("sha256sum")
++        .arg(path.as_ref())
++        .output()
++        .unwrap();
++    assert!(output.status.success());
++    String::from_utf8(output.stdout)
++        .unwrap()
++        .split_whitespace()
++        .next()
++        .unwrap()
++        .to_string()
++}
++fn write_checksums(directory: &Path) {
++    let mut paths: Vec<_> = std::fs::read_dir(directory)
++        .unwrap()
++        .map(|entry| entry.unwrap().path())
++        .collect();
++    paths.sort();
++    let text: String = paths
++        .iter()
++        .map(|path| {
++            format!(
++                "{}\t{}\t{}\n",
++                digest(path),
++                path.metadata().unwrap().len(),
++                path.file_name().unwrap().to_str().unwrap()
++            )
++        })
++        .collect();
++    std::fs::write(directory.join("CHECKSUMS.tsv"), text).unwrap();
++}
++fn remaining_updates(start_sb: usize, end_sb: usize, batches_per_sb: usize) -> usize {
++    (end_sb + 1).checked_sub(start_sb).unwrap() * batches_per_sb
++}
++fn named_shapes() -> BTreeMap<&'static str, usize> {
++    [("l0w", FAC_COMBINED * FT), ("l0b", FT), ("l1w", FT * 128), ("l1b", 128),
++     ("l2w", 16 * 256), ("l2b", 256), ("l3w", 32 * 8), ("l3b", 8),
++     ("combw", 2), ("combb", 1)].into_iter().collect()
++}
++fn inspect_named(path: &Path, expected: &BTreeMap<&str, usize>, moments: bool, velocity: bool) -> BTreeMap<String, (u64, usize)> {
++    use std::io::{BufRead, Read, Seek};
++    let mut file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
++    let size = file.get_ref().metadata().unwrap().len();
++    let mut found = BTreeMap::new();
++    while file.stream_position().unwrap() < size {
++        let mut label = Vec::new();
++        (&mut file).take(128).read_until(b'\n', &mut label).unwrap();
++        assert_eq!(label.pop(), Some(b'\n'), "invalid named label");
++        let name = String::from_utf8(label).unwrap();
++        let mut count = [0;8]; file.read_exact(&mut count).unwrap();
++        let count = usize::try_from(u64::from_le_bytes(count)).unwrap();
++        assert_eq!(expected.get(name.as_str()), Some(&count), "wrong tensor name/shape {name}");
++        let offset = file.stream_position().unwrap();
++        assert!(offset + (count as u64) * 4 <= size, "truncated named tensor");
++        assert!(found.insert(name.clone(), (offset, count)).is_none(), "duplicate tensor");
++        let frozen = matches!(name.as_str(), "l0w" | "l0b" | "combw" | "combb");
++        let mut buffer = vec![0; 262144 * 4];
++        let mut remaining = count;
++        while remaining > 0 {
++            let n = remaining.min(262144); file.read_exact(&mut buffer[..n*4]).unwrap();
++            for bytes in buffer[..n*4].chunks_exact(4) {
++                let bits = u32::from_le_bytes(bytes.try_into().unwrap()); let value = f32::from_bits(bits);
++                assert!(value.is_finite(), "nonfinite named tensor {name}");
++                if velocity { assert!(value >= 0.0, "negative Adam velocity"); }
++                if moments && frozen { assert_eq!(bits, 0, "frozen Adam state changed"); }
++            }
++            remaining -= n;
++        }
++    }
++    assert_eq!(found.keys().map(String::as_str).collect::<Vec<_>>(), expected.keys().copied().collect::<Vec<_>>(), "missing named tensors");
++    found
++}
++fn validate_checkpoint_tensors(directory: &Path, initial: &Path) {
++    use std::io::{Read, Seek, SeekFrom};
++    let shapes = named_shapes();
++    let actual = inspect_named(&directory.join("weights.bin"), &shapes, false, false);
++    let before = inspect_named(initial, &shapes, false, false);
++    inspect_named(&directory.join("momentum.bin"), &shapes, true, false);
++    inspect_named(&directory.join("velocity.bin"), &shapes, true, true);
++    let mut a = std::fs::File::open(directory.join("weights.bin")).unwrap();
++    let mut b = std::fs::File::open(initial).unwrap();
++    let mut left = vec![0; 1048576]; let mut right = left.clone();
++    for name in ["l0w", "l0b", "combw", "combb"] {
++        a.seek(SeekFrom::Start(actual[name].0)).unwrap(); b.seek(SeekFrom::Start(before[name].0)).unwrap();
++        let mut remaining = shapes[name] * 4;
++        while remaining > 0 {
++            let n = remaining.min(left.len());
++            a.read_exact(&mut left[..n]).unwrap(); b.read_exact(&mut right[..n]).unwrap();
++            assert_eq!(&left[..n], &right[..n], "frozen checkpoint tensor changed {name}"); remaining -= n;
++        }
++    }
++}
++
++fn verify_checksums(directory: &Path) {
++    let mut names = Vec::new();
++    for line in std::fs::read_to_string(directory.join("CHECKSUMS.tsv"))
++        .unwrap()
++        .lines()
++    {
++        let fields: Vec<_> = line.split('\t').collect();
++        assert_eq!(fields.len(), 3);
++        assert_eq!(
++            Path::new(fields[2]).file_name().unwrap().to_str().unwrap(),
++            fields[2]
++        );
++        let path = directory.join(fields[2]);
++        assert_eq!(
++            path.metadata().unwrap().len(),
++            fields[1].parse::<u64>().unwrap()
++        );
++        assert_eq!(digest(&path), fields[0]);
++        names.push(fields[2].to_string());
++    }
++    names.sort();
++    assert_eq!(
++        names,
++        [
++            "momentum.bin",
++            "source-state.json",
++            "state.tsv",
++            "velocity.bin",
++            "weights.bin"
++        ]
++    );
++    assert_eq!(std::fs::read_dir(directory).unwrap().count(), 6);
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn config() -> BTreeMap<String, String> {
++        [
++            ("schema", "zq_bt4_head_qat_v1"),
++            ("mode", "production"),
++            ("batch_size", "16384"),
++            ("output_scale", "400"),
++            ("threads", "4"),
++            ("validation_count", "65536"),
++            ("superbatches", "16"),
++            ("batches_per_sb", "4096"),
++        ]
++        .into_iter()
++        .map(|(k, v)| (k.to_string(), v.to_string()))
++        .collect()
++    }
++    #[test]
++    fn production_budget_is_fixed_and_readiness_is_separate() {
++        let mut cfg = config();
++        validate_config(&cfg);
++        cfg.insert("superbatches".into(), "15".into());
++        assert!(std::panic::catch_unwind(|| validate_config(&cfg)).is_err());
++        cfg.insert("mode".into(), "readiness".into());
++        cfg.insert("superbatches".into(), "2".into());
++        cfg.insert("batches_per_sb".into(), "2".into());
++        validate_config(&cfg);
++        cfg.insert("batches_per_sb".into(), "4096".into());
++        assert!(std::panic::catch_unwind(|| validate_config(&cfg)).is_err());
++    }
++    #[test]
++    fn decoder_and_feature_workers_are_separate() {
++        let runtime = loader_runtime(4, 2);
++        assert_eq!(runtime["decoder_workers"], 4);
++        assert_eq!(runtime["feature_preparation_workers"], 2);
++        assert!(std::panic::catch_unwind(|| loader_runtime(1, 2)).is_err());
++        assert!(std::panic::catch_unwind(|| loader_runtime(4, 0)).is_err());
++    }
++    #[test]
++    fn strict_named_and_completed_checkpoint_recovery() {
++        assert_eq!(remaining_updates(17, 16, 4096), 0);
++        assert_eq!(remaining_updates(2, 2, 2), 2);
++        let path = std::env::temp_dir().join(format!("zq-qat-named-{}", std::process::id()));
++        let expected: BTreeMap<&str, usize> = [("l1b", 1)].into_iter().collect();
++        let make = |value: f32| { let mut v = b"l1b\n".to_vec(); v.extend(1_u64.to_le_bytes()); v.extend(value.to_le_bytes()); v };
++        std::fs::write(&path, make(0.5)).unwrap(); inspect_named(&path, &expected, true, true);
++        for bytes in [Vec::new(), make(f32::NAN), make(-0.5), make(0.5)[..10].to_vec(), [make(0.5), make(0.5)].concat()] {
++            std::fs::write(&path, bytes).unwrap();
++            assert!(std::panic::catch_unwind(|| inspect_named(&path, &expected, true, true)).is_err());
++        }
++        std::fs::remove_file(path).unwrap();
++    }
++    #[test]
++    fn model_scale_and_validation_bounds_cannot_be_reinterpreted() {
++        let mut cfg = config();
++        cfg.insert("output_scale".into(), "864".into());
++        assert!(std::panic::catch_unwind(|| validate_config(&cfg)).is_err());
++        cfg.insert("output_scale".into(), "400".into());
++        cfg.insert("validation_count".into(), "0".into());
++        assert!(std::panic::catch_unwind(|| validate_config(&cfg)).is_err());
++    }
++}
++
++static PSQT: std::sync::OnceLock<Vec<i64>> = std::sync::OnceLock::new();
++type OwnInputs = Combined<Factorised<ChessBucketsMirrored, Chess768>, FullThreatInputs60k>;
++static PSQT_INPUTS: std::sync::OnceLock<OwnInputs> = std::sync::OnceLock::new();
++fn exact_psqt(pos: &bulletformat::ChessBoard) -> f32 {
++    use bullet_lib::game::inputs::SparseInputType;
++    let psqt = PSQT.get().unwrap();
++    let mut sum = psqt[DEPLOYED];
++    let inputs = PSQT_INPUTS.get_or_init(|| {
++        Combined::new(
++            Factorised::from_parts(ChessBucketsMirrored::new(BUCKET_LAYOUT), Chess768),
++            FullThreatInputs60k::new(),
++        )
++    });
++    inputs.map_features(pos, |stm, _| {
++        if stm >= FAC {
++            sum += psqt[stm - FAC];
++        }
++    });
++    (sum as f64 / 1048576.0) as f32
++}

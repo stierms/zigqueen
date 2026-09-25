@@ -3,8 +3,10 @@
 zigqueen runs on 64-bit Android as a native UCI engine. The NNUE evaluation
 uses portable integer SIMD, so the ARM build is **bit-identical** to the x86
 builds by design. Release checks compare fixed-depth node counts and
-evaluations; 6.2.0 ARM execution is checked under QEMU, not claimed as
-a fresh physical-device test.
+evaluations. For 6.3.0 we ran both ARM builds under QEMU user-mode
+emulation: they answer `uci` with the documented options and reproduce the
+x86 builds' bench and fixed-depth results. That is an emulated check, not a
+test on a physical device, and ARM speed was not measured.
 
 ## Just want the engine?
 

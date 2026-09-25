@@ -28,7 +28,7 @@ pub const Options = struct {
         try sink.writeAll(hash_line);
 
         var threads_buffer: [96]u8 = undefined;
-        const threads_line = try std.fmt.bufPrint(&threads_buffer, "option name Threads type spin default {d} min 1 max 1\n", .{self.threads});
+        const threads_line = try std.fmt.bufPrint(&threads_buffer, "option name Threads type spin default {d} min 1 max 32\n", .{self.threads});
         try sink.writeAll(threads_line);
 
         var overhead_buffer: [128]u8 = undefined;
@@ -124,7 +124,7 @@ pub const Options = struct {
         if (std.mem.eql(u8, name, "Threads")) {
             if (value.len == 0) return error.InvalidValue;
             const parsed = std.fmt.parseInt(u8, value, 10) catch return error.InvalidValue;
-            if (parsed != 1) return error.InvalidValue;
+            if (parsed < 1 or parsed > @import("../search/parallel_pool.zig").MAX_THREADS) return error.InvalidValue;
             self.threads = parsed;
             return .applied;
         }
@@ -239,7 +239,7 @@ test "setoption updates hash within bounds" {
 
 test "setoption rejects unsupported thread counts" {
     var options = Options{};
-    try std.testing.expectError(error.InvalidValue, options.applySetOptionLine("setoption name Threads value 2"));
+    try std.testing.expectError(error.InvalidValue, options.applySetOptionLine("setoption name Threads value 33"));
     try std.testing.expectEqual(@as(u8, 1), options.threads);
 }
 

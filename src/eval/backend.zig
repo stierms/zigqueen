@@ -84,11 +84,13 @@ pub const EngineState = struct {
     /// false, loading a net adopts that net's `autoScalePercent`.
     scale_explicit: bool = false,
     /// The active net (a `ZQB1` Chess768 net). Always set after `init`.
-    net: ?*nnue768.Net = null,
-    /// False when `net` is borrowed (one shared read-only copy across worker
-    /// threads, datagen --threads): unload/deinit then leave it alive for the
-    /// owner. Weights are immutable after load, so sharing is race-free.
-    owns_net: bool = true,
+    net: ?*const nnue768.Net = null,
+    /// Destruction handle for a privately loaded net. Borrowing states leave
+    /// this null; only the external owner may destroy their shared allocation.
+    /// The search-facing view above never grants a mutable Net pointer.
+    /// Net's slice fields are still shallow-const: their payloads must remain
+    /// immutable after load, and the owner must outlive every borrower.
+    owned_net: ?*nnue768.Net = null,
     /// Owned path of a file-loaded net; null when using the embedded default.
     net_path: ?[]u8 = null,
 
@@ -109,13 +111,12 @@ pub const EngineState = struct {
     /// datagen --threads seam: N per-thread engines around ONE 74.6MB weight
     /// blob). The caller keeps ownership and must outlive this state; deinit
     /// never destroys a borrowed net. Scale adoption matches `init`'s.
-    pub fn initBorrowedNet(allocator: std.mem.Allocator, net: *nnue768.Net, options: Options) EngineState {
+    pub fn initBorrowedNet(allocator: std.mem.Allocator, net: *const nnue768.Net, options: Options) EngineState {
         var state = EngineState{
             .allocator = allocator,
             .nnue_scale_percent = options.nnue_scale_percent,
             .scale_explicit = options.nnue_scale_percent != builtin_nnue_scale_percent,
             .net = net,
-            .owns_net = false,
         };
         state.adoptNetScale();
         return state;
@@ -123,6 +124,19 @@ pub const EngineState = struct {
 
     pub fn deinit(self: *EngineState) void {
         self.unload();
+    }
+
+    /// The owner must outlive this view. Preserve the exact selected scale,
+    /// including whether it was explicit; never transfer destruction or path
+    /// ownership to a worker. Path announcements belong to the pool owner.
+    pub fn borrow(self: *const EngineState, allocator: std.mem.Allocator) EngineState {
+        std.debug.assert(self.net != null);
+        return .{
+            .allocator = allocator,
+            .net = self.net,
+            .nnue_scale_percent = self.nnue_scale_percent,
+            .scale_explicit = self.scale_explicit,
+        };
     }
 
     pub fn setNnueScalePercent(self: *EngineState, nnue_scale_percent: u16) void {
@@ -143,6 +157,7 @@ pub const EngineState = struct {
             errdefer net.destroy(self.allocator);
             self.unload();
             self.net = net;
+            self.owned_net = net;
             self.adoptNetScale();
             return;
         }
@@ -153,6 +168,7 @@ pub const EngineState = struct {
         errdefer self.allocator.free(stored_path);
         self.unload();
         self.net = net;
+        self.owned_net = net;
         self.net_path = stored_path;
         self.adoptNetScale();
     }
@@ -314,7 +330,7 @@ pub const EngineState = struct {
 
     /// Evaluate from the maintained accumulator at `ply` (output layer only),
     /// materializing any deferred updates first.
-    pub fn evaluate(self: *const EngineState, stack: *search_stack.SearchStack, ply: usize, pos: *const position.Position, finny: *nnue768.FinnyTable, ft: *nnue768.FullThreatState) i32 {
+    pub fn evaluate(self: *const EngineState, stack: *search_stack.SearchStack, ply: usize, pos: *const position.Position, finny: *nnue768.FinnyTable, ft: *nnue768.FullThreatState) align(64) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
         const net = self.net orelse return 0;
         self.ensureMaterialized(stack, ply, pos, finny, ft);
         // ZQB9 full threats FIRST (a ZQB9 net also sets net.threats — the lean
@@ -353,12 +369,12 @@ pub const EngineState = struct {
     }
 
     fn unload(self: *EngineState) void {
-        if (self.net) |net| {
-            if (self.owns_net) net.destroy(self.allocator);
-            self.net = null;
-            // Any net installed after this point (loadModelFile) is owned.
-            self.owns_net = true;
+        if (self.owned_net) |owned| {
+            std.debug.assert(self.net == owned);
+            owned.destroy(self.allocator);
         }
+        self.net = null;
+        self.owned_net = null;
         if (self.net_path) |p| {
             self.allocator.free(p);
             self.net_path = null;
@@ -478,7 +494,7 @@ const Zqb9Fixture = struct {
         errdefer allocator.destroy(ft);
         ft.* = .{};
         return .{
-            .state = EngineState{ .allocator = allocator, .nnue_scale_percent = 100, .net = net },
+            .state = EngineState{ .allocator = allocator, .nnue_scale_percent = 100, .net = net, .owned_net = net },
             .stack = stack,
             .finny = finny,
             .ft = ft,
@@ -535,4 +551,86 @@ test "backend ZQB9 full-threats lazy materialization matches refresh" {
     try fx.run("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 3, false);
     try fx.run("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3, false);
     try fx.run("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 3, false);
+}
+
+test "net ownership accepts const borrowers and separates destruction handles" {
+    const allocator = std.testing.allocator;
+    const blob = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(blob);
+    const owner = try nnue768.loadFromBytes(allocator, blob);
+    defer owner.destroy(allocator);
+    const view: *const nnue768.Net = owner;
+    var first = EngineState.initBorrowedNet(allocator, view, .{});
+    defer first.deinit();
+    var second = EngineState.initBorrowedNet(allocator, view, .{});
+    defer second.deinit();
+    try std.testing.expect(first.owned_net == null and second.owned_net == null);
+    try std.testing.expect(first.net == view and second.net == view);
+    first.setNnueScalePercent(73);
+    try std.testing.expectEqual(zqb9_nnue_scale_percent, second.nnueScalePercent());
+    first.deinit();
+    try std.testing.expect(first.net == null and first.owned_net == null);
+    const pos = try @import("../core/fen.zig").startpos();
+    try std.testing.expectEqual(nnue768.evaluate(owner, &pos, zqb9_nnue_scale_percent), nnue768.evaluate(second.net.?, &pos, second.nnueScalePercent()));
+}
+
+test "net ownership replacement detaches only the replacing borrower" {
+    const allocator = std.testing.allocator;
+    const blob = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(blob);
+    const owner = try nnue768.loadFromBytes(allocator, blob);
+    defer owner.destroy(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "net.zqb", .data = blob });
+    const path = try tmp.dir.realpathAlloc(allocator, "net.zqb");
+    defer allocator.free(path);
+    var first = EngineState.initBorrowedNet(allocator, owner, .{});
+    defer first.deinit();
+    var second = EngineState.initBorrowedNet(allocator, owner, .{});
+    defer second.deinit();
+    first.setNnueScalePercent(73);
+    try first.loadModelFile(path);
+    try std.testing.expect(first.owned_net != null and first.net == first.owned_net);
+    try std.testing.expect(first.net != owner and second.net == owner);
+    try std.testing.expectEqual(@as(u16, 73), first.nnueScalePercent());
+    const previous = first.net;
+    try first.loadModelFile(path);
+    try std.testing.expect(first.net != previous and first.net == first.owned_net);
+    try std.testing.expectEqualStrings(path, first.evalFilePath());
+    first.deinit();
+    const pos = try @import("../core/fen.zig").startpos();
+    try std.testing.expectEqual(nnue768.evaluate(owner, &pos, zqb9_nnue_scale_percent), nnue768.evaluate(second.net.?, &pos, second.nnueScalePercent()));
+}
+
+test "net ownership failed load preserves owned and borrowed states" {
+    const allocator = std.testing.allocator;
+    const blob = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(blob);
+    const owner = try nnue768.loadFromBytes(allocator, blob);
+    defer owner.destroy(allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "net.zqb", .data = blob });
+    const path = try tmp.dir.realpathAlloc(allocator, "net.zqb");
+    defer allocator.free(path);
+    for ([_]bool{ false, true }) |owned| {
+        var state = if (owned)
+            try EngineState.init(allocator, .{ .eval_file_path = path })
+        else
+            EngineState.initBorrowedNet(allocator, owner, .{});
+        defer state.deinit();
+        state.setNnueScalePercent(73);
+        const before = state;
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        state.allocator = failing.allocator();
+        defer state.allocator = allocator;
+        try std.testing.expectError(error.OutOfMemory, state.loadModelFile(path));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(before.net, state.net);
+        try std.testing.expectEqual(before.owned_net, state.owned_net);
+        try std.testing.expectEqual(before.net_path, state.net_path);
+        try std.testing.expectEqual(before.nnue_scale_percent, state.nnue_scale_percent);
+        try std.testing.expectEqual(before.scale_explicit, state.scale_explicit);
+    }
 }

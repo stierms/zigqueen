@@ -25,7 +25,7 @@ pub const INF: types.Score = 30_000;
 
 pub fn search(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     alpha_in: types.Score,
     beta: types.Score,
@@ -40,19 +40,19 @@ pub fn search(
 /// passes that gate records a removed legacy duplicate count.
 pub fn searchFromHorizon(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     alpha_in: types.Score,
     beta: types.Score,
     ply: usize,
     in_check_hint: ?bool,
-) types.Score {
+) align(64) types.Score { // align(64): pins hot entry placement (layout stability, not call speed)
     return searchDepth(ctx, resources, pos, alpha_in, beta, ply, 0, in_check_hint, true);
 }
 
 fn searchDepth(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     alpha_in: types.Score,
     beta: types.Score,
@@ -60,8 +60,8 @@ fn searchDepth(
     qs_depth: u8,
     in_check_hint: ?bool,
     comptime from_horizon: bool,
-) types.Score {
-    if (ctx.noteQNode()) return 0;
+) align(64) types.Score { // align(64): pins hot entry placement (layout stability, not call speed)
+    if (if (comptime @hasField(@TypeOf(resources), "execution")) resources.execution.noteNode(ctx, true) else ctx.noteQNode()) return 0;
     ctx.observePly(ply);
     if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
     if (from_horizon) ctx.noteHorizonTransition();
@@ -148,7 +148,7 @@ fn searchDepth(
         // Qsearch evasions: no continuation history (qsearch doesn't maintain the
         // predecessor stack and never updates conthist).
         const cont = @import("history.zig").ContContext{};
-        ordering.scoreMoves(pos, &moves, tt_move, .{}, null, resources.history, &cont, &scores, &capture_see_scores);
+        ordering.scoreMoves(pos, &moves, tt_move, .{}, null, resources.history, &cont, @import("../movegen/attacks.zig").attackedSquares(pos, pos.side_to_move.other()), &scores, &capture_see_scores);
     } else {
         ordering.scoreTacticalMoves(pos, &moves, tt_move, &scores, &capture_see_scores);
     }
@@ -226,9 +226,13 @@ fn searchDepth(
     // check-blind — captures/promotions alone cannot see one-move mating or
     // perpetual threats. Direct checks only; recursion answers them as evasions.
     if (!in_check and qs_depth == 0 and !ctx.stopped) {
-        var check_moves = move_mod.MoveList.init();
-        legal.generateQuietChecksHinted(pos, &check_moves, false);
-        for (check_moves.slice()) |mv| {
+        // Reuse the tactical list's storage: it is dead once the capture loop
+        // above ends, and the generator clears the list before appending, so
+        // the check list is the same moves in the same order. A second
+        // MAX_MOVES list in this frame pushed the Windows x64 AVX2 frame past
+        // 4 KB, which costs a ___chkstk_ms probe on every qsearch call.
+        legal.generateQuietChecksHinted(pos, &moves, false);
+        for (moves.slice()) |mv| {
             if (tt_quiet_move) |searched| {
                 if (mv == searched) continue;
             }

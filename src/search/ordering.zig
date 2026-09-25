@@ -53,9 +53,10 @@ pub fn scoreMoves(
     countermove: ?move_mod.Move,
     history: *const history_mod.HistoryTable,
     cont: *const history_mod.ContContext,
+    attacked: u64,
     noalias scores: *[move_mod.MAX_MOVES]i32,
     noalias capture_see_scores: ?*[move_mod.MAX_MOVES]i32,
-) void {
+) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
     // Hoist the conthist context resolution out of the per-move loop: the
     // compiler cannot prove the scores[] stores don't alias *cont/*history, so
     // calling contTotal per move reloaded the table pointer, both prev keys,
@@ -80,9 +81,9 @@ pub fn scoreMoves(
     const killer_b_raw: u32 = if (killers.b) |m| @as(u16, @bitCast(m)) else NO_MOVE_SENTINEL;
     const counter_raw: u32 = if (countermove) |m| @as(u16, @bitCast(m)) else NO_MOVE_SENTINEL;
     const stm = pos.side_to_move;
-    const quiet_rows = history.quietPieceRows();
+    const quiet_rows = history.quietPlane(stm);
     for (list.slice(), 0..) |mv, idx| {
-        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows);
+        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows, attacked);
         scores[idx] = scored.score;
         if (capture_see_scores) |see_scores| see_scores[idx] = scored.capture_see;
     }
@@ -156,18 +157,30 @@ inline fn bestScoredIndex(scores: *const [move_mod.MAX_MOVES]i32, start: usize, 
 
     if (count - start >= W) {
         var vbest: V = @splat(best_score);
-        var vindex: V = @splat(@as(i32, @intCast(start)));
+        // Lane `j`'s running best index is `vbase[j] + j`: a lane that takes a
+        // chunk element records only the chunk's base index, so the loop keeps
+        // no lane-offset vector live (one vector register fewer where negamax
+        // inlines an unrolled copy; on Windows x64 a seventh one is callee-
+        // saved xmm6). The seed `start - j` makes seed lanes read `start`.
+        var vbase: V = @as(V, @splat(@as(i32, @intCast(start)))) - LANE;
         while (index + W <= count) : (index += W) {
             const chunk: V = scores[index..][0..W].*;
-            const lanes: V = @as(V, @splat(@as(i32, @intCast(index)))) + LANE;
             const better = chunk > vbest;
             vbest = @select(i32, better, chunk, vbest);
-            vindex = @select(i32, better, lanes, vindex);
+            vbase = @select(i32, better, @as(V, @splat(@as(i32, @intCast(index)))), vbase);
         }
         best_score = @reduce(.Max, vbest);
         const at_best = vbest == @as(V, @splat(best_score));
-        const candidates = @select(i32, at_best, vindex, @as(V, @splat(std.math.maxInt(i32))));
-        best_index = @intCast(@reduce(.Min, candidates));
+        // Lane indices are >= 0, so an unsigned min over them is the signed
+        // min; the all-ones filler for non-maximum lanes exceeds every index.
+        // (A maxInt(i32) filler is a constant-pool broadcast LLVM hoisted and
+        // spilled to a 32-byte stack slot, which forced a realigned frame in
+        // every function the picker is inlined into; all-ones is a register
+        // idiom.)
+        const U = @Vector(W, u32);
+        const vindex: U = @bitCast(vbase + LANE);
+        const candidates = @select(u32, at_best, vindex, @as(U, @splat(std.math.maxInt(u32))));
+        best_index = @reduce(.Min, candidates);
     }
 
     while (index < count) : (index += 1) {
@@ -222,8 +235,9 @@ inline fn scoreMove(
     killer_b_raw: u32,
     counter_raw: u32,
     stm: types.Color,
-    quiet_rows: *const [12][64]i16,
+    quiet_rows: *const [4][6][64]i16,
     cont_rows: *const history_mod.ContRows,
+    attacked: u64,
 ) ScoredMove {
     // Move equality on the packed(u16) Move is bit equality, so the raw-vs-raw
     // compares below are identical to the previous `?Move` unwrap + `==`.
@@ -251,18 +265,11 @@ inline fn scoreMove(
     if (mv_raw == killer_a_raw) return .{ .score = 250_000 };
     if (mv_raw == killer_b_raw) return .{ .score = 249_000 };
 
-    // Quiet path: the mover's color is the side to move for every generated
-    // move, so the mailbox piece is `stm * 6 + piece_type` — which is already
-    // the leading half of both history keys. Indexing the tables by the piece
-    // itself (quietPieceRows / contKeyOfPiece) is value-identical to the old
-    // `pieceType()`-keyed form and takes the PIECE_TYPES load out of the
-    // mailbox -> row-address -> history-load dependency chain.
+    // Quiet rows are resolved for the moving side and indexed by its threat bucket.
     const moving_piece = pos.pieceAt(mv.from);
     std.debug.assert(moving_piece.color().? == stm);
-    // Explicit row pointer — `quiet_rows[piece][to]` with a runtime piece index
-    // materialises a 128-byte stack copy of the row (the defect class
-    // HistoryTable.score already documents).
-    const quiet_row: *const [64]i16 = &quiet_rows[@intFromEnum(moving_piece)];
+    const bucket = history_mod.quietBucket(attacked, mv);
+    const quiet_row: *const [64]i16 = &quiet_rows[bucket][@intFromEnum(moving_piece.pieceType())];
     const history_score: i32 = quiet_row[mv.to.index()];
     if (mv_raw == counter_raw) return .{ .score = COUNTERMOVE_SCORE + @divTrunc(@max(history_score, 0), 4) };
     // Plain quiet: main history + continuation history. The combined magnitude
@@ -328,7 +335,7 @@ test "tt move outranks other ordering terms" {
     var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     const history = history_mod.HistoryTable{};
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, move_mod.Move.init(.e2, .e4, .double_push), .{}, null, &history, &cont, &scores, null);
+    scoreMoves(&pos, &moves, move_mod.Move.init(.e2, .e4, .double_push), .{}, null, &history, &cont, 0, &scores, null);
 
     const first = pickNext(&moves, &scores, null, 0);
     try std.testing.expectEqual(move_mod.Move.init(.e2, .e4, .double_push), first);
@@ -343,11 +350,11 @@ test "killer quiet outranks quiet history ordering" {
     moves.add(move_mod.Move.init(.h2, .h3, .quiet));
 
     var history = history_mod.HistoryTable{};
-    history.bonus(.white, .pawn, .a3, 4);
+    history.bonus(.white, .pawn, .a3, 4, 0);
 
     var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, null, .{ .a = move_mod.Move.init(.h2, .h3, .quiet) }, null, &history, &cont, &scores, null);
+    scoreMoves(&pos, &moves, null, .{ .a = move_mod.Move.init(.h2, .h3, .quiet) }, null, &history, &cont, 0, &scores, null);
 
     const first = pickNext(&moves, &scores, null, 0);
     try std.testing.expectEqual(move_mod.Move.init(.h2, .h3, .quiet), first);
@@ -364,13 +371,33 @@ test "countermove quiet outranks plain quiet history but stays below killers" {
     moves.add(counter_move);
 
     var history = history_mod.HistoryTable{};
-    history.bonus(.white, .pawn, history_move.to, 10);
+    history.bonus(.white, .pawn, history_move.to, 10, 0);
 
     var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, null, .{}, counter_move, &history, &cont, &scores, null);
+    scoreMoves(&pos, &moves, null, .{}, counter_move, &history, &cont, 0, &scores, null);
     try std.testing.expect(scores[1] > scores[0]);
 
-    scoreMoves(&pos, &moves, null, .{ .a = history_move }, counter_move, &history, &cont, &scores, null);
+    scoreMoves(&pos, &moves, null, .{ .a = history_move }, counter_move, &history, &cont, 0, &scores, null);
     try std.testing.expect(scores[0] > scores[1]);
+}
+
+test "quiet ordering and countermove tie break use the moves threat bucket" {
+    const fen = @import("../core/fen.zig");
+    const pos = try fen.parse("4k3/8/8/8/8/r7/8/N3K3 w - - 0 1");
+    const mv = move_mod.Move.init(.a1, .c2, .quiet);
+    const map = @import("../movegen/attacks.zig").attackedSquares(&pos, .black);
+    const bucket = history_mod.quietBucket(map, mv);
+    try std.testing.expectEqual(@as(u2, 2), bucket);
+    var history = history_mod.HistoryTable{};
+    history.adjustMain(.white, .knight, mv.to, 800, bucket);
+    history.adjustMain(.white, .knight, mv.to, -400, 0);
+    var moves = move_mod.MoveList.init();
+    moves.add(mv);
+    var scores: [move_mod.MAX_MOVES]i32 = undefined;
+    const cont = history_mod.ContContext{};
+    scoreMoves(&pos, &moves, null, .{}, null, &history, &cont, map, &scores, null);
+    try std.testing.expectEqual(@as(i32, 800), scores[0]);
+    scoreMoves(&pos, &moves, null, .{}, mv, &history, &cont, map, &scores, null);
+    try std.testing.expectEqual(COUNTERMOVE_SCORE + 200, scores[0]);
 }

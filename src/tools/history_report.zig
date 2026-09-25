@@ -60,13 +60,13 @@ test "history report prints table distribution" {
     const square = @import("../core/square.zig");
 
     var history = history_mod.HistoryTable{};
-    history.bonus(.white, .knight, square.Square.f3, 8);
+    history.bonus(.white, .knight, square.Square.f3, 8, 0);
 
     var sink = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer sink.deinit();
 
     try write(&sink.writer, &history);
-    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "history_table_entries 768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.written(), "history_table_entries 3072") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "history_table_bucket name zero") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "history_table_side_piece side white piece knight") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.written(), "countermove_table_slots 768") != null);

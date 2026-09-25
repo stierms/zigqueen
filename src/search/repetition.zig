@@ -30,8 +30,23 @@ pub const History = struct {
     // same side-to-move key has already appeared earlier inside the reversible window.
     // This is intentionally "one prior occurrence is enough" rather than a strict
     // game-history threefold claim test.
+    //
+    // Same predicate as currentPriorOccurrenceCount(...) != 0, as an early-exit
+    // scan. The counting form is a reduction LLVM vectorizes (strided gathers,
+    // 4x unrolled ymm); inlined into every negamax/qsearch entry, that loop used
+    // all sixteen vector registers, so on Windows x64 (xmm6-15 callee-saved)
+    // both recursive functions saved and restored ten xmm registers per call
+    // and realigned their frames to 32 bytes for the spills.
     pub fn isRepetition(self: *const History, halfmove_clock: u16) bool {
-        return self.currentPriorOccurrenceCount(halfmove_clock) != 0;
+        if (self.count < 3 or halfmove_clock < 4) return false;
+
+        const current_key = self.current();
+        const max_back = @min(@as(usize, halfmove_clock), self.count - 1);
+        var back: usize = 2;
+        while (back <= max_back) : (back += 2) {
+            if (self.keys[self.count - 1 - back] == current_key) return true;
+        }
+        return false;
     }
 
     // Root adjudication must be stricter than interior search nodes. A root position
@@ -123,6 +138,22 @@ test "current repetition exposes previous cycle child key" {
 
     try std.testing.expectEqual(@as(?u64, 2), history.currentPreviousCycleChildKey(8));
     try std.testing.expectEqual(@as(?u64, null), history.currentPreviousCycleChildKey(2));
+}
+
+test "early-exit repetition scan matches the prior-occurrence count" {
+    var prng = std.Random.DefaultPrng.init(0x7e9e_7171);
+    const rand = prng.random();
+    for (0..4000) |_| {
+        var history = History{};
+        const len = rand.intRangeAtMost(usize, 0, 96);
+        // Few distinct keys, so repetitions at every distance and parity occur.
+        for (0..len) |_| history.push(rand.intRangeAtMost(u64, 1, 4));
+        const halfmove_clock = rand.intRangeAtMost(u16, 0, 120);
+        try std.testing.expectEqual(
+            history.currentPriorOccurrenceCount(halfmove_clock) != 0,
+            history.isRepetition(halfmove_clock),
+        );
+    }
 }
 
 test "history ignores positions beyond halfmove window" {

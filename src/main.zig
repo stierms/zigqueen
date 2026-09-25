@@ -34,6 +34,8 @@ const uci = @import("uci/protocol.zig");
 const zobrist = @import("core/zobrist.zig");
 
 pub fn main() !void {
+    // Prewarm before dispatch/spawn. Engine constructors remain the safety boundary.
+    @import("search/startup.zig").ensure();
     var args = try std.process.argsWithAllocator(std.heap.page_allocator);
     defer args.deinit();
 

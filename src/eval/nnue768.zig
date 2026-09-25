@@ -45,6 +45,7 @@
 //!     in[i]*in[i+h/2]; screlu(x)=clamp(x,0,1)^2; eval(cp)=l3_out*scale.
 
 const std = @import("std");
+const pair_permutation = @import("pair_permutation.zig");
 const builtin = @import("builtin");
 const position = @import("../core/position.zig");
 const bitboard = @import("../core/bitboard.zig");
@@ -120,7 +121,23 @@ pub const MAX_FULL_THREAT_INPUTS: usize = fullthreats_mod.NUM_FULLTHREAT_FEATURE
 /// this stays portable; integer SIMD is bit-exact, so eval output is unchanged.
 const VEC: usize = std.simd.suggestVectorLength(i32) orelse 8;
 /// SIMD width for the i16 accumulator add/sub loop (twice the i32 width).
-const VEC16: usize = std.simd.suggestVectorLength(i16) orelse 16;
+/// 512-bit (32 lanes) whenever the target has 512-bit AVX-512BW registers
+/// (nnue-exact-20260924): the AVX-512 release target, x86-64-v4, carries LLVM's
+/// prefer-256-bit tuning, so suggestVectorLength reports 256-bit lanes there
+/// although these kernels were sized for the 32-lane width the native Zen build
+/// gets. Every VEC16 kernel is lane-wise integer arithmetic (wrapping add/sub,
+/// min/max, mul, shift, widen/narrow) with exact tails, so the width changes no
+/// value. LLVM backend only: the self-hosted (Debug) backend keeps its width.
+const VEC16: usize = if (has_avx512bw_512 and builtin.zig_backend == .stage2_llvm)
+    32
+else
+    std.simd.suggestVectorLength(i16) orelse 16;
+/// u64 lanes of the bitset skip-scan in applyThreatBitsetDeltaInto, widened for
+/// the same reason (chunked equality tests only; word and bit order unchanged).
+const VEC64: usize = if (has_avx512bw_512 and builtin.zig_backend == .stage2_llvm)
+    8
+else
+    std.simd.suggestVectorLength(u64) orelse 2;
 
 /// Largest inner-layer widths supported (ZQB4 layerstack l2/l3). Our first net is
 /// 16/32; keep generous headroom for re-tunes without a format change.
@@ -194,6 +211,16 @@ pub const Net = struct {
     l2_size: usize = 0, // l1 output width (== l2 input)
     l3_size: usize = 0, // l2 output width (== l3 input)
     l1_weights: []align(64) i8 = &.{}, // [l2_size*hidden], output-major; raw i8 (scale qb) for a vpdpbusd dot
+    // Optional AVX2-only private layout. Serialized and reference weights stay intact.
+    l1_byte_weights: []align(64) i8 = &.{},
+    l1_permutations: [MAX_BUCKETS]pair_permutation.Permutation = [_]pair_permutation.Permutation{.{}} ** MAX_BUCKETS,
+    // Optional row-blocked private copy for the blocked l1 finisher kernels
+    // (initL1Blocked): the VNNI build blocks l1_weights, the AVX2 build blocks
+    // l1_byte_weights. Empty = the row-major kernels above serve every bucket.
+    l1_blocked: []align(64) i8 = &.{},
+    // Output bucket per piece count (0..64), filled at load from bucketIndex so
+    // the per-eval lookup replaces its two runtime divisions (same values).
+    bucket_of_count: [65]u8 = [_]u8{0} ** 65,
     l1_bias: []f32 = &.{}, // [l2_size]
     l2_weights: []f32 = &.{}, // [l3_size*l2_size], output-major
     // ZQB8: transposed copy built at load ([k*l3n + k3]) so l2 vectorizes over OUTPUTS
@@ -236,6 +263,8 @@ pub const Net = struct {
             allocator.free(self.l3_weights);
             allocator.free(self.l3_bias);
         }
+        allocator.free(self.l1_byte_weights);
+        allocator.free(self.l1_blocked);
         allocator.destroy(self);
     }
 
@@ -246,6 +275,18 @@ pub const Net = struct {
         const divisor = (32 + self.buckets - 1) / self.buckets; // ceil(32/buckets)
         const b = (piece_count -| 2) / divisor;
         return @min(b, self.buckets - 1);
+    }
+
+    /// `bucketIndex` through the load-time table (identical values for every
+    /// count a board can have); falls back to the division for larger inputs.
+    pub inline fn bucketOf(self: *const Net, piece_count: usize) usize {
+        if (piece_count < self.bucket_of_count.len) return self.bucket_of_count[piece_count];
+        return self.bucketIndex(piece_count);
+    }
+
+    /// Fill `bucket_of_count` from `bucketIndex` (call once `buckets` is set).
+    pub fn initBucketTable(self: *Net) void {
+        for (&self.bucket_of_count, 0..) |*b, n| b.* = @intCast(self.bucketIndex(n));
     }
 };
 
@@ -302,7 +343,84 @@ fn maybeSimFtI8(net: *Net) void {
 pub fn loadFromBytes(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
     const net = try loadFromBytesInner(allocator, bytes);
     maybeSimFtI8(net);
+    initL1BytePairs(net, allocator);
+    initL1Blocked(net, allocator);
     return net;
+}
+
+// Optional acceleration: allocation failure or an unrepairable bucket keeps
+// the original exact kernel. Only the small readout tensor is copied at load.
+fn initL1BytePairs(net: *Net, allocator: std.mem.Allocator) void {
+    if (comptime !has_avx2 or has_avx512vnni or builtin.zig_backend != .stage2_llvm) return;
+    if (!net.full_threats or net.hidden % 32 != 0 or net.l2_size % 4 != 0) return;
+    const copy = allocator.alignedAlloc(i8, .@"64", net.l1_weights.len) catch return;
+    @memcpy(copy, net.l1_weights);
+    const stride = net.hidden * net.l2_size;
+    for (0..net.buckets) |bucket| {
+        const slice = copy[bucket * stride ..][0..stride];
+        // Prefer the four-byte lane proof (grouped kernel); it also implies pair
+        // safety. On failure restore the untouched weights before the pair repair.
+        const grouped = pair_permutation.repairGrouped(slice, net.hidden, net.l2_size);
+        if (grouped.ready) {
+            net.l1_permutations[bucket] = grouped;
+        } else {
+            @memcpy(slice, net.l1_weights[bucket * stride ..][0..stride]);
+            net.l1_permutations[bucket] = pair_permutation.repair(slice, net.hidden, net.l2_size);
+        }
+    }
+    net.l1_byte_weights = copy;
+}
+
+/// Rows per group of the row-blocked l1 finisher (nnue-exact-20260924), fixed by
+/// the build ISA: 16 on AVX-512 VNNI (16 zmm vpdpbusd chains share one
+/// activation load), 8 on AVX2 (8 ymm grouped chains fit its 16 registers),
+/// 0 = not compiled (other targets and the self-hosted Debug backend).
+const L1_BLOCK_ROWS: usize = if (builtin.zig_backend != .stage2_llvm)
+    0
+else if (has_avx512vnni)
+    16
+else if (has_avx2)
+    8
+else
+    0;
+/// Activation bytes per blocked kernel step (one zmm / two ymm chunks).
+const L1_BLOCK_SPAN: usize = 64;
+
+// Optional acceleration (nnue-exact-20260924): a row-blocked private copy of the
+// l1 weights for l1DotsVnni16 / l1DotsGroup8. Any shape it does not cover (or an
+// allocation failure) leaves l1_blocked empty and the row-major kernels serve.
+// The VNNI build blocks the serialized weights (vpdpbusd never saturates); the
+// AVX2 build blocks the grouped-permuted private copy, and finishMultiActivated
+// uses it only for buckets whose four-byte lane proof succeeded.
+fn initL1Blocked(net: *Net, allocator: std.mem.Allocator) void {
+    if (comptime L1_BLOCK_ROWS == 0) return;
+    if (!net.full_threats or net.hidden % L1_BLOCK_SPAN != 0 or net.l2_size % L1_BLOCK_ROWS != 0) return;
+    const src: []const i8 = if (comptime has_avx512vnni) net.l1_weights else net.l1_byte_weights;
+    if (src.len == 0 or src.len != net.buckets * net.l2_size * net.hidden) return;
+    const copy = allocator.alignedAlloc(i8, .@"64", src.len) catch return;
+    blockL1Weights(L1_BLOCK_ROWS, copy, src, net.buckets * net.l2_size, net.hidden);
+    net.l1_blocked = copy;
+}
+
+/// Row-blocked layout: rows are taken `rows` at a time (row-major source,
+/// `width` bytes per row); inside a group, each 64-byte column step stores the
+/// group's `rows` matching chunks back to back (row r at byte r*64 of the
+/// step). A group therefore starts at the same offset (first_row * width) as
+/// in the source, and its kernel walks ONE pointer with compile-time
+/// displacements. Pure byte relocation: every weight keeps its (row, column).
+fn blockL1Weights(comptime rows: usize, dst: []i8, src: []const i8, total_rows: usize, width: usize) void {
+    std.debug.assert(total_rows % rows == 0 and width % L1_BLOCK_SPAN == 0 and dst.len == src.len);
+    var o: usize = 0;
+    var g: usize = 0;
+    while (g < total_rows) : (g += rows) {
+        var s: usize = 0;
+        while (s < width) : (s += L1_BLOCK_SPAN) {
+            for (0..rows) |r| {
+                @memcpy(dst[o..][0..L1_BLOCK_SPAN], src[(g + r) * width + s ..][0..L1_BLOCK_SPAN]);
+                o += L1_BLOCK_SPAN;
+            }
+        }
+    }
 }
 
 fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
@@ -361,12 +479,16 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
     }
 
     const net = try allocator.create(Net);
+    net.l1_byte_weights = &.{};
+    net.l1_permutations = [_]pair_permutation.Permutation{.{}} ** MAX_BUCKETS;
+    net.l1_blocked = &.{};
     errdefer allocator.destroy(net);
     net.scale = scale;
     net.qa = qa;
     net.qb = qb;
     net.hidden = h;
     net.buckets = buckets;
+    net.initBucketTable();
     net.king_buckets = king_buckets;
     net.mirror = mirror_u != 0;
     net.table = table;
@@ -1257,7 +1379,7 @@ pub const Accumulator = struct {
     /// `changes` is the move's already-decoded piece feature list (decodeMoveChanges):
     /// the materialization walk decodes it ONCE and hands the same buffer to this and
     /// to FullThreatState.advanceMove, which used to decode the identical list again.
-    pub fn applyMove(self: *Accumulator, parent: *const Accumulator, net: *const Net, mv: move_mod.Move, state: *const make_unmake.StateInfo, pos: *const position.Position, finny: *FinnyTable, changes: []const Change) void {
+    pub fn applyMove(self: *Accumulator, parent: *const Accumulator, net: *const Net, mv: move_mod.Move, state: *const make_unmake.StateInfo, pos: *const position.Position, finny: *FinnyTable, changes: []const Change) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
         const wctx = perspCtx(net, .white, pos);
         const bctx = perspCtx(net, .black, pos);
         if (state.moved_piece.color().? == .white) {
@@ -1810,7 +1932,7 @@ fn PendingThreatRowsT(comptime T: type) type {
         /// read the same values the copy would have staged and the add order is
         /// unchanged -> bit-exact. Unlike flush, no early return: with zero pending
         /// rows this must still perform the copy. Resets the pending counts.
-        fn flushInto(self: *Self, dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) void {
+        fn flushInto(self: *Self, dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
             var i: usize = 0;
             // 8-wide chunk unroll: 8 accumulator vectors stay live across the row loop,
             // so each row iteration does 8 loads+adds per loop-overhead set (vs 1 in the
@@ -1978,7 +2100,7 @@ fn applyThreatBitsetDeltaInto(
     // is entirely zero is skipped with one vector compare. Word order, bit
     // order and therefore the pending row ORDER are unchanged -> bit-exact
     // (not merely order-insensitive).
-    const VW = std.simd.suggestVectorLength(u64) orelse 2;
+    const VW = VEC64;
     var w: usize = 0;
     while (w < old_bits.len) {
         // Skip whole all-equal chunks with one vector compare each.
@@ -2606,13 +2728,13 @@ fn finishMultiHalves(net: *const Net, us: *const [MAX_HIDDEN]i16, them: *const [
 /// screlu -> l3, plus the PSQT combine) — factored out of finishMultiHalves so
 /// the ZQB9 incremental path (fillPairwiseU8Split, no combined-half temps)
 /// shares the body bit-for-bit.
-fn finishMultiActivated(net: *const Net, p_u8: *const [MAX_HIDDEN]u8, piece_count: usize, psqt: i64, scale_percent: u16) i32 {
+fn finishMultiActivated(net: *const Net, p_u8: *[MAX_HIDDEN]u8, piece_count: usize, psqt: i64, scale_percent: u16) align(64) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
     const h = net.hidden;
     const l2n = net.l2_size;
     const l3n = net.l3_size;
     const qaf: f32 = @floatFromInt(net.qa);
     // Material-bucketed stacks (bucket 0 for single-stack nets): bucket-major slices.
-    const bucket = net.bucketIndex(piece_count);
+    const bucket = net.bucketOf(piece_count);
     const l1w = net.l1_weights[bucket * l2n * h ..];
     const l1b = net.l1_bias[bucket * l2n ..];
     const l2wt = net.l2_weights_t[bucket * l3n * l2n ..];
@@ -2621,20 +2743,34 @@ fn finishMultiActivated(net: *const Net, p_u8: *const [MAX_HIDDEN]u8, piece_coun
     const l3b = net.l3_bias[bucket];
 
     // l1 (i8 x u8 dot; dequant folds the pairwise >>8) -> screlu -> l2 -> screlu -> l3.
-    // Rows consumed 4 at a time so each activation load feeds 4 vpdpbusd chains.
+    // Rows consumed in groups (16/8 blocked, else 4) so each activation load
+    // feeds several accumulator chains.
     const l1_dequant: f32 = 256.0 / (@as(f32, @floatFromInt(net.qb)) * qaf * qaf);
     var hl2: [MAX_L2]f32 align(64) = undefined;
-    var k: usize = 0;
-    while (k + 4 <= l2n) : (k += 4) {
-        var dots: [4]i32 = undefined;
-        dotI8U8x4(l1w[k * h ..][0..h], l1w[(k + 1) * h ..][0..h], l1w[(k + 2) * h ..][0..h], l1w[(k + 3) * h ..][0..h], p_u8[0..h], &dots);
-        inline for (0..4) |j| {
-            hl2[k + j] = screluF(@as(f32, @floatFromInt(dots[j])) * l1_dequant + l1b[k + j]);
+    // Row-blocked kernels (nnue-exact-20260924) whenever initL1Blocked built the
+    // blocked copy; it exists only for shapes the kernels cover exactly.
+    const blocked = net.l1_blocked.len != 0;
+    if (comptime L1_BLOCK_ROWS == 16) {
+        if (blocked)
+            l1ForwardBlocked(.vnni16, net.l1_blocked[bucket * l2n * h ..], l1b, p_u8[0..h], hl2[0..l2n], l1_dequant)
+        else
+            l1ForwardPairs(.generic, l1w, l1b, p_u8[0..h], hl2[0..l2n], l1_dequant);
+    } else if (comptime has_avx2 and !has_avx512vnni and builtin.zig_backend == .stage2_llvm) {
+        const permutation = &net.l1_permutations[bucket];
+        if (permutation.ready) {
+            permutation.apply(p_u8[0..h]);
+            const paired = net.l1_byte_weights[bucket * l2n * h ..];
+            if (permutation.grouped and blocked)
+                l1ForwardBlocked(.group8, net.l1_blocked[bucket * l2n * h ..], l1b, p_u8[0..h], hl2[0..l2n], l1_dequant)
+            else if (permutation.grouped)
+                l1ForwardPairs(.grouped, paired, l1b, p_u8[0..h], hl2[0..l2n], l1_dequant)
+            else
+                l1ForwardPairs(.pairs, paired, l1b, p_u8[0..h], hl2[0..l2n], l1_dequant);
+        } else {
+            l1ForwardPairs(.generic, l1w, l1b, p_u8[0..h], hl2[0..l2n], l1_dequant);
         }
-    }
-    while (k < l2n) : (k += 1) {
-        const dot = dotI8U8(l1w[k * h ..][0..h], p_u8[0..h]);
-        hl2[k] = screluF(@as(f32, @floatFromInt(dot)) * l1_dequant + l1b[k]);
+    } else {
+        l1ForwardPairs(.generic, l1w, l1b, p_u8[0..h], hl2[0..l2n], l1_dequant);
     }
     // l2 vectorized over OUTPUTS: acc[k3] = l2b[k3] + sum_k hl2[k]*l2wT[k][k3]
     // (broadcast-FMA per k; no horizontal reduces), then one vectorized screlu.
@@ -2646,9 +2782,14 @@ fn finishMultiActivated(net: *const Net, p_u8: *const [MAX_HIDDEN]u8, piece_coun
     // what the previous kk just stored). Holding acc3 in registers across the kk
     // loop removes the round-trip. Per-element op order is IDENTICAL (kk-ascending
     // mul then add, no FMA contraction in either form) -> bit-exact.
-    if (l3n % VECF == 0 and l3n <= 4 * VECF) {
+    if (l3n % VECF_L2 == 0 and l3n <= 4 * VECF_L2) {
+        switch (l3n / VECF_L2) {
+            inline 1, 2, 3, 4 => |nb| l2ForwardBlocked(VECF_L2, nb, acc3[0..l3n], hl2[0..l2n], l2wt, l3n),
+            else => unreachable,
+        }
+    } else if (VECF_L2 != VECF and l3n % VECF == 0 and l3n <= 4 * VECF) {
         switch (l3n / VECF) {
-            inline 1, 2, 3, 4 => |nb| l2ForwardBlocked(nb, acc3[0..l3n], hl2[0..l2n], l2wt, l3n),
+            inline 1, 2, 3, 4 => |nb| l2ForwardBlocked(VECF, nb, acc3[0..l3n], hl2[0..l2n], l2wt, l3n),
             else => unreachable,
         }
     } else {
@@ -2665,12 +2806,20 @@ fn finishMultiActivated(net: *const Net, p_u8: *const [MAX_HIDDEN]u8, piece_coun
     }
     var hl3: [MAX_L3]f32 align(64) = undefined;
     {
-        const zero: @Vector(VECF, f32) = @splat(0.0);
-        const one: @Vector(VECF, f32) = @splat(1.0);
+        // Elementwise, so the (VECF_L2) width is bit-exact-neutral.
+        const zero: @Vector(VECF_L2, f32) = @splat(0.0);
+        const one: @Vector(VECF_L2, f32) = @splat(1.0);
         var j: usize = 0;
+        while (j + VECF_L2 <= l3n) : (j += VECF_L2) {
+            const av: @Vector(VECF_L2, f32) = acc3[j..][0..VECF_L2].*;
+            const c = @min(@max(av, zero), one);
+            hl3[j..][0..VECF_L2].* = c * c;
+        }
+        // review fix: finish at the base VECF width so exactly the base's elements
+        // take the vector form (whose NaN handling differs from screluF's clamp).
         while (j + VECF <= l3n) : (j += VECF) {
             const av: @Vector(VECF, f32) = acc3[j..][0..VECF].*;
-            const c = @min(@max(av, zero), one);
+            const c = @min(@max(av, @as(@Vector(VECF, f32), @splat(0.0))), @as(@Vector(VECF, f32), @splat(1.0)));
             hl3[j..][0..VECF].* = c * c;
         }
         while (j < l3n) : (j += 1) hl3[j] = screluF(acc3[j]);
@@ -2686,25 +2835,67 @@ fn finishMultiActivated(net: *const Net, p_u8: *const [MAX_HIDDEN]u8, piece_coun
     return @intCast(out);
 }
 
+/// Which l1 dot kernel the (bucket's) weight layout has been proven safe for.
+const L1Kernel = enum { generic, pairs, grouped };
+
+inline fn l1ForwardPairs(comptime kernel: L1Kernel, l1w: []const i8, l1b: []const f32, p_u8: []const u8, hl2: []f32, l1_dequant: f32) void {
+    const h = p_u8.len;
+    const l2n = hl2.len;
+    const dot4 = switch (kernel) {
+        .generic => dotI8U8x4,
+        .pairs => dotI8U8x4ByteSafe,
+        .grouped => dotI8U8x4GroupSafe,
+    };
+    var k: usize = 0;
+    while (k + 4 <= l2n) : (k += 4) {
+        var dots: [4]i32 = undefined;
+        dot4(l1w[k * h ..][0..h], l1w[(k + 1) * h ..][0..h], l1w[(k + 2) * h ..][0..h], l1w[(k + 3) * h ..][0..h], p_u8[0..h], &dots);
+        inline for (0..4) |j| {
+            hl2[k + j] = screluF(@as(f32, @floatFromInt(dots[j])) * l1_dequant + l1b[k + j]);
+        }
+    }
+    while (k < l2n) : (k += 1) {
+        const dot = dotI8U8(l1w[k * h ..][0..h], p_u8[0..h]);
+        hl2[k] = screluF(@as(f32, @floatFromInt(dot)) * l1_dequant + l1b[k]);
+    }
+}
+
 /// SIMD width for the f32 layerstack matmuls.
 const VECF: usize = std.simd.suggestVectorLength(f32) orelse 8;
+/// The finisher's l2/hl3 width: 16 lanes (zmm) on the AVX-512 VNNI build, whose
+/// x86-64-v4 tuning (prefer-256-bit) makes VECF 8; VECF elsewhere. These are
+/// elementwise mul/add/clamp ops, so the lane width never changes a value.
+const VECF_L2: usize = if (builtin.zig_backend == .stage2_llvm and has_avx512vnni) 16 else VECF;
 
 /// l2 forward (acc3[j] += hl2[kk] * l2wT[kk][j]) with acc3 held in NB register
-/// vectors across the whole kk loop. Same kk-major traversal and the same
-/// separate mul/add per element as the memory-round-trip version -> bit-exact;
-/// only the redundant per-kk stack stores/reloads are gone.
-inline fn l2ForwardBlocked(comptime NB: usize, acc3: []f32, hl2: []const f32, l2wt: []const f32, l3n: usize) void {
-    var av: [NB]@Vector(VECF, f32) = undefined;
-    inline for (0..NB) |b| av[b] = acc3[b * VECF ..][0..VECF].*;
+/// vectors of V lanes across the whole kk loop. Same kk-major traversal and the
+/// same separate mul/add per element as the memory-round-trip version ->
+/// bit-exact; only the redundant per-kk stack stores/reloads are gone. The
+/// common 16-input shape is unrolled at compile time (same kk order).
+inline fn l2ForwardBlocked(comptime V: usize, comptime NB: usize, acc3: []f32, hl2: []const f32, l2wt: []const f32, l3n: usize) void {
+    var av: [NB]@Vector(V, f32) = undefined;
+    inline for (0..NB) |b| av[b] = acc3[b * V ..][0..V].*;
+    if (hl2.len == 16) {
+        inline for (0..16) |kk| {
+            const hk: @Vector(V, f32) = @splat(hl2[kk]);
+            const wrow = l2wt[kk * l3n ..];
+            inline for (0..NB) |b| {
+                const wv: @Vector(V, f32) = wrow[b * V ..][0..V].*;
+                av[b] = av[b] + hk * wv;
+            }
+        }
+        inline for (0..NB) |b| acc3[b * V ..][0..V].* = av[b];
+        return;
+    }
     for (hl2, 0..) |hkv, kk| {
-        const hk: @Vector(VECF, f32) = @splat(hkv);
+        const hk: @Vector(V, f32) = @splat(hkv);
         const wrow = l2wt[kk * l3n ..];
         inline for (0..NB) |b| {
-            const wv: @Vector(VECF, f32) = wrow[b * VECF ..][0..VECF].*;
+            const wv: @Vector(V, f32) = wrow[b * V ..][0..V].*;
             av[b] = av[b] + hk * wv;
         }
     }
-    inline for (0..NB) |b| acc3[b * VECF ..][0..VECF].* = av[b];
+    inline for (0..NB) |b| acc3[b * V ..][0..V].* = av[b];
 }
 
 inline fn screluF(x: f32) f32 {
@@ -2737,6 +2928,14 @@ inline fn dotF(w: []const f32, x: []const f32) f32 {
     return s;
 }
 
+/// Products per activation-pass iteration (nnue-exact-20260924): at least 32, so
+/// the AVX2 build narrows 32 u16 products (each <= 254, as a*b <= 255*255 and
+/// >> 8) to bytes with one vpackuswb plus one lane fix-up instead of an extract
+/// and a pack per 16; AVX-512BW builds already run 32 (VEC16) and are unchanged.
+/// The kernels are elementwise with exact scalar tails, so the width changes no
+/// byte.
+const ACT_LANES: usize = if (builtin.zig_backend == .stage2_llvm and has_avx2) @max(VEC16, 32) else VEC16;
+
 /// crelu+pairwise_mul of one perspective's accumulator into u8 [0,255]:
 /// out[i] = (clamp(acc[i],0,qa) * clamp(acc[i+half],0,qa)) >> 8, i in 0..half.
 /// (bullet `pairwise_mul`: first half * second half of the crelu'd accumulator.)
@@ -2747,7 +2946,7 @@ inline fn fillPairwiseU8(out: []u8, acc: []const i16, qa: i32) void {
     // i16 lanes -> size by the i16 SIMD width (VEC16 = 32 on AVX-512), not VECF:
     // VECF (=16 f32 lanes) only filled a ymm here, running the clamp/mul at 256-bit.
     // Elementwise ops only, so the width is bit-exact-neutral.
-    const V = VEC16;
+    const V = ACT_LANES;
     const half = out.len;
     const qa16: @Vector(V, i16) = @splat(@intCast(qa));
     const zero16: @Vector(V, i16) = @splat(0);
@@ -2781,7 +2980,7 @@ inline fn fillPairwiseU8(out: []u8, acc: []const i16, qa: i32) void {
 /// accumulator is i16-safe for any legal net, so the clamp/mul sees identical
 /// values -> bit-exact with the staged path.
 inline fn fillPairwiseU8Split(out: []u8, ha: []const i16, ta: []const i16, qa: i32) void {
-    const V = VEC16;
+    const V = ACT_LANES;
     const half = out.len;
     const qa16: @Vector(V, i16) = @splat(@intCast(qa));
     const zero16: @Vector(V, i16) = @splat(0);
@@ -2814,6 +3013,14 @@ const has_avx512vnni = blk: {
     break :blk std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vnni);
 };
 
+/// True at comptime when the target has AVX-512BW with 512-bit registers
+/// (x86-64-v4 and the native Zen build; not x86-64-v3). Sizes VEC16/VEC64.
+const has_avx512bw_512 = blk: {
+    if (builtin.cpu.arch != .x86_64) break :blk false;
+    break :blk std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw) and
+        std.Target.x86.featureSetHas(builtin.cpu.features, .evex512);
+};
+
 /// True at comptime when the build target has AVX2 (x86-64-v3 — the public
 /// release/CCRL "avx2" artifact baseline). Selects the exact ymm vpmaddwd l1
 /// kernel below when VNNI is absent.
@@ -2844,6 +3051,271 @@ inline fn madd16(w: @Vector(16, i16), x: @Vector(16, i16)) @Vector(8, i32) {
 /// 4-row variant of dotI8U8: one activation load feeds four vpdpbusd chains
 /// (the finisher re-loads x per row otherwise; l1 rows are consumed in groups
 /// of 4). Each row's accumulation chain is IDENTICAL to dotI8U8's -> bit-exact.
+// Load-time permutation proves every byte pair safe for all u8 activations.
+// No saturation repair is needed in the hot path; i32 summation is exact.
+inline fn dotI8U8x4ByteSafe(w0: []const i8, w1: []const i8, w2: []const i8, w3: []const i8, x: []const u8, out: *[4]i32) void {
+    const rows = .{ w0, w1, w2, w3 };
+    var accum: [4]@Vector(8, i32) = @splat(@splat(0));
+    const ones: @Vector(16, i16) = @splat(1);
+    var i: usize = 0;
+    while (i + 32 <= x.len) : (i += 32) {
+        const xv: @Vector(32, u8) = x[i..][0..32].*;
+        inline for (rows, 0..) |row, j| {
+            const wv: @Vector(32, i8) = row[i..][0..32].*;
+            const pairs = asm ("vpmaddubsw %[w], %[x], %[pairs]"
+                : [pairs] "=v" (-> @Vector(16, i16)),
+                : [w] "v" (wv),
+                  [x] "v" (xv),
+            );
+            accum[j] += madd16(pairs, ones);
+        }
+    }
+    inline for (0..4) |j| out[j] = @reduce(.Add, accum[j]);
+    while (i < x.len) : (i += 1) {
+        inline for (rows, 0..) |row, j| out[j] += @as(i32, row[i]) * x[i];
+    }
+}
+
+/// Grouped twin of dotI8U8x4ByteSafe (hotspot-profile-20260924): per 64-byte
+/// step the two 32-byte vpmaddubsw results are added lane-wise in i16 BEFORE a
+/// single vpmaddwd widening, so each row pays 3 multiply uops per 64 bytes
+/// instead of 4. Exact: `pair_permutation.repairGrouped` proved, at load time
+/// and for every row, that each lane's four byte products sum inside
+/// [-32640,32640] for ALL u8 activations — so neither the saturating pair step
+/// nor the wrapping i16 add changes any value, and every i32 lane is the same
+/// exact integer sum as the pair kernel's. The i32 dot (and thus hl2) is
+/// bit-identical; only the widening count changes.
+inline fn dotI8U8x4GroupSafe(w0: []const i8, w1: []const i8, w2: []const i8, w3: []const i8, x: []const u8, out: *[4]i32) void {
+    const rows = .{ w0, w1, w2, w3 };
+    var accum: [4]@Vector(8, i32) = @splat(@splat(0));
+    const ones: @Vector(16, i16) = @splat(1);
+    var i: usize = 0;
+    while (i + pair_permutation.GROUP_SPAN <= x.len) : (i += pair_permutation.GROUP_SPAN) {
+        const xlo: @Vector(32, u8) = x[i..][0..32].*;
+        const xhi: @Vector(32, u8) = x[i + 32 ..][0..32].*;
+        inline for (rows, 0..) |row, j| {
+            const wlo: @Vector(32, i8) = row[i..][0..32].*;
+            const whi: @Vector(32, i8) = row[i + 32 ..][0..32].*;
+            const plo = asm ("vpmaddubsw %[w], %[x], %[pairs]"
+                : [pairs] "=v" (-> @Vector(16, i16)),
+                : [w] "v" (wlo),
+                  [x] "v" (xlo),
+            );
+            const phi = asm ("vpmaddubsw %[w], %[x], %[pairs]"
+                : [pairs] "=v" (-> @Vector(16, i16)),
+                : [w] "v" (whi),
+                  [x] "v" (xhi),
+            );
+            accum[j] += madd16(plo +% phi, ones);
+        }
+    }
+    inline for (0..4) |j| out[j] = @reduce(.Add, accum[j]);
+    // repairGrouped only accepts widths that are a multiple of GROUP_SPAN, so
+    // this scalar tail never runs for a grouped bucket; kept for totality.
+    while (i < x.len) : (i += 1) {
+        inline for (rows, 0..) |row, j| out[j] += @as(i32, row[i]) * x[i];
+    }
+}
+
+// ---- Row-blocked l1 kernels (nnue-exact-20260924) ----
+//
+// Both walk ONE group of the blockL1Weights layout: per 64-byte activation step
+// the group's rows' weight chunks are contiguous (row r at byte r*64), so every
+// multiply takes its weights straight from memory at a compile-time
+// displacement off a single pointer, and one activation load feeds all the
+// group's accumulator chains. Each row's chain performs exactly the multiply-
+// adds of the row-major kernel it replaces, in the same column order; only the
+// final horizontal sums are regrouped (reduceRows16 / reduceRows8), and i32
+// addition of these bounded values (|dot| <= 2048*255*128 < 2^31) is exact and
+// associative — every returned lane is the row's exact integer dot.
+// `x.len` is a multiple of L1_BLOCK_SPAN (initL1Blocked checks the width).
+
+/// AVX-512 VNNI: 16 rows, `vpdpbusd` (u8 activations x i8 weights, exact i32
+/// accumulation, no saturation) with a memory weight operand.
+inline fn l1DotsVnni16(wb: [*]const i8, x: []const u8) @Vector(16, i32) {
+    var acc: [16]@Vector(16, i32) = @splat(@splat(0));
+    var p = wb;
+    var i: usize = 0;
+    while (i < x.len) : (i += L1_BLOCK_SPAN) {
+        const xv: @Vector(64, u8) = x[i..][0..64].*;
+        inline for (0..16) |r| {
+            // AT&T: `vpdpbusd m512(i8), zmm(u8), acc`; acc += u8·i8 per 4-byte lane.
+            acc[r] = asm (std.fmt.comptimePrint("vpdpbusd {d}(%[p]), %[x], %[acc]", .{r * L1_BLOCK_SPAN})
+                : [acc] "=v" (-> @Vector(16, i32)),
+                : [p] "r" (p),
+                  [x] "v" (xv),
+                  [accin] "0" (acc[r]),
+            );
+        }
+        p += 16 * L1_BLOCK_SPAN;
+    }
+    return reduceRows16(acc);
+}
+
+/// AVX2 grouped (four-byte lane proof, see dotI8U8x4GroupSafe): 8 rows. Per
+/// row and step: two `vpmaddubsw` with memory weight operands, their i16
+/// lane-wise sum (proven overflow-free at load), one `vpmaddwd` widening.
+inline fn l1DotsGroup8(wb: [*]const i8, x: []const u8) @Vector(8, i32) {
+    var acc: [8]@Vector(8, i32) = @splat(@splat(0));
+    const ones: @Vector(16, i16) = @splat(1);
+    var p = wb;
+    var i: usize = 0;
+    while (i < x.len) : (i += L1_BLOCK_SPAN) {
+        const xlo: @Vector(32, u8) = x[i..][0..32].*;
+        const xhi: @Vector(32, u8) = x[i + 32 ..][0..32].*;
+        inline for (0..8) |r| {
+            // AT&T: `vpmaddubsw m256(i8), ymm(u8), dst` (x unsigned, weights signed).
+            const plo = asm (std.fmt.comptimePrint("vpmaddubsw {d}(%[p]), %[x], %[pairs]", .{r * L1_BLOCK_SPAN})
+                : [pairs] "=v" (-> @Vector(16, i16)),
+                : [p] "r" (p),
+                  [x] "v" (xlo),
+            );
+            const phi = asm (std.fmt.comptimePrint("vpmaddubsw {d}(%[p]), %[x], %[pairs]", .{r * L1_BLOCK_SPAN + 32})
+                : [pairs] "=v" (-> @Vector(16, i16)),
+                : [p] "r" (p),
+                  [x] "v" (xhi),
+            );
+            acc[r] += madd16(plo +% phi, ones);
+        }
+        p += 8 * L1_BLOCK_SPAN;
+    }
+    return reduceRows8(acc);
+}
+
+/// Shuffle mask helper: `n` lanes of a @shuffle mask from a comptime function.
+fn laneMask(comptime n: usize, comptime f: fn (usize) i32) [n]i32 {
+    var m: [n]i32 = undefined;
+    for (&m, 0..) |*v, j| v.* = f(j);
+    return m;
+}
+
+/// 16 row accumulators (16 i32 lanes each) -> lane k = total of row k.
+/// Level 1 folds 128-bit quarters (q0+q2, q1+q3) of each row pair into one
+/// vector (row 2j in lanes 0-7, 2j+1 in 8-15); level 2 folds quarter pairs
+/// across two such vectors (4 rows x 4 lanes); levels 3 and 4 fold 64-bit then
+/// 32-bit pairs inside each quarter, leaving row k+4j in lane 4k+j; one
+/// permutation restores row order.
+inline fn reduceRows16(a: [16]@Vector(16, i32)) @Vector(16, i32) {
+    const V = @Vector(16, i32);
+    const m1lo = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            return if (j < 8) @intCast(j) else ~@as(i32, @intCast(j - 8));
+        }
+    }.f);
+    const m1hi = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            return if (j < 8) @intCast(j + 8) else ~@as(i32, @intCast(j));
+        }
+    }.f);
+    var t: [8]V = undefined;
+    inline for (0..8) |j| t[j] = @shuffle(i32, a[2 * j], a[2 * j + 1], m1lo) +% @shuffle(i32, a[2 * j], a[2 * j + 1], m1hi);
+    // Quarter q of the result takes quarter src_q of (q < 2 ? first : second).
+    const m2lo = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            const q = j / 4;
+            const src: i32 = @intCast((q % 2) * 8 + j % 4); // quarters 0 and 2
+            return if (q < 2) src else ~src;
+        }
+    }.f);
+    const m2hi = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            const q = j / 4;
+            const src: i32 = @intCast((q % 2) * 8 + 4 + j % 4); // quarters 1 and 3
+            return if (q < 2) src else ~src;
+        }
+    }.f);
+    var u: [4]V = undefined;
+    inline for (0..4) |m| u[m] = @shuffle(i32, t[2 * m], t[2 * m + 1], m2lo) +% @shuffle(i32, t[2 * m], t[2 * m + 1], m2hi);
+    // Inside each quarter: [a0 a1 b0 b1] + [a2 a3 b2 b3].
+    const m3lo = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            const base: i32 = @intCast(j - j % 4);
+            const e: i32 = @intCast(j % 2);
+            return if (j % 4 < 2) base + e else ~(base + e);
+        }
+    }.f);
+    const m3hi = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            const base: i32 = @intCast(j - j % 4);
+            const e: i32 = @intCast(2 + j % 2);
+            return if (j % 4 < 2) base + e else ~(base + e);
+        }
+    }.f);
+    var v: [2]V = undefined;
+    inline for (0..2) |n| v[n] = @shuffle(i32, u[2 * n], u[2 * n + 1], m3lo) +% @shuffle(i32, u[2 * n], u[2 * n + 1], m3hi);
+    // Inside each quarter: [a0 a2 b0 b2] + [a1 a3 b1 b3].
+    const m4lo = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            const base: i32 = @intCast(j - j % 4);
+            const e: i32 = @intCast(2 * (j % 2));
+            return if (j % 4 < 2) base + e else ~(base + e);
+        }
+    }.f);
+    const m4hi = comptime laneMask(16, struct {
+        fn f(j: usize) i32 {
+            const base: i32 = @intCast(j - j % 4);
+            const e: i32 = @intCast(2 * (j % 2) + 1);
+            return if (j % 4 < 2) base + e else ~(base + e);
+        }
+    }.f);
+    const s = @shuffle(i32, v[0], v[1], m4lo) +% @shuffle(i32, v[0], v[1], m4hi);
+    // Row n sits in lane 4*(n%4) + n/4.
+    const order = comptime laneMask(16, struct {
+        fn f(n: usize) i32 {
+            return @intCast(4 * (n % 4) + n / 4);
+        }
+    }.f);
+    return @shuffle(i32, s, undefined, order);
+}
+
+/// 8 row accumulators (8 i32 lanes each) -> lane k = total of row k:
+/// 64-bit then 32-bit pair folds inside each 128-bit half, then the two halves.
+inline fn reduceRows8(a: [8]@Vector(8, i32)) @Vector(8, i32) {
+    const V = @Vector(8, i32);
+    // [a0 a1 b0 b1 | a4 a5 b4 b5] + [a2 a3 b2 b3 | a6 a7 b6 b7]
+    const m1lo = [8]i32{ 0, 1, ~@as(i32, 0), ~@as(i32, 1), 4, 5, ~@as(i32, 4), ~@as(i32, 5) };
+    const m1hi = [8]i32{ 2, 3, ~@as(i32, 2), ~@as(i32, 3), 6, 7, ~@as(i32, 6), ~@as(i32, 7) };
+    var t: [4]V = undefined;
+    inline for (0..4) |j| t[j] = @shuffle(i32, a[2 * j], a[2 * j + 1], m1lo) +% @shuffle(i32, a[2 * j], a[2 * j + 1], m1hi);
+    // [a0 a2 b0 b2 | ...] + [a1 a3 b1 b3 | ...] -> rows (4 per half-vector)
+    const m2lo = [8]i32{ 0, 2, ~@as(i32, 0), ~@as(i32, 2), 4, 6, ~@as(i32, 4), ~@as(i32, 6) };
+    const m2hi = [8]i32{ 1, 3, ~@as(i32, 1), ~@as(i32, 3), 5, 7, ~@as(i32, 5), ~@as(i32, 7) };
+    var u: [2]V = undefined;
+    inline for (0..2) |m| u[m] = @shuffle(i32, t[2 * m], t[2 * m + 1], m2lo) +% @shuffle(i32, t[2 * m], t[2 * m + 1], m2hi);
+    // Low halves + high halves: rows 0-3 then 4-7.
+    const m3lo = [8]i32{ 0, 1, 2, 3, ~@as(i32, 0), ~@as(i32, 1), ~@as(i32, 2), ~@as(i32, 3) };
+    const m3hi = [8]i32{ 4, 5, 6, 7, ~@as(i32, 4), ~@as(i32, 5), ~@as(i32, 6), ~@as(i32, 7) };
+    return @shuffle(i32, u[0], u[1], m3lo) +% @shuffle(i32, u[0], u[1], m3hi);
+}
+
+const L1BlockKind = enum { vnni16, group8 };
+
+/// l1 over whole blocked groups: dots -> dequant + bias -> screlu, vectorized
+/// over the group's rows. Per lane these are exactly l1ForwardPairs' scalar
+/// f32 ops (int->f32 convert, *l1_dequant, +bias, clamp to [0,1], square),
+/// elementwise with no contraction, so every hl2 value is bit-identical.
+inline fn l1ForwardBlocked(comptime kind: L1BlockKind, wb: []const i8, l1b: []const f32, x: []const u8, hl2: []f32, l1_dequant: f32) void {
+    const R = switch (kind) {
+        .vnni16 => 16,
+        .group8 => 8,
+    };
+    const h = x.len;
+    const deq: @Vector(R, f32) = @splat(l1_dequant);
+    const zero: @Vector(R, f32) = @splat(0.0);
+    const one: @Vector(R, f32) = @splat(1.0);
+    var k: usize = 0;
+    while (k < hl2.len) : (k += R) {
+        const dots = switch (kind) {
+            .vnni16 => l1DotsVnni16(wb[k * h ..].ptr, x),
+            .group8 => l1DotsGroup8(wb[k * h ..].ptr, x),
+        };
+        const bias: @Vector(R, f32) = l1b[k..][0..R].*;
+        const z = @as(@Vector(R, f32), @floatFromInt(dots)) * deq + bias;
+        const c = std.math.clamp(z, zero, one);
+        hl2[k..][0..R].* = c * c;
+    }
+}
+
 inline fn dotI8U8x4(w0: []const i8, w1: []const i8, w2: []const i8, w3: []const i8, x: []const u8, out: *[4]i32) void {
     const n = x.len;
     var i: usize = 0;
@@ -3056,12 +3528,16 @@ test "nnue768 evaluates a material imbalance from the side to move" {
     // Build a tiny synthetic net: validate the load round-trip + that evaluate
     // runs and is sign-correct on a constructed net.
     const net = try allocator.create(Net);
+    net.l1_byte_weights = &.{};
+    net.l1_permutations = [_]pair_permutation.Permutation{.{}} ** MAX_BUCKETS;
+    net.l1_blocked = &.{};
     defer net.destroy(allocator);
     net.scale = 400;
     net.qa = 255;
     net.qb = 64;
     net.hidden = H;
     net.buckets = 1;
+    net.initBucketTable();
     net.king_buckets = 1;
     net.mirror = false;
     net.table = [_]u8{0} ** 64;
@@ -3587,12 +4063,16 @@ fn expandMirrorTable(layout: [32]u8) [64]u8 {
 fn buildTestNet(allocator: std.mem.Allocator, hidden: usize, king_buckets: usize, mirror: bool, table: [64]u8) !*Net {
     const inputs = INPUTS * king_buckets;
     const net = try allocator.create(Net);
+    net.l1_byte_weights = &.{};
+    net.l1_permutations = [_]pair_permutation.Permutation{.{}} ** MAX_BUCKETS;
+    net.l1_blocked = &.{};
     errdefer allocator.destroy(net);
     net.scale = 400;
     net.qa = 255;
     net.qb = 64;
     net.hidden = hidden;
     net.buckets = 1;
+    net.initBucketTable();
     net.king_buckets = king_buckets;
     net.mirror = mirror;
     net.table = table;
@@ -3748,6 +4228,313 @@ test "nnue768 HalfKA feature mapping matches the bullet reference (king-relative
         for (0..16) |i| {
             try std.testing.expectEqual(us_ref[i], @as(i64, us[i]));
             try std.testing.expectEqual(them_ref[i], @as(i64, them[i]));
+        }
+    }
+}
+
+test "grouped AVX2 byte dots equal the scalar dot at activation extremes" {
+    if (comptime !has_avx2 or has_avx512vnni or builtin.zig_backend != .stage2_llvm) return;
+    for ([_]usize{ 64, 128, 1024, 2048 }) |n| {
+        var original: [4 * MAX_HIDDEN]i8 = undefined;
+        for (0..4) |row| {
+            for (0..n) |i| original[row * n + i] = @intCast(@as(i32, @intCast((i * 17 + row * 7) % 11)) - 5);
+            // Unsafe lane groups the repair must move apart (each large weight
+            // alone fits beside three small ones, so a repair exists).
+            original[row * n] = 110;
+            original[row * n + 32] = 100;
+            original[row * n + 3] = -110;
+            original[row * n + 35] = -100;
+        }
+        var weights = original;
+        const permutation = pair_permutation.repairGrouped(weights[0 .. 4 * n], n, 4);
+        try std.testing.expect(permutation.ready and permutation.grouped);
+        var x: [MAX_HIDDEN]u8 = undefined;
+        for (0..24) |trial| {
+            for (0..n) |i| x[i] = switch (trial) {
+                0 => 0,
+                1 => 255,
+                2 => if (i % 2 == 0) 255 else 0,
+                3 => if (i % 64 < 32) 255 else 0,
+                else => @intCast((i * 173 + trial * 97) % 256),
+            };
+            var expected: [4]i32 = @splat(0);
+            for (0..4) |row| {
+                for (0..n) |i| expected[row] += @as(i32, original[row * n + i]) * x[i];
+            }
+            permutation.apply(x[0..n]);
+            var grouped: [4]i32 = undefined;
+            dotI8U8x4GroupSafe(weights[0..n], weights[n .. 2 * n], weights[2 * n .. 3 * n], weights[3 * n .. 4 * n], x[0..n], &grouped);
+            try std.testing.expectEqualSlices(i32, &expected, &grouped);
+            var paired: [4]i32 = undefined;
+            dotI8U8x4ByteSafe(weights[0..n], weights[n .. 2 * n], weights[2 * n .. 3 * n], weights[3 * n .. 4 * n], x[0..n], &paired);
+            try std.testing.expectEqualSlices(i32, &expected, &paired);
+        }
+    }
+}
+
+test "permuted AVX2 byte dots preserve full-range activations and scalar tails" {
+    if (comptime !has_avx2 or has_avx512vnni or builtin.zig_backend != .stage2_llvm) return;
+    for ([_]usize{ 32, 64, 66, 1024, 1536, 2048 }) |n| {
+        var original: [4 * MAX_HIDDEN]i8 = undefined;
+        for (0..4) |row| {
+            for (0..n) |i| original[row * n + i] = @intCast(@as(i32, @intCast((i * 17 + row * 7) % 31)) - 15);
+            original[row * n] = 127;
+            original[row * n + 1] = 127;
+            original[row * n + 2] = -128;
+            original[row * n + 3] = -128;
+        }
+        var weights = original;
+        const permutation = pair_permutation.repair(weights[0 .. 4 * n], n, 4);
+        try std.testing.expect(permutation.ready);
+        var x: [MAX_HIDDEN]u8 = undefined;
+        for (0..20) |trial| {
+            for (0..n) |i| x[i] = if (trial == 0) 0 else if (trial == 1) 255 else @intCast((i * 173 + trial * 97) % 256);
+            var expected: [4]i32 = @splat(0);
+            for (0..4) |row| {
+                for (0..n) |i| expected[row] += @as(i32, original[row * n + i]) * x[i];
+            }
+            permutation.apply(x[0..n]);
+            var actual: [4]i32 = undefined;
+            dotI8U8x4ByteSafe(weights[0..n], weights[n .. 2 * n], weights[2 * n .. 3 * n], weights[3 * n .. 4 * n], x[0..n], &actual);
+            try std.testing.expectEqualSlices(i32, &expected, &actual);
+        }
+    }
+}
+
+/// Deterministic test PRNG (xorshift32).
+fn testRand(state: *u32) u32 {
+    var x = state.*;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    state.* = x;
+    return x;
+}
+
+/// Activation patterns for the l1 kernel tests: all-zero, all-255, alternating,
+/// half-block, per-row adversarial vertices (255 exactly where the row's weight
+/// is positive / negative), random vertices and uniform random bytes.
+fn fillTestActivation(x: []u8, trial: usize, row_w: []const i8, rng: *u32) void {
+    for (x, 0..) |*v, i| v.* = switch (trial) {
+        0 => 0,
+        1 => 255,
+        2 => if (i % 2 == 0) 255 else 0,
+        3 => if (i % 64 < 32) 255 else 0,
+        4 => if (row_w[i] > 0) 255 else 0,
+        5 => if (row_w[i] < 0) 255 else 0,
+        6, 7 => if (testRand(rng) & 1 == 0) 255 else 0,
+        else => @truncate(testRand(rng)),
+    };
+}
+
+test "blocked l1 dots equal the scalar dot and the row-major kernels" {
+    if (comptime L1_BLOCK_ROWS == 0) return error.SkipZigTest;
+    const R = L1_BLOCK_ROWS;
+    var rng: u32 = 0x9E3779B9;
+    for ([_]usize{ 64, 128, 256, 1024, 2048 }) |n| {
+        // Two blocked groups, weights with the grouped kernel's outlier shapes
+        // (AVX2 must first pass the four-byte lane proof, exactly as at load).
+        const rows = 2 * R;
+        var original: [2 * 16 * MAX_HIDDEN]i8 = undefined;
+        for (0..rows) |row| {
+            for (0..n) |i| original[row * n + i] = @intCast(@as(i32, @intCast(testRand(&rng) % 23)) - 11);
+            original[row * n] = 110;
+            original[row * n + 32] = 100;
+            original[row * n + 3] = -110;
+            original[row * n + 35] = -100;
+            if (comptime has_avx512vnni) {
+                // VNNI needs no proof: exercise the full i8 range too.
+                original[row * n + 7] = 127;
+                original[row * n + 9] = -128;
+            }
+        }
+        var weights = original;
+        const w = weights[0 .. rows * n];
+        var permutation: pair_permutation.Permutation = .{};
+        if (comptime !has_avx512vnni) {
+            permutation = pair_permutation.repairGrouped(w, n, rows);
+            try std.testing.expect(permutation.ready and permutation.grouped);
+        }
+        var blocked: [2 * 16 * MAX_HIDDEN]i8 align(64) = undefined;
+        blockL1Weights(R, blocked[0 .. rows * n], w, rows, n);
+        var x: [MAX_HIDDEN]u8 align(64) = undefined;
+        for (0..40) |trial| {
+            fillTestActivation(x[0..n], trial, original[(trial % rows) * n ..][0..n], &rng);
+            var expected: [2 * 16]i64 = @splat(0);
+            for (0..rows) |row| {
+                for (0..n) |i| expected[row] += @as(i64, original[row * n + i]) * x[i];
+            }
+            permutation.apply(x[0..n]);
+            for (0..2) |g| {
+                const got: [R]i32 = if (comptime has_avx512vnni)
+                    l1DotsVnni16(blocked[g * R * n ..].ptr, x[0..n])
+                else
+                    l1DotsGroup8(blocked[g * R * n ..].ptr, x[0..n]);
+                for (0..R) |r| {
+                    try std.testing.expectEqual(expected[g * R + r], @as(i64, got[r]));
+                    // The row-major kernel on the same (permuted) weights agrees.
+                    var four: [4]i32 = undefined;
+                    const row = g * R + r - (g * R + r) % 4;
+                    if (comptime has_avx512vnni)
+                        dotI8U8x4(w[row * n ..][0..n], w[(row + 1) * n ..][0..n], w[(row + 2) * n ..][0..n], w[(row + 3) * n ..][0..n], x[0..n], &four)
+                    else
+                        dotI8U8x4GroupSafe(w[row * n ..][0..n], w[(row + 1) * n ..][0..n], w[(row + 2) * n ..][0..n], w[(row + 3) * n ..][0..n], x[0..n], &four);
+                    try std.testing.expectEqual(four[(g * R + r) % 4], got[r]);
+                }
+            }
+        }
+    }
+}
+
+test "blocked l1 forward matches the row-major forward bit-for-bit on the embedded net" {
+    if (comptime L1_BLOCK_ROWS == 0) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const net = try loadDefault(allocator);
+    defer net.destroy(allocator);
+    // The shipped net's shape is covered, so load built the blocked copy.
+    try std.testing.expect(net.l1_blocked.len == net.l1_weights.len);
+    const h = net.hidden;
+    const l2n = net.l2_size;
+    const qaf: f32 = @floatFromInt(net.qa);
+    const l1_dequant: f32 = 256.0 / (@as(f32, @floatFromInt(net.qb)) * qaf * qaf);
+    var rng: u32 = 0x1234567;
+    for (0..net.buckets) |bucket| {
+        const l1b = net.l1_bias[bucket * l2n ..];
+        const row0 = net.l1_weights[bucket * l2n * h ..][0..h];
+        for (0..60) |trial| {
+            var x: [MAX_HIDDEN]u8 align(64) = undefined;
+            fillTestActivation(x[0..h], trial, row0, &rng);
+            if (trial >= 8) {
+                // Realistic sparsity: pairwise products are mostly small or zero.
+                for (x[0..h]) |*v| {
+                    if (testRand(&rng) % 3 == 0) v.* = 0 else v.* >>= @intCast(testRand(&rng) % 8);
+                }
+            }
+            var ref_hl2: [MAX_L2]f32 = undefined;
+            var ref_x = x;
+            // Reference: the untouched serialized weights through the generic kernel.
+            l1ForwardPairs(.generic, net.l1_weights[bucket * l2n * h ..], l1b, ref_x[0..h], ref_hl2[0..l2n], l1_dequant);
+            var hl2: [MAX_L2]f32 align(64) = undefined;
+            if (comptime has_avx512vnni) {
+                l1ForwardBlocked(.vnni16, net.l1_blocked[bucket * l2n * h ..], l1b, x[0..h], hl2[0..l2n], l1_dequant);
+            } else {
+                const permutation = &net.l1_permutations[bucket];
+                try std.testing.expect(permutation.ready and permutation.grouped);
+                permutation.apply(x[0..h]);
+                l1ForwardBlocked(.group8, net.l1_blocked[bucket * l2n * h ..], l1b, x[0..h], hl2[0..l2n], l1_dequant);
+            }
+            for (0..l2n) |k| try std.testing.expectEqual(@as(u32, @bitCast(ref_hl2[k])), @as(u32, @bitCast(hl2[k])));
+        }
+    }
+}
+
+test "bucket table equals bucketIndex for every piece count and bucket count" {
+    var net: Net = undefined;
+    for (1..MAX_BUCKETS + 1) |b| {
+        net.buckets = b;
+        net.initBucketTable();
+        for (0..200) |n| try std.testing.expectEqual(net.bucketIndex(n), net.bucketOf(n));
+    }
+}
+
+test "VEC16-wide accumulator and activation kernels equal their scalar definitions" {
+    // Lane-wise integer kernels at this build's VEC16 (32 lanes on AVX-512BW
+    // targets, 16 on AVX2; the activation pass at ACT_LANES) against
+    // per-element scalar references, including
+    // widths with super-chunk, vector and scalar tails, wrapping sums and
+    // clamp-edge activations.
+    var rng: u32 = 0xC0FFEE11;
+    const widths = [_]usize{ 1024, 2048, 768, 544, 96, 40, 2 };
+    for (widths) |h| {
+        for (0..6) |trial| {
+            var src: [MAX_HIDDEN]i16 align(64) = undefined;
+            var rows8: [6][MAX_HIDDEN]i8 = undefined;
+            var rows16: [4][MAX_HIDDEN]i16 = undefined;
+            for (0..h) |i| src[i] = @bitCast(@as(u16, @truncate(testRand(&rng))));
+            for (&rows8) |*r| for (r[0..h]) |*v| {
+                v.* = @bitCast(@as(u8, @truncate(testRand(&rng))));
+            };
+            for (&rows16) |*r| for (r[0..h]) |*v| {
+                v.* = @bitCast(@as(u16, @truncate(testRand(&rng))));
+            };
+            const na = trial % 4;
+            const ns = (trial * 7 + 1) % 3;
+            // flushInto (i8 rows, the ZQB9 threat path), dst != src and in place.
+            var pend: PendingThreatRowsT(i8) = undefined;
+            pend.initEmpty();
+            var dst: [MAX_HIDDEN]i16 align(64) = undefined;
+            var src_ptr: *const [MAX_HIDDEN]i16 = &src;
+            for (0..na) |k| pend.pushAddFrom(&dst, &src_ptr, h, rows8[k][0..h]);
+            for (0..ns) |k| pend.pushSubFrom(&dst, &src_ptr, h, rows8[3 + k][0..h]);
+            pend.flushInto(&dst, src_ptr, h);
+            var dual_a: [MAX_HIDDEN]i16 align(64) = src;
+            var dual_b: [MAX_HIDDEN]i16 align(64) = undefined;
+            var pend2: PendingThreatRowsT(i8) = undefined;
+            pend2.initEmpty();
+            for (0..na) |k| pend2.pushAdd(&dual_a, h, rows8[k][0..h]);
+            for (0..ns) |k| pend2.pushSub(&dual_a, h, rows8[3 + k][0..h]);
+            pend2.flushIntoDual(&dual_a, &dual_b, &dual_a, h);
+            for (0..h) |i| {
+                var v: i16 = src[i];
+                for (0..na) |k| v +%= rows8[k][i];
+                for (0..ns) |k| v -%= rows8[3 + k][i];
+                try std.testing.expectEqual(v, dst[i]);
+                try std.testing.expectEqual(v, dual_a[i]);
+                try std.testing.expectEqual(v, dual_b[i]);
+            }
+            // fusedRowsDual (i16 HalfKA rows), every (adds, subs) combo it serves.
+            var wchild: [MAX_HIDDEN]i16 align(64) = undefined;
+            var bchild: [MAX_HIDDEN]i16 align(64) = undefined;
+            var bpar: [MAX_HIDDEN]i16 align(64) = undefined;
+            for (0..h) |i| bpar[i] = src[h - 1 - i];
+            const add_rows = [4][]const i16{ rows16[0][0..h], rows16[1][0..h], rows16[0][0..h], rows16[0][0..h] };
+            const sub_rows = [4][]const i16{ rows16[2][0..h], rows16[3][0..h], rows16[2][0..h], rows16[2][0..h] };
+            const badd = [4][]const i16{ rows16[3][0..h], rows16[2][0..h], rows16[3][0..h], rows16[3][0..h] };
+            const bsub = [4][]const i16{ rows16[1][0..h], rows16[0][0..h], rows16[1][0..h], rows16[1][0..h] };
+            inline for (.{ .{ 1, 1 }, .{ 1, 2 }, .{ 2, 2 }, .{ 2, 1 } }) |combo| {
+                fusedRowsDual(&wchild, &src, &bchild, &bpar, h, combo[0], add_rows, badd, combo[1], sub_rows, bsub);
+                for (0..h) |i| {
+                    var w: i16 = src[i];
+                    var b: i16 = bpar[i];
+                    for (0..combo[0]) |k| {
+                        w +%= add_rows[k][i];
+                        b +%= badd[k][i];
+                    }
+                    for (0..combo[1]) |k| {
+                        w -%= sub_rows[k][i];
+                        b -%= bsub[k][i];
+                    }
+                    try std.testing.expectEqual(w, wchild[i]);
+                    try std.testing.expectEqual(b, bchild[i]);
+                }
+            }
+            // Activation: split and combined pairwise products, clamp edges forced.
+            if (h % 2 == 0) {
+                var ha: [MAX_HIDDEN]i16 align(64) = undefined;
+                var ta: [MAX_HIDDEN]i16 align(64) = undefined;
+                for (0..h) |i| {
+                    const edge = [_]i16{ -32768, -1, 0, 1, 254, 255, 256, 32767 };
+                    ha[i] = if (testRand(&rng) % 4 == 0) edge[testRand(&rng) % 8] else @intCast(@as(i32, @intCast(testRand(&rng) % 700)) - 200);
+                    ta[i] = if (testRand(&rng) % 4 == 0) edge[testRand(&rng) % 8] else @intCast(@as(i32, @intCast(testRand(&rng) % 500)) - 250);
+                }
+                var out_split: [MAX_HIDDEN]u8 = undefined;
+                var out_comb: [MAX_HIDDEN]u8 = undefined;
+                var comb: [MAX_HIDDEN]i16 = undefined;
+                for (0..h) |i| comb[i] = ha[i] +% ta[i];
+                // Runtime qa, as from a loaded net (a comptime bound would let
+                // @min narrow the clamp's result type inside the inline kernel).
+                var qa: i32 = 255;
+                _ = &qa;
+                fillPairwiseU8Split(out_split[0 .. h / 2], ha[0..h], ta[0..h], qa);
+                fillPairwiseU8(out_comb[0 .. h / 2], comb[0..h], qa);
+                for (0..h / 2) |i| {
+                    const a: i32 = std.math.clamp(@as(i32, comb[i]), 0, 255);
+                    const b: i32 = std.math.clamp(@as(i32, comb[i + h / 2]), 0, 255);
+                    const want: u8 = @intCast((a * b) >> 8);
+                    try std.testing.expectEqual(want, out_split[i]);
+                    try std.testing.expectEqual(want, out_comb[i]);
+                }
+            }
         }
     }
 }

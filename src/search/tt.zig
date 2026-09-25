@@ -122,18 +122,16 @@ pub const TranspositionTable = struct {
         @prefetch(&self.entries[index(self.mask, key)], .{ .rw = .read, .locality = 3, .cache = .data });
     }
 
-    pub inline fn lookupPtr(self: *const TranspositionTable, key: u64) ?*const Entry {
+    /// Copy the matching entry at the table boundary. The caller owns this
+    /// snapshot; later stores, clears or resize cannot mutate it. This serial
+    /// implementation is not safe for concurrent writers (P2 adds coherence).
+    pub inline fn lookup(self: *const TranspositionTable, key: u64) ?Entry {
         if (self.entries.len == 0) return null;
         const cluster = &self.entries[index(self.mask, key)];
         for (&cluster.entries) |*entry| {
-            if (entry.key == key and entry.depth >= 0) return entry;
+            if (entry.key == key and entry.depth >= 0) return entry.*;
         }
         return null;
-    }
-
-    pub fn lookup(self: *const TranspositionTable, key: u64) ?Entry {
-        const entry = self.lookupPtr(key) orelse return null;
-        return entry.*;
     }
 
     pub fn bestMove(self: *const TranspositionTable, key: u64) ?move_mod.Move {
@@ -330,4 +328,28 @@ test "tt hashfull reports occupancy in permille" {
     }
 
     try std.testing.expect(tt.hashfullPermille() > 0);
+}
+
+test "TT lookup exposes only an owned entry snapshot" {
+    try std.testing.expect(!@hasDecl(TranspositionTable, "lookupPtr"));
+    try std.testing.expect(@typeInfo(@TypeOf(TranspositionTable.lookup)).@"fn".return_type.? == ?Entry);
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Entry));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(Cluster));
+    var table = try TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    const mv = move_mod.Move.init(.e2, .e4, .double_push);
+    _ = table.storeWithOutcome(1234, 5, 17, .exact, mv, -23, true);
+    const saved = table.lookup(1234).?;
+    const expected = Entry{ .key = 1234, .move_bits = @bitCast(mv), .depth = 5, .score = 17, .static_eval = -23, .was_pv = true };
+    try std.testing.expectEqualDeep(expected, saved);
+    _ = table.storeWithOutcome(1234, 6, -40, .lower, null, STATIC_EVAL_NONE, false);
+    try std.testing.expectEqual(@as(i32, -40), table.lookup(1234).?.score);
+    try std.testing.expectEqual(@as(i16, -23), table.lookup(1234).?.static_eval);
+    try std.testing.expectEqualDeep(expected, saved);
+    table.clear();
+    try std.testing.expect(table.lookup(1234) == null);
+    try std.testing.expectEqualDeep(expected, saved);
+    try table.resize(2);
+    try std.testing.expectEqualDeep(expected, saved);
+    try std.testing.expect(table.lookup(1234) == null);
 }

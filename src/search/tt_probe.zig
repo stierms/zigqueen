@@ -27,7 +27,7 @@ pub const Result = struct {
 pub inline fn probeInto(
     result: *Result,
     ctx: *context_mod.SearchContext,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     key: u64,
     required_depth: i16,
     alpha_in: types.Score,
@@ -42,7 +42,7 @@ pub inline fn probeInto(
 pub inline fn probeMainInto(
     result: *Result,
     ctx: *context_mod.SearchContext,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     key: u64,
     required_depth: i16,
     alpha_in: types.Score,
@@ -58,7 +58,7 @@ pub inline fn probeMainInto(
 inline fn probeIntoImpl(
     result: *Result,
     ctx: *context_mod.SearchContext,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     key: u64,
     required_depth: i16,
     alpha_in: types.Score,
@@ -78,18 +78,18 @@ inline fn probeIntoImpl(
     var beta = beta_in;
 
     ctx.noteTtProbe();
-    const entry = table.lookupPtr(key) orelse return;
+    const entry = table.lookup(key) orelse return;
     ctx.noteTtHit();
-    ctx.noteTtHitDetails(entry, table.generation);
+    ctx.noteTtHitDetails(&entry, table.generation);
     const current_generation = entry.generation == table.generation;
 
     if (excluded_move) |excluded| {
-        if (tt.moveFromEntry(entry.*)) |entry_move| {
+        if (tt.moveFromEntry(entry)) |entry_move| {
             if (entry_move == excluded) return;
         }
     }
 
-    result.entry = entry.*;
+    result.entry = entry;
     if (entry.depth < required_depth or score_mod.isMateLike(entry.score)) {
         ctx.noteTtShallowHit();
         ctx.noteTtOrderingOnlyHit();
@@ -151,7 +151,7 @@ inline fn probeIntoImpl(
 /// By-value convenience wrapper (tests and any cold caller).
 pub inline fn probe(
     ctx: *context_mod.SearchContext,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     key: u64,
     required_depth: i16,
     alpha_in: types.Score,

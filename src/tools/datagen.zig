@@ -459,6 +459,7 @@ pub fn runThreaded(
     threads: u32,
     tb_options: TbOptions,
 ) !void {
+    @import("../search/startup.zig").ensure();
     if (threads == 0 or threads > 512) return error.InvalidThreadCount;
     if (games == 0) return error.InvalidGameCount;
     if (nodes_per_move == 0) return error.InvalidNodeLimit;
@@ -563,7 +564,7 @@ const SharedProgress = struct {
 
 const WorkerContext = struct {
     shared: *SharedProgress,
-    net: *search_engine.Net,
+    net: *const search_engine.Net,
     seed: u64,
     first_game: u64,
     last_game: u64, // exclusive

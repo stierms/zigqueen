@@ -50,6 +50,7 @@ pub const Options = struct {
 pub const csv_header = "tag,row,men,stm,hmc,fmn,wP,wN,wB,wR,wQ,bP,bN,bB,bR,bQ,result,old,new,nodes,depth,seldepth\n";
 
 pub fn run(progress: *std.Io.Writer, opts: Options) !void {
+    @import("../search/startup.zig").ensure();
     if (opts.nodes == 0) return error.InvalidNodeLimit;
     if (opts.threads == 0 or opts.threads > 512) return error.InvalidThreadCount;
     if (opts.hash_mb == 0 or opts.hash_mb > 65_536) return error.InvalidHashSize;
@@ -145,7 +146,7 @@ const Shared = struct {
 
 const Worker = struct {
     shared: *Shared,
-    net: *search_engine.Net,
+    net: *const search_engine.Net,
     opts: Options,
     data: []const u8,
     offsets: []const u32,

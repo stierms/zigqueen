@@ -56,7 +56,7 @@ pub fn isLegal(pos: *const position.Position, history: *const repetition.History
 pub fn reconstructFromRootMove(
     pos: *const position.Position,
     history: *const repetition.History,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     root_move: ?move_mod.Move,
     out: *Line,
 ) void {
@@ -66,7 +66,7 @@ pub fn reconstructFromRootMove(
 pub fn reconstructFromRootMoveLimited(
     pos: *const position.Position,
     history: *const repetition.History,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     root_move: ?move_mod.Move,
     out: *Line,
     max_len: usize,
@@ -98,7 +98,7 @@ pub fn reconstructFromRootMoveLimited(
 pub fn reconstruct(
     pos: *const position.Position,
     history: *const repetition.History,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     out: *Line,
 ) void {
     reconstructLimited(pos, history, table, out, MAX_PV);
@@ -107,7 +107,7 @@ pub fn reconstruct(
 pub fn reconstructLimited(
     pos: *const position.Position,
     history: *const repetition.History,
-    table: *const tt.TranspositionTable,
+    table: anytype,
     out: *Line,
     max_len: usize,
 ) void {

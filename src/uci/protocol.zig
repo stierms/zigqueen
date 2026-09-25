@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("../util/search_runtime.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const fen = @import("../core/fen.zig");
@@ -11,6 +12,7 @@ const position = @import("../core/position.zig");
 const repetition = @import("../search/repetition.zig");
 const basin = @import("../search/basin.zig");
 const search_time = @import("../search/time.zig");
+const search_stack = @import("../search/stack.zig");
 const tunables = @import("../search/tunables.zig");
 const worker_mod = @import("worker.zig");
 
@@ -29,7 +31,7 @@ const UciState = struct {
     current_position: position.Position,
     history: repetition.History,
     options: options_mod.Options,
-    worker: worker_mod.Worker,
+    worker: worker_mod.Pool,
 
     fn init(self: *UciState, output: worker_mod.OutputSink) !void {
         const start_position = fen.startpos() catch unreachable;
@@ -41,8 +43,9 @@ const UciState = struct {
             .current_position = start_position,
             .history = history,
             .options = options,
-            .worker = try worker_mod.Worker.initWithOptions(output, options.hash_mb, options.evalOptions()),
+            .worker = try worker_mod.Pool.initWithOptions(output, options.hash_mb, options.evalOptions()),
         };
+        errdefer self.worker.deinit();
         try self.worker.start();
     }
 
@@ -52,7 +55,7 @@ const UciState = struct {
 };
 
 const StdoutOutput = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: runtime.Mutex = .{},
     file: std.fs.File,
 
     fn init() StdoutOutput {
@@ -85,35 +88,26 @@ pub fn run() !void {
         try state.worker.output.print("info string large_pages: {s}\n", .{hugealloc.winStatusText()});
     }
 
-    var line_buffer: [4096]u8 = undefined;
+    // Command input is cold-path storage. A complete game can exceed 4 KiB;
+    // grow here, without adding any allocation to search or repetition tracking.
+    const allocator = std.heap.page_allocator;
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
     const stdin = std.fs.File.stdin();
-
-    var line_len: usize = 0;
-    var byte_buffer: [1]u8 = undefined;
-    var should_quit = false;
-
-    while (!should_quit) {
-        const bytes_read = try stdin.read(&byte_buffer);
-        if (bytes_read == 0) {
-            if (line_len != 0) {
-                const line = std.mem.trimRight(u8, line_buffer[0..line_len], "\r");
-                should_quit = try handleCommand(&state, line);
-            }
-            break;
-        }
-
-        const byte = byte_buffer[0];
-        if (byte == '\n') {
-            const line = std.mem.trimRight(u8, line_buffer[0..line_len], "\r");
-            should_quit = try handleCommand(&state, line);
-            line_len = 0;
-            continue;
-        }
-
-        if (line_len >= line_buffer.len) return error.StreamTooLong;
-        line_buffer[line_len] = byte;
-        line_len += 1;
+    while (try readCommandLine(stdin, &line_buffer, allocator)) |line| {
+        if (try handleCommand(&state, line)) break;
     }
+}
+
+fn readCommandLine(input: anytype, buffer: *std.ArrayList(u8), allocator: std.mem.Allocator) !?[]const u8 {
+    buffer.clearRetainingCapacity();
+    var byte_buffer: [1]u8 = undefined;
+    while (try input.read(&byte_buffer) != 0) {
+        if (byte_buffer[0] == '\n') return std.mem.trimRight(u8, buffer.items, "\r");
+        try buffer.append(allocator, byte_buffer[0]);
+    }
+    if (buffer.items.len == 0) return null;
+    return std.mem.trimRight(u8, buffer.items, "\r");
 }
 
 fn handleCommand(state: *UciState, line: []const u8) !bool {
@@ -142,6 +136,12 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
             return false;
         };
         if (apply_result == .applied) {
+            if (state.options.threads != previous.threads) {
+                state.worker.setThreads(state.options.threads) catch {
+                    state.options = previous;
+                    return false;
+                };
+            }
             if (state.options.hash_mb != previous.hash_mb) {
                 state.worker.resizeHash(state.options.hash_mb) catch {
                     state.options = previous;
@@ -176,7 +176,7 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
                 state.worker.resetEngine();
             }
         } else {
-            try state.worker.output.print("info string unknown option: {s}\n", .{setOptionNameForNotice(line)});
+            try writeUnknownOptionNotice(state.worker.output, setOptionNameForNotice(line));
         }
         return false;
     }
@@ -280,6 +280,17 @@ fn fatalEvalFile(state: *UciState, path: []const u8, reason: []const u8) noretur
     std.process.exit(1);
 }
 
+fn writeUnknownOptionNotice(output: worker_mod.OutputSink, name: []const u8) !void {
+    const prefix = "info string unknown option: ";
+    var buffer: [256]u8 = undefined;
+    const max_name = buffer.len - prefix.len - 1;
+    const text = if (name.len <= max_name)
+        try std.fmt.bufPrint(&buffer, prefix ++ "{s}\n", .{name})
+    else
+        try std.fmt.bufPrint(&buffer, prefix ++ "{s}...\n", .{name[0 .. max_name - 3]});
+    try output.writeAll(text);
+}
+
 fn setOptionNameForNotice(line: []const u8) []const u8 {
     var tokens = std.mem.tokenizeScalar(u8, line, ' ');
     _ = tokens.next() orelse return "<unknown>";
@@ -296,7 +307,7 @@ fn setOptionNameForNotice(line: []const u8) []const u8 {
 fn handleGo(state: *UciState, line: []const u8) !void {
     state.worker.stopAndWait();
     const command = try parseGoCommand(line, &state.current_position);
-    state.worker.startSearch(.{
+    try state.worker.startSearch(.{
         .position = state.current_position,
         .history = state.history,
         .limits = command.limits,
@@ -458,7 +469,7 @@ pub fn parsePositionCommand(line: []const u8) UciError!PositionCommandResult {
             const mv = findLegalMoveByUci(&pos, move_text) orelse return error.InvalidMove;
             var state = make_unmake.StateInfo{};
             _ = make_unmake.makeMove(&pos, mv, &state);
-            history.push(pos.zobrist_key);
+            appendGameHistory(&history, pos.zobrist_key, pos.halfmove_clock);
         }
     }
 
@@ -466,6 +477,22 @@ pub fn parsePositionCommand(line: []const u8) UciError!PositionCommandResult {
         .position = pos,
         .history = history,
     };
+}
+
+// Keep ordinary histories unchanged, but never consume the tail needed by a
+// full search/PV. Only game ingestion compacts: search push/pop stays untouched.
+// At a nonterminal root halfmove_clock < 100, so its entire reversible window
+// survives. At >= 100 the engine immediately adjudicates a rule-50 draw; retaining
+// the latest 100 ancestors also suffices after any later pawn move or capture.
+fn appendGameHistory(history: *repetition.History, key: u64, halfmove_clock: u16) void {
+    const max_game_history = repetition.MAX_HISTORY - search_stack.MAX_PLY;
+    comptime std.debug.assert(max_game_history > 100);
+    if (history.count >= max_game_history) {
+        const keep = @min(history.count, @min(@as(usize, halfmove_clock), 100));
+        std.mem.copyForwards(u64, history.keys[0..keep], history.keys[history.count - keep .. history.count]);
+        history.count = keep;
+    }
+    history.push(key);
 }
 
 fn findLegalMoveByUci(pos: *const position.Position, move_text: []const u8) ?move_mod.Move {
@@ -487,7 +514,7 @@ fn moveMatchesUci(mv: move_mod.Move, move_text: []const u8) bool {
 }
 
 const TestOutput = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: runtime.Mutex = .{},
     buffer: [8192]u8 = [_]u8{0} ** 8192,
     len: usize = 0,
 
@@ -689,7 +716,7 @@ test "go infinite is interrupted by stop" {
     defer state.deinit();
 
     try std.testing.expect(!try handleCommand(&state, "go infinite"));
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    runtime.Thread.sleep(5 * std.time.ns_per_ms);
     try std.testing.expect(!try handleCommand(&state, "stop"));
 
     const out = output.contents();
@@ -764,10 +791,10 @@ test "basin setoption is tuning-only and LMR rebuilds only for shape" {
 
     try std.testing.expect(!try handleCommand(&state, "setoption name BasinRfpLinear value 91"));
     if (build_options.tuning) {
-        try std.testing.expectEqual(@as(i32, 91), state.worker.engine.basin_config.params.rfp_linear);
-        const rebuilds = state.worker.engine.basin_config.lmr_rebuild_count;
+        try std.testing.expectEqual(@as(i32, 91), state.worker.coordinator.engine.basin_config.params.rfp_linear);
+        const rebuilds = state.worker.coordinator.engine.basin_config.lmr_rebuild_count;
         try std.testing.expect(!try handleCommand(&state, "setoption name BasinLmrQuietBase value 812"));
-        try std.testing.expectEqual(rebuilds + 1, state.worker.engine.basin_config.lmr_rebuild_count);
+        try std.testing.expectEqual(rebuilds + 1, state.worker.coordinator.engine.basin_config.lmr_rebuild_count);
     } else {
         try std.testing.expectEqualStrings("info string unknown option: BasinRfpLinear\n", output.contents());
     }
@@ -806,4 +833,173 @@ test "a second searchmoves replaces the earlier move set" {
     try std.testing.expectEqual(@as(usize, 1), root_moves.count);
     var buffer: [5]u8 = undefined;
     try std.testing.expectEqualStrings("d2d4", root_moves.slice()[0].toUci(&buffer));
+}
+
+test "unknown option echo cannot terminate command handling on long raw names" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    // The option parser normalizes internal spaces into a short unknown name,
+    // while the diagnostic echoes the raw name. A single overlong token is
+    // rejected earlier, so it would not reproduce the old print-buffer failure.
+    const command = "setoption name No" ++ (" " ** 1000) ++ "Such value 1";
+    try std.testing.expect(!try handleCommand(&state, command));
+    try std.testing.expect(!try handleCommand(&state, "isready"));
+    const out = output.contents();
+    try std.testing.expect(std.mem.startsWith(u8, out, "info string unknown option: No"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "...\nreadyok\n"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\n"));
+    try std.testing.expectEqual(@as(usize, 256 + "readyok\n".len), out.len);
+}
+
+const ConcurrentLineProducer = struct {
+    output: worker_mod.OutputSink,
+    start: *runtime.ResetEvent,
+    ready: runtime.ResetEvent = .{},
+    failure: ?anyerror = null,
+    search: bool,
+
+    fn run(self: *@This()) void {
+        self.ready.set();
+        self.start.timedWait(5 * std.time.ns_per_s) catch |err| {
+            self.failure = err;
+            return;
+        };
+        self.emitLines() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn emitLines(self: *@This()) !void {
+        const info = @import("info.zig");
+        const mv = move_mod.Move.init(.a7, .a8, .promo_queen);
+        for (0..128) |_| {
+            if (self.search) {
+                try info.writeIterationLine(self.output, .{
+                    .depth = 8,
+                    .seldepth = 9,
+                    .score = -42,
+                    .nodes = 123,
+                    .time_ms = 1000,
+                    .hashfull = 12,
+                    .best_move = mv,
+                    .pv = &.{mv},
+                });
+                try info.writeCurrMoveLine(self.output, .{ .depth = 8, .move = mv, .move_number = 1, .time_ms = 3000 });
+                try info.writeBestMoveLine(self.output, mv);
+            } else {
+                try self.output.writeAll("readyok\n");
+            }
+        }
+    }
+};
+
+test "two producers preserve complete UCI lines through the production output mutex" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const file = try temporary.dir.createFile("uci-lines", .{ .read = true });
+    defer file.close();
+    // Exercise the real stdout sink and its mutex, substituting only the fd.
+    var output = StdoutOutput{ .file = file };
+    var start = runtime.ResetEvent{};
+    var search = ConcurrentLineProducer{ .output = output.sink(), .start = &start, .search = true };
+    var protocol = ConcurrentLineProducer{ .output = output.sink(), .start = &start, .search = false };
+    const search_thread = try runtime.Thread.spawn(.{}, ConcurrentLineProducer.run, .{&search});
+    var search_joined = false;
+    defer {
+        if (!search_joined) {
+            start.set();
+            search_thread.join();
+        }
+    }
+    const protocol_thread = try runtime.Thread.spawn(.{}, ConcurrentLineProducer.run, .{&protocol});
+    var protocol_joined = false;
+    defer {
+        if (!protocol_joined) {
+            start.set();
+            protocol_thread.join();
+        }
+    }
+    try search.ready.timedWait(5 * std.time.ns_per_s);
+    try protocol.ready.timedWait(5 * std.time.ns_per_s);
+    start.set();
+    search_thread.join();
+    search_joined = true;
+    protocol_thread.join();
+    protocol_joined = true;
+    if (search.failure) |err| return err;
+    if (protocol.failure) |err| return err;
+    try file.seekTo(0);
+    const bytes = try file.readToEndAlloc(std.testing.allocator, 128 * 256);
+    defer std.testing.allocator.free(bytes);
+    const expected = [_][]const u8{
+        "info depth 8 seldepth 9 score cp -42 nodes 123 time 1000 nps 123 hashfull 12 pv a7a8q",
+        "info depth 8 currmove a7a8q currmovenumber 1 time 3000",
+        "bestmove a7a8q",
+        "readyok",
+    };
+    var counts = [_]usize{0} ** expected.len;
+    var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        var found = false;
+        for (expected, 0..) |wanted, i| {
+            if (std.mem.eql(u8, line, wanted)) {
+                counts[i] += 1;
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+    for (counts) |count| try std.testing.expectEqual(@as(usize, 128), count);
+    try std.testing.expectEqual(@as(usize, 512), std.mem.count(u8, bytes, "\n"));
+}
+
+test "command reader grows beyond 4096 bytes and preserves line boundaries" {
+    const text = "x" ** 5000 ++ "\r\n\nlast";
+    var input = std.io.fixedBufferStream(text);
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(text[0..5000], (try readCommandLine(&input, &buffer, std.testing.allocator)).?);
+    try std.testing.expectEqualStrings("", (try readCommandLine(&input, &buffer, std.testing.allocator)).?);
+    try std.testing.expectEqualStrings("last", (try readCommandLine(&input, &buffer, std.testing.allocator)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try readCommandLine(&input, &buffer, std.testing.allocator));
+}
+
+test "long position replay reserves search history and preserves the final position" {
+    const line = "position startpos moves " ++ "g1f3 g8f6 f3g1 f6g8 " ** 400 ++ "e2e4";
+    const parsed = try parsePositionCommand(line);
+    const expected = try parsePositionCommand("position startpos moves e2e4");
+    try std.testing.expectEqual(expected.position.zobrist_key, parsed.position.zobrist_key);
+    try std.testing.expectEqual(@as(u16, 0), parsed.position.halfmove_clock);
+    try std.testing.expectEqual(@as(u16, 801), parsed.position.fullmove_number);
+    try std.testing.expect(!parsed.history.isRepetition(parsed.position.halfmove_clock));
+    try std.testing.expect(parsed.history.count <= repetition.MAX_HISTORY - search_stack.MAX_PLY);
+    var history = parsed.history;
+    const root_count = history.count;
+    for (0..search_stack.MAX_PLY) |i| history.push(@intCast(i));
+    for (0..search_stack.MAX_PLY) |_| history.pop();
+    try std.testing.expectEqual(root_count, history.count);
+    try std.testing.expectEqual(parsed.position.zobrist_key, history.current());
+}
+
+test "game history compaction preserves every nonterminal repetition query" {
+    // All possible nonterminal halfmove windows, including a zeroing move.
+    for (0..100) |clock| {
+        var original = repetition.History{};
+        const limit = repetition.MAX_HISTORY - search_stack.MAX_PLY;
+        for (0..limit) |i| original.push(@intCast(i % 12));
+        var compacted = original;
+        const key = @as(u64, @intCast(limit % 12));
+        original.push(key);
+        appendGameHistory(&compacted, key, @intCast(clock));
+        try std.testing.expectEqual(clock + 1, compacted.count);
+        try std.testing.expectEqual(original.currentPriorOccurrenceCount(@intCast(clock)), compacted.currentPriorOccurrenceCount(@intCast(clock)));
+        try std.testing.expectEqual(original.currentPreviousCycleChildKey(@intCast(clock)), compacted.currentPreviousCycleChildKey(@intCast(clock)));
+        try std.testing.expectEqual(original.isClaimableCurrentRepetition(@intCast(clock)), compacted.isClaimableCurrentRepetition(@intCast(clock)));
+        // A reversible child extends the window by one, with unchanged parity.
+        try std.testing.expectEqual(original.isRepetitionForKey((key + 1) % 12, @intCast(clock + 1)), compacted.isRepetitionForKey((key + 1) % 12, @intCast(clock + 1)));
+    }
 }

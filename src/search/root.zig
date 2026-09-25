@@ -5,6 +5,7 @@ const context_mod = @import("context.zig");
 const eval_cache_mod = @import("eval_cache.zig");
 const history_mod = @import("history.zig");
 const legal = @import("../movegen/legal.zig");
+const attacks = @import("../movegen/attacks.zig");
 const make_unmake = @import("../movegen/make_unmake.zig");
 const move_mod = @import("../core/move.zig");
 const node_context = @import("node_context.zig");
@@ -151,7 +152,7 @@ const StagedMoveCounts = struct {
 
 pub fn searchDepth(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     depth: u16,
 ) IterationResult {
@@ -160,7 +161,7 @@ pub fn searchDepth(
 
 pub fn searchDepthWindow(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     depth: u16,
     alpha_in: types.Score,
@@ -199,7 +200,8 @@ pub fn searchDepthWindow(
     const root_move_counts = if (ctx.recordMoveOrder()) stagedMoveCounts(&moves) else StagedMoveCounts{};
     if (ctx.recordMoveOrder()) ctx.noteStagedMainMoveList(moves.count, root_move_counts.quiet, root_move_counts.tactical, containsMove(&moves, tt_move));
     const root_cont = history_mod.ContContext{}; // root has no predecessor moves
-    ordering.scoreMoves(pos, &moves, tt_move, .{}, null, resources.history, &root_cont, &scores, null);
+    const attacked = attacks.attackedSquares(pos, pos.side_to_move.other());
+    ordering.scoreMoves(pos, &moves, tt_move, .{}, null, resources.history, &root_cont, attacked, &scores, null);
     var previous_hint_bonuses: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     applyRootHintBonuses(&moves, &scores, previous_root_hints, &previous_hint_bonuses);
     var root_order = traceRootOrder(moves, scores, previous_hint_bonuses, tt_move);
@@ -242,7 +244,7 @@ pub fn searchDepthWindow(
         const cont_piece = moving_piece.pieceType();
         const moved_piece_type = if (is_quiet_root) cont_piece else null;
         const root_history_score = if (is_quiet_root and index >= 2)
-            resources.history.score(pos.side_to_move, cont_piece, mv.to)
+            resources.history.score(pos.side_to_move, cont_piece, mv.to, history_mod.quietBucket(attacked, mv))
         else
             0;
         const child_key = make_unmake.makeMove(pos, mv, &entry.state);
@@ -444,7 +446,7 @@ fn log2Bonus(value: u64) i32 {
 
 fn negamax(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     depth: u16,
     alpha_in: types.Score,
@@ -458,7 +460,7 @@ fn negamax(
     // Kills the second-per-node isInCheck: every node paid it once as the
     // parent's gives_check and again here.
     in_check_hint: ?bool,
-) types.Score {
+) align(64) types.Score { // align(64): pins hot entry placement (layout stability, not call speed)
     // A depth-0 negamax entry and the qsearch entry immediately beneath it are
     // one visited position. Dispatch before bookkeeping so qsearch performs the
     // sole node count, stop poll, seldepth observation, and draw check.
@@ -466,7 +468,7 @@ fn negamax(
         return qsearch.searchFromHorizon(ctx, resources, pos, alpha_in, beta_in, ply, in_check_hint);
     }
     const basin_config = if (comptime build_options.tuning) ctx.basin_config else {};
-    if (ctx.noteNode()) return 0;
+    if (if (comptime @hasField(@TypeOf(resources), "execution")) resources.execution.noteNode(ctx, false) else ctx.noteNode()) return 0;
     ctx.observePly(ply);
     if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
     if (ply_limit.fallback(ctx, resources.evaluator, pos, ply, in_check_hint)) |score| return score;
@@ -493,12 +495,17 @@ fn negamax(
     );
 
     // Syzygy WDL probe (no-op unless SyzygyPath is set): a table hit is ground
-    // truth — return it. probeWdl itself gates on piece count, castling, and a
-    // fresh rule-50 clock; singular verification nodes are excluded so the
-    // exclusion window still searches.
+    // truth — return it. The inline scope gate (piece count, castling, fresh
+    // rule-50 clock) rejects out-of-scope nodes before any call, and the
+    // covered probe rechecks it under the lease. Nested rather than through
+    // the optional-returning probeWdl so a rejection branches straight past
+    // the probe. Singular verification nodes are excluded so the exclusion
+    // window still searches.
     if (excluded_move == null) {
-        if (syzygy.probeWdl(pos)) |wdl| {
-            return syzygy.wdlScore(wdl, ply);
+        if (ctx.tablebases) |job| {
+            if (job.wdlInScope(pos)) {
+                if (job.probeCoveredWdl(pos)) |wdl| return syzygy.wdlScore(wdl, ply);
+            }
         }
     }
     // Pointer into the local `probe` value, NOT another 32-byte copy: the old
@@ -582,7 +589,8 @@ fn negamax(
                 if (stack_entry.prev_move) |previous_move| {
                     if (ctx.stack.entry(ply - 1).static_eval) |parent_eval| {
                         const gain = -parent_eval - evaluated;
-                        resources.history.adjustMain(pos.side_to_move.other(), previous_piece, previous_move.to, shallow_arms.evalPolicyBonus(gain));
+                        // Frozen R2.2: this tuning-only parent update remains unconditioned.
+                        resources.history.adjustMain(pos.side_to_move.other(), previous_piece, previous_move.to, shallow_arms.evalPolicyBonus(gain), 0);
                     }
                 }
             }
@@ -704,7 +712,7 @@ fn negamax(
     // capture that beats beta+margin at reduced depth cuts the node now.
     if (PROBCUT_ENABLED and !node_ctx.pv_node and !in_check and excluded_move == null) {
         if (static_eval) |evaluated| {
-            if (tryProbCut(ctx, resources, pos, search_depth, beta, ply, tt_entry, tt_move, evaluated, raw_static_eval.?)) |probcut_score| {
+            if (tryProbCut(ctx, resources, pos, search_depth, beta, ply, node_ctx, tt_entry, tt_move, evaluated, raw_static_eval.?)) |probcut_score| {
                 return probcut_score;
             }
             if (ctx.stopped) return 0;
@@ -747,6 +755,7 @@ fn negamax(
         break :blk candidate;
     };
     var list_ready = false;
+    var attacked: u64 = undefined;
     var singular_plan: ?SingularPlan = null;
     var singular_test_applied = false;
     if (tt_first_move == null) {
@@ -754,10 +763,11 @@ fn negamax(
         if (moves.count == 0) {
             return if (in_check) -score_mod.MATE_SCORE + @as(types.Score, @intCast(ply)) else ctx.drawScore(pos.side_to_move);
         }
-        scoreGeneratedMoves(ctx, pos, &moves, tt_move, stack_entry, countermove, resources.history, &cont, &scores, &capture_see_scores, &staged_counts);
+        attacked = attacks.attackedSquares(pos, pos.side_to_move.other());
+        scoreGeneratedMoves(ctx, pos, &moves, tt_move, stack_entry, countermove, resources.history, &cont, attacked, &scores, &capture_see_scores, &staged_counts);
         list_ready = true;
         const singular_attempt = if (!in_check)
-            trySingularPlan(ctx, resources, pos, search_depth, ply, node_ctx, tt_entry, tt_move, excluded_move, &moves, &capture_see_scores, stack_entry, countermove, beta)
+            trySingularPlan(ctx, resources, pos, search_depth, ply, node_ctx, tt_entry, tt_move, excluded_move, &moves, &capture_see_scores, stack_entry, countermove, beta, attacked)
         else
             SingularAttempt{};
         singular_test_applied = singular_attempt.applied;
@@ -776,9 +786,12 @@ fn negamax(
     var best_score: types.Score = -qsearch.INF;
     var alpha_raises: i32 = 0;
     const child_entry = ctx.stack.entry(ply + 1);
-    var quiets_tried: [move_mod.MAX_MOVES]move_mod.Move = undefined;
+    // Per-ply slot in the thread's context instead of two MAX_MOVES arrays in
+    // this frame (see SearchContext.tried_quiets for why no other frame can
+    // write this slot while the loop below is running).
+    const tried_quiets = ctx.claimTriedQuiets(ply);
+    defer ctx.releaseTriedQuiets(ply);
     var quiet_count: usize = 0;
-    var quiet_pieces_tried: [move_mod.MAX_MOVES]piece.PieceType = undefined;
     var searched_quiet_count: usize = 0;
     var moves_searched: usize = 0;
 
@@ -801,7 +814,8 @@ fn negamax(
                 // the eager path does, replay the first pick (the TT move,
                 // by construction the unique 1e6 score) and continue at slot 1.
                 legal.generateHinted(pos, &moves, in_check);
-                scoreGeneratedMoves(ctx, pos, &moves, tt_move, stack_entry, countermove, resources.history, &cont, &scores, &capture_see_scores, &staged_counts);
+                attacked = attacks.attackedSquares(pos, pos.side_to_move.other());
+                scoreGeneratedMoves(ctx, pos, &moves, tt_move, stack_entry, countermove, resources.history, &cont, attacked, &scores, &capture_see_scores, &staged_counts);
                 const first = move_picker.next(0);
                 std.debug.assert(first == tt_first_move.?);
                 list_ready = true;
@@ -827,22 +841,22 @@ fn negamax(
         // EBF ladder): the ordering already ranks by the combined signal, but LMR only
         // saw main history — cont-hist is the stronger of the two for "this quiet is
         // known-good in this line" and lets reductions track evidence, not blindness.
-        // Both tables are keyed by the mover's mailbox piece rather than by
-        // (side, piece_type): identical entries (Piece == side*6 + piece_type,
-        // and every generated move is by the side to move), one dependent L1
-        // load fewer in front of the continuation-history read. `cont_piece` is
-        // still needed for the child's conthist context, but off this chain.
+        // TT-stage diagnostics and cutoff writes share the two-query key.
+        const history_bucket: u2 = if (is_quiet or build_options.tuning or basin.defaults.lmr_noisy_history_coeff != 423)
+            (if (tt_stage) history_mod.ttQuietBucket(pos, mv) else history_mod.quietBucket(attacked, mv))
+        else
+            0;
         const quiet_history_score: i32 = if (is_quiet) blk: {
             // Explicit row pointer: a runtime piece index through the returned
             // pointer materialises a 128-byte stack copy of the row first (the
             // store-to-load-forwarding defect class HistoryTable.score documents).
-            const quiet_row: *const [64]i16 = &resources.history.quietPieceRows()[@intFromEnum(moving_piece)];
+            const quiet_row: *const [64]i16 = &resources.history.quietPlane(pos.side_to_move)[history_bucket][@intFromEnum(cont_piece)];
             break :blk @as(i32, quiet_row[mv.to.index()]) +
                 cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
         } else 0;
         const basin_history_score: i32 = if (comptime build_options.tuning or basin.defaults.lmr_noisy_history_coeff != 423) blk: {
             if (is_quiet) break :blk quiet_history_score;
-            const noisy_row: *const [64]i16 = &resources.history.quietPieceRows()[@intFromEnum(moving_piece)];
+            const noisy_row: *const [64]i16 = &resources.history.quietPlane(pos.side_to_move)[history_bucket][@intFromEnum(cont_piece)];
             break :blk @as(i32, noisy_row[mv.to.index()]) +
                 cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
         } else quiet_history_score;
@@ -1080,7 +1094,7 @@ fn negamax(
                 }
                 ctx.notePvsScout();
                 shallow_arms.setParentLmrReduction(child_entry, reduction);
-                score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.scoutChild(), null, gives_check);
+                score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.reducedChild(reduction), null, gives_check);
                 if (!ctx.stopped and reduction > 0 and score > alpha) {
                     var research_depth: i32 = child_base_depth;
                     const deeper_threshold = if (comptime build_options.tuning) basin_config.params.deeperThreshold(child_base_depth) else basin.deeperThreshold(child_base_depth);
@@ -1163,14 +1177,14 @@ fn negamax(
             }
             if (excluded_move == null) {
                 if (moved_piece_type) |quiet_piece_type| {
-                    applyQuietCutoffLearning(resources.history, if (comptime build_options.tuning) &basin_config.params else {}, stack_entry, &cont, pos.side_to_move, mv, quiet_piece_type, quiets_tried[0..quiet_count], quiet_pieces_tried[0..quiet_count], search_depth);
+                    applyQuietCutoffLearning(resources.history, if (comptime build_options.tuning) &basin_config.params else {}, stack_entry, &cont, pos.side_to_move, mv, quiet_piece_type, tried_quiets.moves[0..quiet_count], tried_quiets.pieces[0..quiet_count], search_depth, history_bucket, if (list_ready) attacked else null);
                 }
             }
             break;
         }
 
         if (moved_piece_type) |quiet_piece_type| {
-            recordTriedQuiet(&quiets_tried, &quiet_pieces_tried, &quiet_count, mv, quiet_piece_type);
+            recordTriedQuiet(&tried_quiets.moves, &tried_quiets.pieces, &quiet_count, mv, quiet_piece_type);
         }
     }
 
@@ -1211,6 +1225,7 @@ fn scoreGeneratedMoves(
     countermove: ?move_mod.Move,
     history: *const @import("history.zig").HistoryTable,
     cont: *const @import("history.zig").ContContext,
+    attacked: u64,
     scores: *[move_mod.MAX_MOVES]i32,
     capture_see_scores: *[move_mod.MAX_MOVES]i32,
     staged_counts: *StagedMoveCounts,
@@ -1230,12 +1245,13 @@ fn scoreGeneratedMoves(
         countermove,
         history,
         cont,
+        attacked,
         scores,
         capture_see_scores,
     );
 }
 
-fn nodeGivesCheck(info: *legal.CheckInfo, pos: *const position.Position, mv: move_mod.Move) bool {
+fn nodeGivesCheck(info: *legal.CheckInfo, pos: *const position.Position, mv: move_mod.Move) align(64) bool { // align(64): pins hot entry placement (layout stability, not call speed)
     // Replaces the per-move predicate / make-unmake round trip (R7's density
     // dispatch): one lazily built per-node context, exact (see legal.CheckInfo).
     info.ensure(pos);
@@ -1289,11 +1305,12 @@ fn canTrySingular(
 /// bridge (probcut_beta - static_eval).
 fn tryProbCut(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     search_depth: u16,
     beta: types.Score,
     ply: usize,
+    node_ctx: node_context.NodeContext,
     tt_entry: ?*const tt_mod.Entry,
     tt_move: ?move_mod.Move,
     corrected_eval: types.Score,
@@ -1337,7 +1354,7 @@ fn tryProbCut(
         // cheap qsearch pre-verification, then the reduced-depth confirmation
         var score = -qsearch.search(ctx, resources, pos, -probcut_beta, -probcut_beta + 1, ply + 1, null);
         if (!ctx.stopped and score >= probcut_beta) {
-            const verify_ctx = node_context.NodeContext.fromWindow(-probcut_beta, -probcut_beta + 1, true);
+            const verify_ctx = node_ctx.probCutChild();
             score = -negamax(ctx, resources, pos, search_depth - PROBCUT_DEPTH_REDUCTION, -probcut_beta, -probcut_beta + 1, ply + 1, true, verify_ctx, null, null);
         }
         ctx.repetition.pop();
@@ -1353,7 +1370,7 @@ fn tryProbCut(
 
 fn trySingularPlan(
     ctx: *context_mod.SearchContext,
-    resources: context_mod.Resources,
+    resources: anytype,
     pos: *position.Position,
     search_depth: u16,
     ply: usize,
@@ -1366,6 +1383,7 @@ fn trySingularPlan(
     stack_entry: anytype,
     countermove: ?move_mod.Move,
     beta: types.Score,
+    attacked: u64,
 ) SingularAttempt {
     if (!canTrySingular(search_depth, node_ctx, tt_entry, tt_move, excluded_move)) return .{};
 
@@ -1383,6 +1401,7 @@ fn trySingularPlan(
         stack_entry,
         countermove,
         resources.history,
+        attacked,
     );
     if (shallow_arms.singularWeakGateEnabled()) {
         if (!alternative_quality.isWeak()) return .{};
@@ -1438,6 +1457,7 @@ fn classifySingularAlternatives(
     stack_entry: anytype,
     countermove: ?move_mod.Move,
     history: *const @import("history.zig").HistoryTable,
+    attacked: u64,
 ) SingularAlternativeQuality {
     var quality = SingularAlternativeQuality{};
     for (moves.slice(), 0..) |mv, idx| {
@@ -1462,7 +1482,7 @@ fn classifySingularAlternatives(
             if (candidate == mv) quality.has_killer_or_countermove = true;
         }
 
-        const history_score = lmrHistoryScore(history, pos, mv);
+        const history_score = lmrHistoryScore(history, pos, mv, attacked);
         if (history_score > quality.strongest_history) quality.strongest_history = history_score;
         if (history_score > 0) quality.positive_history_count += 1;
     }
@@ -1477,11 +1497,11 @@ fn singularVerificationDepth(search_depth: u16) u16 {
     return @max(@as(u16, 1), search_depth / 2);
 }
 
-fn lmrHistoryScore(history: *const @import("history.zig").HistoryTable, pos: *const position.Position, mv: move_mod.Move) i32 {
+fn lmrHistoryScore(history: *const @import("history.zig").HistoryTable, pos: *const position.Position, mv: move_mod.Move, attacked: u64) i32 {
     if (mv.isCapture() or mv.isPromotion()) return 0;
     const moving_piece = pos.pieceAt(mv.from);
     const color = moving_piece.color() orelse return 0;
-    return history.score(color, moving_piece.pieceType(), mv.to);
+    return history.score(color, moving_piece.pieceType(), mv.to, history_mod.quietBucket(attacked, mv));
 }
 
 fn classifyMoveOrderBucket(
@@ -1543,16 +1563,18 @@ fn applyQuietCutoffLearning(
     quiets: []const move_mod.Move,
     quiet_pieces: []const piece.PieceType,
     depth: u16,
+    bucket: u2,
+    attacked: ?u64,
 ) void {
     rememberKiller(stack_entry, mv);
     if (comptime build_options.tuning) {
-        history.bonusWithPolicy(basin_policy, side, moved_piece_type, mv.to, depth);
+        history.bonusWithPolicy(basin_policy, side, moved_piece_type, mv.to, depth, bucket);
         history.contBonusWithPolicy(basin_policy, cont, history_mod.contKey(side, moved_piece_type, mv.to), depth);
     } else {
-        history.bonus(side, moved_piece_type, mv.to, depth);
+        history.bonus(side, moved_piece_type, mv.to, depth, bucket);
         history.contBonus(cont, history_mod.contKey(side, moved_piece_type, mv.to), depth);
     }
-    penalizeFailedQuiets(history, basin_policy, side, quiets, quiet_pieces, depth);
+    penalizeFailedQuiets(history, basin_policy, side, quiets, quiet_pieces, depth, attacked);
     for (quiets, quiet_pieces) |quiet, quiet_piece| {
         if (comptime build_options.tuning)
             history.contPenalizeWithPolicy(basin_policy, cont, history_mod.contKey(side, quiet_piece, quiet.to), depth)
@@ -1620,13 +1642,18 @@ fn penalizeFailedQuiets(
     quiets: []const move_mod.Move,
     quiet_pieces: []const piece.PieceType,
     depth: u16,
+    attacked: ?u64,
 ) void {
     std.debug.assert(quiets.len == quiet_pieces.len);
+    const map = attacked orelse {
+        std.debug.assert(quiets.len == 0); // TT-stage cutoff: no failed quiets, no map.
+        return;
+    };
     for (quiets, quiet_pieces) |quiet, quiet_piece| {
         if (comptime build_options.tuning)
-            history.penalizeWithPolicy(basin_policy, side, quiet_piece, quiet.to, depth)
+            history.penalizeWithPolicy(basin_policy, side, quiet_piece, quiet.to, depth, history_mod.quietBucket(map, quiet))
         else
-            history.penalize(side, quiet_piece, quiet.to, depth);
+            history.penalize(side, quiet_piece, quiet.to, depth, history_mod.quietBucket(map, quiet));
     }
 }
 
@@ -1640,11 +1667,11 @@ test "penalize failed quiets updates only the provided piece-to entries" {
     };
     const quiet_pieces = [_]piece.PieceType{ .pawn, .knight };
 
-    penalizeFailedQuiets(&history_table, if (comptime build_options.tuning) &default_basin_policy else {}, .white, &quiets, &quiet_pieces, 5);
+    penalizeFailedQuiets(&history_table, if (comptime build_options.tuning) &default_basin_policy else {}, .white, &quiets, &quiet_pieces, 5, 0);
 
-    try std.testing.expect(history_table.score(.white, .pawn, .a3) < 0);
-    try std.testing.expect(history_table.score(.white, .knight, .f3) < 0);
-    try std.testing.expectEqual(@as(i32, 0), history_table.score(.white, .pawn, .e4));
+    try std.testing.expect(history_table.score(.white, .pawn, .a3, 0) < 0);
+    try std.testing.expect(history_table.score(.white, .knight, .f3, 0) < 0);
+    try std.testing.expectEqual(@as(i32, 0), history_table.score(.white, .pawn, .e4, 0));
 }
 
 test "root hint bonuses prefer previously expensive promising moves" {
@@ -1666,6 +1693,7 @@ test "root hint bonuses prefer previously expensive promising moves" {
 }
 
 test "depth-zero negamax counts one honest horizon node" {
+    @import("startup.zig").ensure();
     const fen = @import("../core/fen.zig");
     const history = @import("history.zig");
     const rfp_hint_mod = @import("rfp_hint.zig");
@@ -1712,6 +1740,7 @@ test "depth-zero negamax counts one honest horizon node" {
 }
 
 test "reverse futility does not publish a heuristic tt bound" {
+    @import("startup.zig").ensure();
     const fen = @import("../core/fen.zig");
     const history = @import("history.zig");
     const rfp_hint_mod = @import("rfp_hint.zig");
@@ -1744,6 +1773,7 @@ test "reverse futility does not publish a heuristic tt bound" {
 }
 
 test "reverse futility hint reuses on second probe without evaluating" {
+    @import("startup.zig").ensure();
     const fen = @import("../core/fen.zig");
     const history = @import("history.zig");
     const rfp_hint_mod = @import("rfp_hint.zig");
@@ -1782,6 +1812,7 @@ test "reverse futility hint reuses on second probe without evaluating" {
 }
 
 test "basin futility searches a first quiet move before pruning" {
+    @import("startup.zig").ensure();
     const fen = @import("../core/fen.zig");
     const history = @import("history.zig");
     const rfp_hint_mod = @import("rfp_hint.zig");
@@ -1846,7 +1877,7 @@ test "ProbCut stores raw rather than corrected static eval" {
 
     const raw: types.Score = -321;
     const corrected: types.Score = 1000;
-    const cutoff = tryProbCut(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, PROBCUT_MIN_DEPTH, -10_000, 0, null, null, corrected, raw);
+    const cutoff = tryProbCut(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, PROBCUT_MIN_DEPTH, -10_000, 0, node_context.NodeContext.fromWindow(-10_001, -10_000, true), null, null, corrected, raw);
     try std.testing.expect(cutoff != null);
     try std.testing.expectEqual(@as(i16, @intCast(raw)), table.lookup(pos.zobrist_key).?.static_eval);
 }
@@ -1886,11 +1917,11 @@ test "quiet cutoff learning updates killer history and countermove" {
     const tried_pieces = [_]piece.PieceType{.knight};
     const cont = history.ContContext{};
 
-    applyQuietCutoffLearning(&history_table, if (comptime build_options.tuning) &default_basin_policy else {}, &stack_entry, &cont, .black, cutoff_move, .knight, &tried_quiets, &tried_pieces, 4);
+    applyQuietCutoffLearning(&history_table, if (comptime build_options.tuning) &default_basin_policy else {}, &stack_entry, &cont, .black, cutoff_move, .knight, &tried_quiets, &tried_pieces, 4, 0, 0);
 
     try std.testing.expectEqual(cutoff_move, stack_entry.killer_a.?);
-    try std.testing.expect(history_table.score(.black, .knight, .f6) > 0);
-    try std.testing.expect(history_table.score(.black, .knight, .c6) < 0);
+    try std.testing.expect(history_table.score(.black, .knight, .f6, 0) > 0);
+    try std.testing.expect(history_table.score(.black, .knight, .c6, 0) < 0);
     try std.testing.expectEqual(cutoff_move, history_table.counterMove(.white, .pawn, .e4).?);
 }
 
@@ -1908,7 +1939,7 @@ test "singular alternative quality treats cold quiet alternatives as weak" {
     const stack_entry = stack.StackEntry{};
     const history_table = history.HistoryTable{};
     const see_scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
-    const quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table);
+    const quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table, 0);
 
     try std.testing.expect(quality.isWeak());
     try std.testing.expectEqual(@as(usize, 1), quality.alternative_count);
@@ -1932,7 +1963,7 @@ test "singular alternative quality rejects strong tactical alternatives and reco
     var see_scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     see_scores[1] = 900;
 
-    const tactical_quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table);
+    const tactical_quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table, 0);
     try std.testing.expect(!tactical_quality.isWeak());
 
     const killer_alt = move_mod.Move.init(.e1, .d2, .quiet);
@@ -1941,11 +1972,12 @@ test "singular alternative quality rejects strong tactical alternatives and reco
     moves.add(tt_move);
     moves.add(killer_alt);
     see_scores = [_]i32{0} ** move_mod.MAX_MOVES;
-    const killer_quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table);
+    const killer_quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table, 0);
     try std.testing.expect(killer_quality.has_killer_or_countermove);
 }
 
 test "root LMR starts with the third quiet move and preserves tactical guards" {
+    @import("startup.zig").ensure();
     const quiet = move_mod.Move.init(.a2, .a3, .quiet);
     const capture = move_mod.Move.init(.a2, .b3, .capture);
     const promotion = move_mod.Move.init(.a7, .a8, .promo_queen);
@@ -1960,6 +1992,7 @@ test "root LMR starts with the third quiet move and preserves tactical guards" {
 }
 
 test "root search depth one returns a move in start position" {
+    @import("startup.zig").ensure();
     const fen = @import("../core/fen.zig");
     const history = @import("history.zig");
     const rfp_hint_mod = @import("rfp_hint.zig");
@@ -1986,4 +2019,72 @@ test "root search depth one returns a move in start position" {
 
     const result = searchDepth(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 1);
     try std.testing.expect(result.best_move != null);
+}
+
+test "TT-stage quiet cutoff learns without a map and failed TT quiet uses the later map" {
+    const fen = @import("../core/fen.zig");
+    const stack = @import("stack.zig");
+    const pos = try fen.parse("4k3/8/8/8/8/r7/8/N3K3 w - - 0 1");
+    const tt_move = move_mod.Move.init(.a1, .c2, .quiet);
+    const tt_bucket = history_mod.ttQuietBucket(&pos, tt_move);
+    try std.testing.expectEqual(@as(u2, 2), tt_bucket);
+    var history = history_mod.HistoryTable{};
+    var entry = stack.StackEntry{};
+    const cont = history_mod.ContContext{};
+    applyQuietCutoffLearning(&history, if (comptime build_options.tuning) &default_basin_policy else {}, &entry, &cont, .white, tt_move, .knight, &.{}, &.{}, 4, tt_bucket, null);
+    try std.testing.expectEqual(if (basin.ENABLED) basin.historyBonus(4) else 24, history.score(.white, .knight, .c2, tt_bucket));
+    try std.testing.expectEqual(@as(i32, 0), history.score(.white, .knight, .c2, 0));
+    try std.testing.expectEqual(tt_move, entry.killer_a.?);
+    try std.testing.expectEqual(@as(u16, 1), history.snapshot().positive_entries);
+
+    history.clear();
+    const map = attacks.attackedSquares(&pos, .black);
+    const cutoff = move_mod.Move.init(.e1, .f1, .quiet);
+    const bucket = history_mod.quietBucket(map, cutoff);
+    applyQuietCutoffLearning(&history, if (comptime build_options.tuning) &default_basin_policy else {}, &entry, &cont, .white, cutoff, .king, &.{tt_move}, &.{.knight}, 4, bucket, map);
+    try std.testing.expectEqual(-(if (basin.ENABLED) basin.historyMalus(4) else 24), history.score(.white, .knight, .c2, tt_bucket));
+    try std.testing.expectEqual(@as(i32, 0), history.score(.white, .knight, .c2, 0));
+    try std.testing.expect(history.score(.white, .king, .f1, bucket) > 0);
+    try std.testing.expectEqual(history.score(.white, .knight, .c2, tt_bucket), lmrHistoryScore(&history, &pos, tt_move, map));
+}
+
+test "negamax quiet TT cutoff bypasses generation and rewards the queried bucket" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var ctx = context_mod.SearchContext{
+        .repetition = .{},
+        .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
+        .record_move_order_outcomes = true,
+    };
+    var history = history_mod.HistoryTable{};
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hints = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hints.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+    var pos = try fen.parse("k7/8/8/8/8/8/4r3/4K3 w - - 0 1");
+    const tt_move = move_mod.Move.init(.e1, .f1, .quiet);
+    try std.testing.expect(legal.isLegalMoveHinted(&pos, tt_move, true));
+    // Depths 1 and 2 have zero bonus under the frozen policy. At depth 3,
+    // a seeded child TT cutoff isolates this node from descendant generation.
+    const child_key = make_unmake.makeMove(&pos, tt_move, &ctx.stack.entry(0).state);
+    make_unmake.unmakeMove(&pos, tt_move, &ctx.stack.entry(0).state);
+    table.store(child_key, 8, 0, .exact, null);
+    table.store(pos.zobrist_key, 0, 0, .upper, tt_move);
+    ctx.repetition.push(pos.zobrist_key);
+    evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+    const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, 3, -10001, -10000, 0, true, node_context.NodeContext.fromWindow(-10001, -10000, false), null, true);
+    try std.testing.expect(score >= -10000);
+    try std.testing.expectEqual(tt_move, ctx.stack.entry(0).killer_a.?);
+    try std.testing.expectEqual(if (basin.ENABLED) basin.historyBonus(3) else 17, history.score(.white, .king, .f1, 2));
+    try std.testing.expectEqual(@as(i32, 0), history.score(.white, .king, .f1, 0));
+    if (context_mod.stats_enabled) try std.testing.expectEqual(@as(u64, 0), ctx.stats.staged_main_movegen_nodes);
 }

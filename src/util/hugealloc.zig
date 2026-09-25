@@ -26,6 +26,7 @@
 //! `winStatusText()` reports which rung engaged for the startup info string.
 
 const std = @import("std");
+const runtime = @import("search_runtime.zig");
 const builtin = @import("builtin");
 
 pub const HUGE_PAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -84,7 +85,7 @@ pub fn BackedAligned(comptime T: type, comptime alignment: std.mem.Alignment) ty
 /// moves). A process may clear its OWN flag without privileges; do it once
 /// before the first huge mapping. With THP policy "madvise" this still only
 /// affects regions we explicitly advise.
-var clear_thp_disable_once = std.once(clearThpDisable);
+var clear_thp_disable_once = runtime.once(clearThpDisable);
 
 fn clearThpDisable() void {
     if (builtin.os.tag != .linux) return;
@@ -132,7 +133,7 @@ extern "advapi32" fn AdjustTokenPrivileges(
 ) callconv(.winapi) windows.BOOL;
 
 /// Outcome of the Windows large-page ladder, for the startup info string.
-pub const WinLargePageStatus = enum {
+pub const WinLargePageStatus = enum(u8) {
     /// No allocation >= 2MB has gone through the ladder yet.
     untried,
     /// MEM_LARGE_PAGES engaged for at least one table (sticky).
@@ -146,18 +147,38 @@ pub const WinLargePageStatus = enum {
     alloc_failed,
 };
 
-var win_status: WinLargePageStatus = .untried;
+// Diagnostic state only: it publishes no allocation or privilege payload.
+// Monotonic atomics suffice; privilege fields have their own once boundary.
+const WinStatusCell = struct {
+    value: std.atomic.Value(WinLargePageStatus) = .init(.untried),
+
+    fn read(self: *const WinStatusCell) WinLargePageStatus {
+        return self.value.load(.monotonic);
+    }
+
+    fn publish(self: *WinStatusCell, outcome: WinLargePageStatus) void {
+        std.debug.assert(outcome != .untried);
+        var observed = self.read();
+        while (observed != .locked and observed != outcome) {
+            // A stale fallback writer cannot overwrite a concurrent success:
+            // its CAS fails and the next iteration observes terminal .locked.
+            observed = self.value.cmpxchgStrong(observed, outcome, .monotonic, .monotonic) orelse return;
+        }
+    }
+};
+
+var win_status: WinStatusCell = .{};
 var win_large_min: usize = 0; // GetLargePageMinimum(); 0 => unsupported
 var win_privilege_ok: bool = false;
-var win_privilege_once = std.once(enableLockMemoryPrivilege);
+var win_privilege_once = runtime.once(enableLockMemoryPrivilege);
 
 pub fn winLargePageStatus() WinLargePageStatus {
-    return win_status;
+    return win_status.read();
 }
 
 /// Human-readable rung report for the startup `info string large_pages: ...`.
 pub fn winStatusText() []const u8 {
-    return switch (win_status) {
+    return switch (winLargePageStatus()) {
         .untried => "untried (no allocation >= 2MB yet)",
         .locked => "locked",
         .no_privilege => "fallback (SeLockMemoryPrivilege unavailable)",
@@ -254,19 +275,17 @@ pub fn allocAligned(
     if (builtin.os.tag == .windows and huge_candidate) {
         win_privilege_once.call();
         if (winMapLarge(byte_len)) |bytes| {
-            win_status = .locked;
+            win_status.publish(.locked);
             return .{ .items = itemsFromBytes(T, alignment, bytes, n), .method = .win_large };
         }
         // Record why rung 1 missed (sticky once locked: a later fragmented
         // resize must not erase the "large pages engaged" verdict).
-        if (win_status != .locked) {
-            win_status = if (win_large_min == 0)
-                .unsupported
-            else if (!win_privilege_ok)
-                .no_privilege
-            else
-                .alloc_failed;
-        }
+        win_status.publish(if (win_large_min == 0)
+            .unsupported
+        else if (!win_privilege_ok)
+            .no_privilege
+        else
+            .alloc_failed);
         if (winMapRegular(byte_len)) |bytes| return .{ .items = itemsFromBytes(T, alignment, bytes, n), .method = .win_virtual };
     }
     return .{ .items = try fallback.alignedAlloc(T, alignment, n), .method = .heap };
@@ -424,4 +443,47 @@ test "thp setting is readable on linux" {
     } else {
         try std.testing.expect(setting == null);
     }
+}
+
+test "Windows page diagnostics retain serial outcomes and sticky success" {
+    var cell = WinStatusCell{};
+    try std.testing.expectEqual(WinLargePageStatus.untried, cell.read());
+    for ([_]WinLargePageStatus{ .unsupported, .no_privilege, .alloc_failed }) |outcome| {
+        cell.publish(outcome);
+        try std.testing.expectEqual(outcome, cell.read());
+    }
+    cell.publish(.locked);
+    for ([_]WinLargePageStatus{ .unsupported, .no_privilege, .alloc_failed, .locked }) |outcome| {
+        cell.publish(outcome);
+        try std.testing.expectEqual(WinLargePageStatus.locked, cell.read());
+    }
+}
+
+test "Windows page diagnostic publishers and readers may overlap" {
+    const Publisher = struct {
+        fn run(cell: *WinStatusCell, start: *runtime.ResetEvent, outcome: WinLargePageStatus) void {
+            start.wait();
+            for (0..10000) |_| {
+                cell.publish(outcome);
+                _ = cell.read();
+            }
+        }
+    };
+    // Local instance: never reset the production diagnostic beneath readers.
+    var cell = WinStatusCell{};
+    var start: runtime.ResetEvent = .{};
+    var threads: [4]runtime.Thread = undefined;
+    var started: usize = 0;
+    defer {
+        start.set();
+        for (threads[0..started]) |thread| thread.join();
+    }
+    for ([_]WinLargePageStatus{ .unsupported, .locked, .alloc_failed, .no_privilege }, 0..) |outcome, i| {
+        threads[i] = try runtime.Thread.spawn(.{}, Publisher.run, .{ &cell, &start, outcome });
+        started += 1;
+    }
+    start.set();
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expectEqual(WinLargePageStatus.locked, cell.read());
 }

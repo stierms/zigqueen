@@ -1,4 +1,5 @@
 const std = @import("std");
+const attacks = @import("../movegen/attacks.zig");
 const basin = @import("basin.zig");
 const hugealloc = @import("../util/hugealloc.zig");
 const move_mod = @import("../core/move.zig");
@@ -9,6 +10,21 @@ const square = @import("../core/square.zig");
 const types = @import("../core/types.zig");
 
 pub const HISTORY_LIMIT: i32 = 32_000;
+
+/// Bits describe attacks in the unchanged node position, including occupied squares.
+pub inline fn quietBucket(attacked: u64, mv: move_mod.Move) u2 {
+    const from: u2 = @intCast((attacked >> mv.from.index()) & 1);
+    const to: u2 = @intCast((attacked >> mv.to.index()) & 1);
+    return (from << 1) | to;
+}
+
+/// Hash-move-first path: obtain the same key without constructing an attack map.
+pub inline fn ttQuietBucket(pos: *const position.Position, mv: move_mod.Move) u2 {
+    const by = pos.side_to_move.other();
+    const from: u2 = @intFromBool(attacks.isSquareAttacked(pos, mv.from, by));
+    const to: u2 = @intFromBool(attacks.isSquareAttacked(pos, mv.to, by));
+    return (from << 1) | to;
+}
 
 /// Continuation history: how good a (piece, to) move is given the recent move
 /// history. We key on the 1-ply previous move (the opponent's last move) and
@@ -161,7 +177,7 @@ pub const CountermoveTableSnapshot = struct {
 };
 
 pub const HistoryTable = struct {
-    quiet: [2][6][64]i16 = std.mem.zeroes([2][6][64]i16),
+    quiet: [2][4][6][64]i16 = std.mem.zeroes([2][4][6][64]i16),
     countermove: [2][6][64]?move_mod.Move = std.mem.zeroes([2][6][64]?move_mod.Move),
     countermove_remember_calls: u64 = 0,
     countermove_overwrite_same: u64 = 0,
@@ -262,34 +278,20 @@ pub const HistoryTable = struct {
         }
     }
 
-    pub fn score(self: *const HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square) i32 {
-        // Explicit row pointer: `self.quiet[side][piece][to]` with runtime
+    pub fn score(self: *const HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, bucket: u2) i32 {
+        // Explicit row pointer: `self.quiet[side][bucket][piece][to]` with runtime
         // indices materialises a 128-byte stack copy of the [64]i16 row and the
         // following 2-byte read stalls on failed store-to-load forwarding (same
         // defect class as correctedEval's 64KB copy above; ~50% of scoreMoves
         // self time in endgame profiles). `&...[piece]` forces in-place
         // addressing.
-        const row: *const [64]i16 = &self.quiet[@intFromEnum(side)][@intFromEnum(moved_piece)];
+        const row: *const [64]i16 = &self.quiet[@intFromEnum(side)][bucket][@intFromEnum(moved_piece)];
         return row[to.index()];
     }
 
-    /// Per-side quiet-history plane, resolved once per scored move list (see
-    /// ordering.scoreMoves): every move in a node's list is by the side to
-    /// move, so the side half of the row address is node-invariant. Reads
-    /// through the plane see the live table values; `plane[piece][to]` equals
-    /// `score(side, piece, to)` exactly.
-    pub inline fn quietPlane(self: *const HistoryTable, side: types.Color) *const [6][64]i16 {
+    /// Live [bucket][piece][to] rows for the side to move; never copied.
+    pub inline fn quietPlane(self: *const HistoryTable, side: types.Color) *const [4][6][64]i16 {
         return &self.quiet[@intFromEnum(side)];
-    }
-
-    /// The same table viewed as one flat `[12][64]` plane keyed by the mover's
-    /// mailbox piece — `quietPieceRows()[@intFromEnum(p)][to]` is exactly
-    /// `score(p.color().?, p.pieceType(), to)`, because `quiet` is
-    /// `[side][piece_type][to]` in that order and `Piece` is `side * 6 +
-    /// piece_type`. Same reindexing (and same reason) as `contKeyOfPiece`: it
-    /// drops the PIECE_TYPES load from the per-move address chain.
-    pub inline fn quietPieceRows(self: *const HistoryTable) *const [12][64]i16 {
-        return @ptrCast(&self.quiet);
     }
 
     pub fn counterMove(self: *const HistoryTable, previous_side: types.Color, previous_piece: piece.PieceType, to: square.Square) ?move_mod.Move {
@@ -315,29 +317,29 @@ pub const HistoryTable = struct {
         slot.* = response;
     }
 
-    pub fn bonus(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
+    pub fn bonus(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16, bucket: u2) void {
         const bonus_value: i32 = if (basin.ENABLED) basin.historyBonus(depth) else @as(i32, depth) * @as(i32, depth) + 8;
-        adjust(self, side, moved_piece, to, bonus_value);
+        adjust(self, side, moved_piece, to, bonus_value, bucket);
     }
 
-    pub fn bonusWithPolicy(self: *HistoryTable, policy: *const basin.Params, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
-        adjust(self, side, moved_piece, to, policy.historyBonus(depth));
+    pub fn bonusWithPolicy(self: *HistoryTable, policy: *const basin.Params, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16, bucket: u2) void {
+        adjust(self, side, moved_piece, to, policy.historyBonus(depth), bucket);
     }
 
-    pub fn penalize(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
+    pub fn penalize(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16, bucket: u2) void {
         const penalty: i32 = if (basin.ENABLED) basin.historyMalus(depth) else @as(i32, depth) * @as(i32, depth) + 8;
-        adjust(self, side, moved_piece, to, -penalty);
+        adjust(self, side, moved_piece, to, -penalty, bucket);
     }
 
-    pub fn penalizeWithPolicy(self: *HistoryTable, policy: *const basin.Params, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16) void {
-        adjust(self, side, moved_piece, to, -policy.historyMalus(depth));
+    pub fn penalizeWithPolicy(self: *HistoryTable, policy: *const basin.Params, side: types.Color, moved_piece: piece.PieceType, to: square.Square, depth: u16, bucket: u2) void {
+        adjust(self, side, moved_piece, to, -policy.historyMalus(depth), bucket);
     }
 
     /// Apply an already-calibrated signed update to MAIN quiet history only.
     /// Used by the tuning-only eval-policy arm; continuation history is
     /// intentionally untouched.
-    pub fn adjustMain(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, delta: i32) void {
-        adjust(self, side, moved_piece, to, delta);
+    pub fn adjustMain(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, delta: i32, bucket: u2) void {
+        adjust(self, side, moved_piece, to, delta, bucket);
     }
 
     /// Summed continuation-history score for a candidate move (`cur_key`) given
@@ -397,10 +399,12 @@ pub const HistoryTable = struct {
     pub fn snapshot(self: *const HistoryTable) HistoryTableSnapshot {
         var result = HistoryTableSnapshot{};
         for (0..2) |side_index| {
-            for (0..6) |piece_index| {
-                for (0..64) |square_index| {
-                    const value: i32 = self.quiet[side_index][piece_index][square_index];
-                    recordHistoryValue(&result, &result.side_piece_stats[side_index][piece_index], value);
+            for (0..4) |bucket| {
+                for (0..6) |piece_index| {
+                    for (0..64) |square_index| {
+                        const value: i32 = self.quiet[side_index][bucket][piece_index][square_index];
+                        recordHistoryValue(&result, &result.side_piece_stats[side_index][piece_index], value);
+                    }
                 }
             }
         }
@@ -470,12 +474,12 @@ fn historyBucketIndex(value: i32) usize {
     return 8;
 }
 
-fn adjust(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, delta: i32) void {
+fn adjust(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, delta: i32, bucket: u2) void {
     // Slot pointer instead of value indexing: the read through
-    // `self.quiet[side][piece][to]` copied the whole 128-byte row to the stack
+    // `self.quiet[side][bucket][piece][to]` copied the whole 128-byte row to the stack
     // first (store-forwarding stall; the bulk of applyQuietCutoffLearning's
     // self time in endgame profiles).
-    const slot = &self.quiet[@intFromEnum(side)][@intFromEnum(moved_piece)][to.index()];
+    const slot = &self.quiet[@intFromEnum(side)][bucket][@intFromEnum(moved_piece)][to.index()];
     const next = applyGravity(@as(i32, slot.*), delta);
     slot.* = @intCast(next);
 }
@@ -491,11 +495,11 @@ fn applyGravity(current: i32, delta: i32) i32 {
 
 test "history snapshot buckets quiet move scores" {
     var history = HistoryTable{};
-    history.bonus(.white, .knight, .f3, 8);
-    history.penalize(.black, .bishop, .g4, 10);
+    history.bonus(.white, .knight, .f3, 8, 0);
+    history.penalize(.black, .bishop, .g4, 10, 0);
 
     const snap = history.snapshot();
-    try std.testing.expectEqual(@as(u16, 768), snap.total_entries);
+    try std.testing.expectEqual(@as(u16, 3072), snap.total_entries);
     try std.testing.expect(snap.positive_entries > 0);
     try std.testing.expect(snap.negative_entries > 0);
     try std.testing.expect(snap.zero_entries < snap.total_entries);
@@ -508,24 +512,24 @@ test "history snapshot buckets quiet move scores" {
 
 test "history table stores signed piece-to quiet move scores" {
     var history = HistoryTable{};
-    history.bonus(.white, .pawn, .e4, 4);
-    try std.testing.expect(history.score(.white, .pawn, .e4) > 0);
-    try std.testing.expectEqual(@as(i32, 0), history.score(.white, .knight, .e4));
-    history.penalize(.white, .pawn, .e4, 8);
-    try std.testing.expect(history.score(.white, .pawn, .e4) < 0);
+    history.bonus(.white, .pawn, .e4, 4, 0);
+    try std.testing.expect(history.score(.white, .pawn, .e4, 0) > 0);
+    try std.testing.expectEqual(@as(i32, 0), history.score(.white, .knight, .e4, 0));
+    history.penalize(.white, .pawn, .e4, 8, 0);
+    try std.testing.expect(history.score(.white, .pawn, .e4, 0) < 0);
 }
 
 test "history gravity updates avoid immediate saturation" {
     var history = HistoryTable{};
     for (0..256) |_| {
-        history.bonus(.white, .knight, .f3, 12);
+        history.bonus(.white, .knight, .f3, 12, 0);
     }
-    const saturated = history.score(.white, .knight, .f3);
+    const saturated = history.score(.white, .knight, .f3, 0);
     try std.testing.expect(saturated > 0);
     try std.testing.expect(saturated <= HISTORY_LIMIT);
 
-    history.penalize(.white, .knight, .f3, 4);
-    try std.testing.expect(history.score(.white, .knight, .f3) < saturated);
+    history.penalize(.white, .knight, .f3, 4, 0);
+    try std.testing.expect(history.score(.white, .knight, .f3, 0) < saturated);
 }
 
 test "continuation history is a no-op until allocated, then bonuses/penalties move the score" {
@@ -557,34 +561,24 @@ test "continuation history is a no-op until allocated, then bonuses/penalties mo
     try std.testing.expect(history.continuation != null); // clear keeps the allocation
 }
 
-test "piece-keyed history views match the side/piece-type keyed ones exactly" {
-    // Exhaustive over the 12 x 64 key space: the reindexing that lets the hot
-    // paths skip PIECE_TYPES is only sound if `Piece == side * 6 + piece_type`
-    // and `quiet` is laid out [side][piece_type][to]. Assert both, for every key.
+test "bucketed quiet plane matches direct reads for every key" {
     var history = HistoryTable{};
     var seed: i16 = 0;
     for (0..2) |side_index| {
-        for (0..6) |piece_index| {
-            for (0..64) |sq_index| {
-                seed +%= 37;
-                history.quiet[side_index][piece_index][sq_index] = seed;
-            }
-        }
-    }
-
-    const rows = history.quietPieceRows();
-    for (0..2) |side_index| {
         const side: types.Color = @enumFromInt(side_index);
-        for (0..6) |piece_index| {
-            const pt: piece.PieceType = @enumFromInt(piece_index);
-            const p = piece.Piece.make(side, pt);
-            for (0..64) |sq_index| {
-                const sq: square.Square = @enumFromInt(sq_index);
-                try std.testing.expectEqual(
-                    history.score(side, pt, sq),
-                    @as(i32, rows[@intFromEnum(p)][sq.index()]),
-                );
-                try std.testing.expectEqual(contKey(side, pt, sq), contKeyOfPiece(p, sq));
+        const rows = history.quietPlane(side);
+        for (0..4) |bucket_index| {
+            const bucket: u2 = @intCast(bucket_index);
+            for (0..6) |piece_index| {
+                const pt: piece.PieceType = @enumFromInt(piece_index);
+                const p = piece.Piece.make(side, pt);
+                for (0..64) |sq_index| {
+                    const sq: square.Square = @enumFromInt(sq_index);
+                    seed +%= 37;
+                    history.quiet[side_index][bucket][piece_index][sq_index] = seed;
+                    try std.testing.expectEqual(history.score(side, pt, sq, bucket), @as(i32, rows[bucket][piece_index][sq_index]));
+                    try std.testing.expectEqual(contKey(side, pt, sq), contKeyOfPiece(p, sq));
+                }
             }
         }
     }
@@ -634,4 +628,65 @@ test "history table stores piece-to countermoves" {
     try std.testing.expectEqual(@as(u16, 767), snap.empty_slots);
     try std.testing.expectEqual(@as(u64, 1), snap.remember_calls);
     try std.testing.expectEqual(@as(u16, 1), snap.side_piece_stats[@intFromEnum(types.Color.white)][@intFromEnum(piece.PieceType.pawn)].occupied_entries);
+}
+
+test "quiet history has four fixed threat buckets" {
+    const table = HistoryTable{};
+    try std.testing.expectEqual(@as(usize, 6144), @sizeOf(@TypeOf(table.quiet)));
+}
+
+test "quiet threat bucket bits and updates stay independent" {
+    const mv = move_mod.Move.init(.g1, .f3, .quiet);
+    const from = @as(u64, 1) << mv.from.index();
+    const to = @as(u64, 1) << mv.to.index();
+    const maps = [_]u64{ 0, to, from, from | to };
+    const policy = basin.Params{};
+    for (maps, 0..) |map, i| {
+        const bucket: u2 = @intCast(i);
+        try std.testing.expectEqual(bucket, quietBucket(map, mv));
+        var history = HistoryTable{};
+        history.bonus(.white, .knight, mv.to, 4, bucket);
+        const bonus = history.score(.white, .knight, mv.to, bucket);
+        try std.testing.expectEqual(if (basin.ENABLED) basin.historyBonus(4) else 24, bonus);
+        history.penalize(.white, .knight, mv.to, 8, bucket);
+        try std.testing.expect(history.score(.white, .knight, mv.to, bucket) < bonus);
+        history.bonusWithPolicy(&policy, .white, .knight, mv.to, 4, bucket);
+        history.penalizeWithPolicy(&policy, .white, .knight, mv.to, 8, bucket);
+        for (0..4) |other| {
+            if (other == i) continue;
+            try std.testing.expectEqual(@as(i32, 0), history.score(.white, .knight, mv.to, @intCast(other)));
+        }
+        try std.testing.expectEqual(@as(i32, 0), history.score(.black, .knight, mv.to, bucket));
+        try std.testing.expectEqual(@as(i32, 0), history.score(.white, .bishop, mv.to, bucket));
+        history.clear();
+        try std.testing.expectEqual(@as(u16, 3072), history.snapshot().zero_entries);
+    }
+}
+
+test "TT square queries agree with map buckets for both sides and every square pair" {
+    const fen = @import("../core/fen.zig");
+    const cases = [_][]const u8{
+        fen.STARTPOS_FEN,
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "4k3/4n3/8/8/8/8/4R3/4K3 w - - 0 1",
+        "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+    };
+    var seen: [4]bool = .{ false, false, false, false };
+    for (cases) |text| {
+        var pos = try fen.parse(text);
+        for ([_]types.Color{ .white, .black }) |side| {
+            pos.side_to_move = side;
+            const map = attacks.attackedSquares(&pos, side.other());
+            for (0..64) |from| {
+                for (0..64) |to| {
+                    const mv = move_mod.Move.init(@enumFromInt(from), @enumFromInt(to), .quiet);
+                    const bucket = ttQuietBucket(&pos, mv);
+                    try std.testing.expectEqual(quietBucket(map, mv), bucket);
+                    seen[bucket] = true;
+                }
+            }
+        }
+    }
+    for (seen) |present| try std.testing.expect(present);
 }

@@ -2,12 +2,17 @@
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, NNUE architecture, search
   architecture, and the performance-relevant design decisions.
-- [`NETWORK.md`](NETWORK.md) — how the NNUE network was trained: data
+- [`NETWORK.md`](NETWORK.md) — how the NNUE networks were trained: data
   sources, trainer, and what was and was not taken from other projects.
 - [`STRENGTH.md`](STRENGTH.md) — anchored gauntlet results and the
   self-assessment methodology.
-- [`RELEASE_VALIDATION_6.2.0.md`](RELEASE_VALIDATION_6.2.0.md) — release checks and artifact identity.
-- [`RELEASE_NOTES_6.2.0.md`](RELEASE_NOTES_6.2.0.md) — current release.
+- [`RELEASE_NOTES_6.3.0.md`](RELEASE_NOTES_6.3.0.md) — current release.
+- [`RELEASE_VALIDATION_6.3.0.md`](RELEASE_VALIDATION_6.3.0.md) — release checks and artifact identity.
+- [`data-r2/README.md`](data-r2/README.md) — the training-data changes behind
+  the 6.3.0 network and how to reproduce them.
+- [`trainer/README.md`](trainer/README.md) — the bullet trainer patches.
+- [`RELEASE_NOTES_6.2.0.md`](RELEASE_NOTES_6.2.0.md) — what changed in 6.2.0.
+- [`RELEASE_VALIDATION_6.2.0.md`](RELEASE_VALIDATION_6.2.0.md) — 6.2.0 release checks.
 - [`RELEASE_NOTES_6.1.1.md`](RELEASE_NOTES_6.1.1.md) — what changed in
   6.1.1.
 - [`RELEASE_NOTES_6.1.0.md`](RELEASE_NOTES_6.1.0.md) — what changed in

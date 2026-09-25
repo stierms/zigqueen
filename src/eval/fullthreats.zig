@@ -366,6 +366,91 @@ fn recomputeGroupBoth(
     return true;
 }
 
+/// Toggle one (attacker group, target) feature in both perspectives, if the
+/// victim `p` on target square `t_idx` is a kept victim class for `atype`.
+inline fn toggleTargetBoth(
+    atype: usize,
+    ak_w: usize,
+    f_ow: usize,
+    ak_b: usize,
+    f_ob: usize,
+    wflip: u6,
+    bflip: u6,
+    t_idx: usize,
+    p: piece.Piece,
+    wbits: *PerspBits,
+    bbits: *PerspBits,
+    delta: *Delta,
+) bool {
+    const vtype_full: usize = @intFromEnum(p.pieceType());
+    if (vtype_full == 5) return true; // king victims excluded
+    const vr = VRANK[atype][vtype_full];
+    if (vr < 0) return true; // subset-redundant combo
+    const vrank: usize = @intCast(vr);
+    const tcolor = p.color().?;
+    const wi = fullIndex(ak_w, f_ow, t_idx ^ wflip, tcolor == .white, vrank);
+    if (!toggleLogged(wbits, wi, 0, delta)) return false;
+    const bi = fullIndex(ak_b, f_ob, (t_idx ^ 56) ^ bflip, tcolor == .black, vrank);
+    return toggleLogged(bbits, bi, 0x8000_0000, delta);
+}
+
+/// Targeted twin of recomputeGroupBoth for an ATTACKER group (hotspot-profile-
+/// 20260924): a piece on an UNCHANGED square, collected by rule 2 below (a
+/// rule-2 piece standing on a changed square is that square's new occupant,
+/// already collected by rule 1 and deduplicated). Its features can differ only
+/// on targets whose victim changed (changed squares it attacks under the old
+/// or new occupancy) or whose attack membership changed (A_old ^ A_new; empty
+/// for pawns and knights). Every other target keeps membership, occupancy and
+/// victim, hence its feature bit. The toggles below are therefore exactly the
+/// XOR of old and new truth that the full recompute finds against the stored
+/// (= old truth) bits — the same SET of toggled features. Only the undo-log
+/// ORDER differs, which no consumer observes: threat-row adds wrap-commute,
+/// PSQT sums commute, undo is XOR, and the 256-toggle overflow test sees the
+/// same total (overflow still falls back to the full re-enumeration barrier).
+fn updateAttackerGroupBoth(
+    pos: *const position.Position,
+    sq_idx: u6,
+    color: types.Color,
+    atype: usize,
+    wflip: u6,
+    bflip: u6,
+    changes: []const SquareChange,
+    changed_mask: u64,
+    occ_old: u64,
+    wbits: *PerspBits,
+    bbits: *PerspBits,
+    delta: *Delta,
+) bool {
+    const pt: piece.PieceType = @enumFromInt(atype);
+    const from = square.Square.fromIndex(sq_idx);
+    const a_new = attackSet(pt, color, from, pos.occupied);
+    // Pawn and knight attack sets do not depend on occupancy.
+    const a_old = if (atype <= 1) a_new else attackSet(pt, color, from, occ_old);
+    var targets = ((a_old ^ a_new) | changed_mask) & (a_old | a_new);
+    if (targets == 0) return true;
+    const f_ow: usize = @as(usize, sq_idx ^ wflip);
+    const f_ob: usize = @as(usize, (sq_idx ^ 56) ^ bflip);
+    const ak_w: usize = (if (color == .white) @as(usize, 0) else 5) + atype;
+    const ak_b: usize = (if (color == .black) @as(usize, 0) else 5) + atype;
+    while (bitboard.popLsb(&targets)) |t| {
+        const t_idx: usize = t.index();
+        const bit = @as(u64, 1) << @intCast(t_idx);
+        const new_piece = pos.mailbox[t_idx];
+        var old_piece = new_piece;
+        if (changed_mask & bit != 0) {
+            for (changes) |c| {
+                if (c.sq == t_idx) old_piece = c.old;
+            }
+        }
+        const old_on = (a_old & bit) != 0 and old_piece != .none;
+        const new_on = (a_new & bit) != 0 and new_piece != .none;
+        if (old_on and new_on and old_piece == new_piece) continue;
+        if (old_on and !toggleTargetBoth(atype, ak_w, f_ow, ak_b, f_ob, wflip, bflip, t_idx, old_piece, wbits, bbits, delta)) return false;
+        if (new_on and !toggleTargetBoth(atype, ak_w, f_ow, ak_b, f_ob, wflip, bflip, t_idx, new_piece, wbits, bbits, delta)) return false;
+    }
+    return true;
+}
+
 /// Apply a move's threat-feature delta to both perspectives' bitsets.
 /// `changes` = the move's changed squares (<=4, incl. EP capture square and
 /// castle rook squares). Returns false on undo-log overflow — the caller must
@@ -376,7 +461,7 @@ pub fn applyMoveDelta(
     wbits: *PerspBits,
     bbits: *PerspBits,
     delta: *Delta,
-) bool {
+) align(64) bool { // align(64): pins hot entry placement (layout stability, not call speed)
     const occ = pos.occupied;
 
     // Deduped affected-group collection: seen[color*5+pt] bitboards.
@@ -410,6 +495,10 @@ pub fn applyMoveDelta(
             }
         }
     }
+
+    // Groups from rule 1 (changed squares' old/new occupants) take the full
+    // recompute; every later entry is an attacker on an unchanged square.
+    const n_own = n_entries;
 
     // 2. Attackers of every changed square under NEW occupancy. This single
     //    reverse-lookup rule covers BOTH cost centres (perf-r4, proof below):
@@ -472,14 +561,26 @@ pub fn applyMoveDelta(
         }
     }
 
-    // Recompute every affected group, both perspectives in one fused pass each.
+    // Recompute every affected group, both perspectives in one fused pass each;
+    // attacker groups take the targeted update over their changed targets only.
     delta.groups = @intCast(n_entries);
     const flips = kingFlips(pos);
+    var changed_mask: u64 = 0;
+    var occ_old: u64 = occ;
+    for (changes) |c| {
+        const bit = @as(u64, 1) << c.sq;
+        changed_mask |= bit;
+        if (c.old != .none) occ_old |= bit else occ_old &= ~bit;
+    }
     for (0..n_entries) |i| {
         const key = entry_key[i];
         const color: types.Color = if (key < 5) .white else .black;
         const atype: usize = key % 5;
-        if (!recomputeGroupBoth(pos, entry_sq[i], color, atype, flips.w, flips.b, wbits, bbits, delta)) return false;
+        if (i < n_own) {
+            if (!recomputeGroupBoth(pos, entry_sq[i], color, atype, flips.w, flips.b, wbits, bbits, delta)) return false;
+        } else {
+            if (!updateAttackerGroupBoth(pos, entry_sq[i], color, atype, flips.w, flips.b, changes, changed_mask, occ_old, wbits, bbits, delta)) return false;
+        }
     }
     return true;
 }

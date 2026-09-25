@@ -8,7 +8,9 @@
 //! defaults here and the engine ships with them (no hot-path cost beyond a cached
 //! global read).
 //!
-//! Single-threaded only (Threads=1), so a process-global `active` is safe.
+//! Mutation requires process-wide quiescence: no search or constructor may
+//! overlap any set/reset, and there is one writer. UCI stops its sole worker;
+//! multi-engine tools must join every reader before tuning.
 //!
 //! Restored + extended 2026-06-06: the original 19 margins/reductions + the 7
 //! v3.1.0 depth-efficiency knobs (the +44 bundle), which had never been SPSA'd.
@@ -147,6 +149,7 @@ pub const specs = [_]Spec{
 pub fn set(uci_name: []const u8, value: types.Score) bool {
     inline for (specs) |s| {
         if (std.mem.eql(u8, uci_name, s.uci_name)) {
+            @import("startup.zig").ensure();
             @field(active, s.field) = std.math.clamp(value, s.min, s.max);
             // The LMR shape lives in a precomputed table: rebuild it whenever
             // either shape knob changes (cheap, never on the search hot path).
@@ -161,6 +164,7 @@ pub fn set(uci_name: []const u8, value: types.Score) bool {
 
 /// Reset all tunables to their shipped defaults (used by tests).
 pub fn reset() void {
+    @import("startup.zig").ensure();
     active = .{};
     @import("reductions.zig").applyLmrShape(active.lmr_base_100, active.lmr_divisor_100);
 }

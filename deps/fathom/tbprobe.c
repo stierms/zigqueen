@@ -358,11 +358,11 @@ static void close_tb(FD fd)
 
 static void *map_file(FD fd, map_t *mapping)
 {
+  /* zigqueen: fd is borrowed; map_tb closes it on every return path. */
 #ifndef _WIN32
   struct stat statbuf;
   if (fstat(fd, &statbuf)) {
     perror("fstat");
-    close_tb(fd);
     return NULL;
   }
   *mapping = statbuf.st_size;
@@ -370,7 +370,6 @@ static void *map_file(FD fd, map_t *mapping)
 			      MAP_SHARED, fd, 0);
   if (data == MAP_FAILED) {
     perror("mmap");
-    close_tb(fd);
     return NULL;
   }
 #ifdef POSIX_MADV_RANDOM
@@ -388,11 +387,13 @@ static void *map_file(FD fd, map_t *mapping)
     fprintf(stderr,"CreateFileMapping() failed, error = %lu.\n", GetLastError());
     return NULL;
   }
-  *mapping = (map_t)map;
   void *data = (void *)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
   if (data == NULL) {
     fprintf(stderr,"MapViewOfFile() failed, error = %lu.\n", GetLastError());
+    CloseHandle(map);
+    return NULL;
   }
+  *mapping = (map_t)map;
 #endif
   return data;
 }

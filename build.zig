@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     // Bump policy: MINOR for an accepted strength gain (each promoted baseline),
     // PATCH for fixes/tooling/perf-neutral changes, MAJOR for architecture
     // milestones. Highest version == newest.
-    const semver = "6.2.0";
+    const semver = "6.3.0";
     const version_override = b.option(
         []const u8,
         "version",
@@ -160,14 +160,37 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Cold initialization must also be tested before any other test can warm
+    // the process-global once state. One executable, fresh process per case.
+    const init_module = b.createModule(.{
+        .root_source_file = b.path("src/search_init_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    init_module.addImport("build_options", build_options_module);
+    addFathom(b, init_module);
+    const init_tests = b.addExecutable(.{ .name = "search-init-test", .root_module = init_module });
+    const init_step = b.step("test-search-init", "Test search initialization in fresh processes");
+    for ([_][]const u8{ "constructors", "tm-first", "tuning", "failure-retry" }) |mode| {
+        const check = b.addRunArtifact(init_tests);
+        check.addArg(mode);
+        init_step.dependOn(&check.step);
+    }
+    test_step.dependOn(init_step);
 }
 
-/// Fathom (Syzygy tablebase probing, deps/fathom, MIT): one C translation unit.
+/// Fathom (Syzygy tablebase probing, deps/fathom, MIT) plus our narrow
+/// public-API bridge.
 fn addFathom(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true;
     module.addIncludePath(b.path("deps/fathom"));
     module.addCSourceFile(.{
         .file = b.path("deps/fathom/tbprobe.c"),
+        .flags = &.{ "-std=gnu11", "-O2", "-DTB_NO_HW_POP_COUNT=0" },
+    });
+    module.addCSourceFile(.{
+        .file = b.path("src/search/fathom_bridge.c"),
         .flags = &.{ "-std=gnu11", "-O2", "-DTB_NO_HW_POP_COUNT=0" },
     });
 }
