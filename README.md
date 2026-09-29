@@ -19,12 +19,12 @@ third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
 
 | Version | [Self-assessment](docs/STRENGTH.md), 1 thread | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) (120+1) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) (40 moves in 15 min) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC (144+1.12) |
 |---|---|---|---|---|
-| 6.3.0 | **3676** (95%: 3670–3683) — 1,628 games, 22 opponents, 2026-09-25, new field | — | — | — |
-| 6.2.0 | **~3672** — 1,620 games, 27 opponents, 2026-09-09 | — | — | — |
+| 6.3.0 | **3676** (95%: 3670–3683) — 1,628 games, 22 opponents, 2026-09-25, new field | — | — | 3563 ±81 |
+| 6.2.0 | **~3672** — 1,620 games, 27 opponents, 2026-09-09 | **3649 ±18** ([#60, 749 games](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.2.0%2064-bit)) | — | — |
 | 6.1.1 | as 6.1.0 (compliance release, engine bit-identical) | — | — | 3475 ±45 |
 | 6.1.0 | ~3644 — 1,620 games, 2026-08-31 | — | — | 3490 ±41 |
-| 6.0.0 | ~3602 — 1,620 games, 2026-08-19 | — | **3498 ±18** ([#80, 572 games](https://computerchess.org.uk/ccrl/4040/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.0.0%2064-bit)) | 3401 ±45 |
-| 5.8.3 | ~3590 — 1,620 games, 2026-07-26 | **3559 ±14** ([#80, 1,295 games](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — | 3384 ±33 |
+| 6.0.0 | ~3602 — 1,620 games, 2026-08-19 | — | **3498 ±18** ([#80, 582 games](https://computerchess.org.uk/ccrl/4040/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.0.0%2064-bit)) | 3402 ±45 |
+| 5.8.3 | ~3590 — 1,620 games, 2026-07-26 | **3559 ±14** ([1,327 games](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — | 3384 ±33 |
 | 5.8.0 | ~3588 — 1,620 games, 2026-07-19 | — | — | — |
 
 Time controls are seconds per game + increment per move. Self-assessments
@@ -34,7 +34,7 @@ used a 27-opponent roster at a fixed 180+1. 6.3.0 uses a new 22-opponent field
 from the 2026-09-21 CCRL list and CCRL's 120+1 scaled to our hardware with a
 Stockfish 10 benchmark, so its number cannot be compared with the rows below
 it. At 8 threads the 6.3 release candidate measured 3697 (95%: 3685–3709)
-against an 8-CPU field. CCRL and CCI figures as of 2026-09-25.
+against an 8-CPU field. CCRL and CCI figures as of 2026-09-29.
 The [Computer Chess Index](https://computer-chess-index.github.io/cci/)
 uses its own Bayesian-Elo scale on an i5-7500T (Stockfish 19 = 3555 at
 STC), so its numbers are not comparable to CCRL's; STC and LTC are on the

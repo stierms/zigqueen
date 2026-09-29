@@ -280,8 +280,9 @@ The first three rows use the 2026-09-21 fields and the performance
 estimator described above; the rows below them use the older roster and
 their own estimators. Do not subtract across that line.
 
-Official numbers as of 2026-09-25: CCRL Blitz lists 5.8.3 at 3559 ±14
-(1,295 games), about 31 below its self-assessment; CCRL 40/15 lists 6.0.0
-at 3498 ±18 (572 games). Useful calibration, not the development baseline.
+Official numbers as of 2026-09-29: CCRL Blitz lists 6.2.0 at 3649 ±18
+(749 games), about 23 below its self-assessment, and 5.8.3 at 3559 ±14
+(1,327 games), about 31 below its own; CCRL 40/15 lists 6.0.0 at 3498 ±18
+(582 games). Useful calibration, not the development baseline.
 The Computer Chess Index's own-scale ratings are in the README table.
 Earlier runs and exact results are in [STRENGTH_6.1.1.md](STRENGTH_6.1.1.md).
