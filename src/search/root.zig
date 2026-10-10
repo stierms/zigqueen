@@ -15,6 +15,7 @@ const ply_limit = @import("ply_limit.zig");
 const position = @import("../core/position.zig");
 const pruning = @import("pruning.zig");
 const qsearch = @import("qsearch.zig");
+const rule50 = @import("rule50.zig");
 const score_mod = @import("score.zig");
 const reductions = @import("reductions.zig");
 const basin = @import("basin.zig");
@@ -26,6 +27,7 @@ const tt_mod = @import("tt.zig");
 const tt_probe = @import("tt_probe.zig");
 const tt_store = @import("tt_store.zig");
 const types = @import("../core/types.zig");
+const fail_soft = @import("fail_soft.zig");
 const default_basin_policy = basin.Params{};
 
 /// `currmove` info is only emitted once a search is both deep and long enough,
@@ -171,7 +173,7 @@ pub fn searchDepthWindow(
 ) IterationResult {
     if (pos.halfmove_clock >= 100 or ctx.repetition.isClaimableCurrentRepetition(pos.halfmove_clock)) {
         return .{
-            .score = 0,
+            .score = if (pos.halfmove_clock >= 100 and rule50.isCheckmated(pos, null)) -score_mod.MATE_SCORE else 0,
             .depth = depth,
         };
     }
@@ -183,7 +185,10 @@ pub fn searchDepthWindow(
     entry.prev_move = null;
     entry.prev_piece_type = null;
     entry.prev_cont_piece = null;
-    entry.static_eval = if (in_check) null else resources.history.correctedEval(pos, resources.evaluator.evaluate(&ctx.stack, 0, pos, &ctx.finny, &ctx.ft));
+    // The stack keeps the corrected eval (`improving` compares corrected
+    // evals); the root has no previous moves for the continuation classes.
+    const root_params: *const basin.Params = if (comptime build_options.tuning) &ctx.basin_config.params else &basin.defaults;
+    entry.static_eval = if (in_check) null else resources.history.correctedEval(pos, resources.evaluator.evaluate(&ctx.stack, 0, pos, &ctx.finny, &ctx.ft), .{}, root_params);
 
     var moves = move_mod.MoveList.init();
     legal.generateHinted(pos, &moves, in_check);
@@ -250,6 +255,7 @@ pub fn searchDepthWindow(
         const child_key = make_unmake.makeMove(pos, mv, &entry.state);
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
         resources.rfp_hint.prefetch(child_key); // and the RFP-hint cluster (probed per negamax node)
+        resources.eval_cache.prefetch(child_key); // and the eval-cache set (probed on a TT eval miss)
         const repeats_cycle = if (cycle_child_key) |key| child_key == key else false;
         ctx.repetition.push(child_key);
         child_entry.prev_move = mv;
@@ -470,7 +476,8 @@ fn negamax(
     const basin_config = if (comptime build_options.tuning) ctx.basin_config else {};
     if (if (comptime @hasField(@TypeOf(resources), "execution")) resources.execution.noteNode(ctx, false) else ctx.noteNode()) return 0;
     ctx.observePly(ply);
-    if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
+    if (pos.halfmove_clock >= 100) return rule50.interiorScore(ctx, pos, ply, in_check_hint);
+    if (ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
     if (ply_limit.fallback(ctx, resources.evaluator, pos, ply, in_check_hint)) |score| return score;
 
     const alpha_orig = alpha_in;
@@ -519,6 +526,16 @@ fn negamax(
     var alpha = probe.alpha;
     const beta = probe.beta;
     const tt_move = if (tt_entry) |entry| tt_mod.moveFromEntry(entry.*) else null;
+    // The hash move is searched first whenever the node gets to its move loop:
+    // start its child's TT, RFP-hint and eval-cache misses now, so they overlap this
+    // node's static eval and pruning instead of only the make that precedes
+    // the child. The key is a prefetch hint only (prefetchKeyAfter).
+    if (tt_move) |hash_move| {
+        const hinted_key = make_unmake.prefetchKeyAfter(pos, hash_move);
+        resources.tt.prefetch(hinted_key);
+        resources.rfp_hint.prefetch(hinted_key);
+        resources.eval_cache.prefetch(hinted_key);
+    }
     var outcome_flags = context_mod.StaticSearchOutcomeFlags{};
 
     // Internal Iterative Reduction: drop one ply at PV and expected cut-nodes
@@ -532,14 +549,12 @@ fn negamax(
     }
     if (excluded_move == null and pruning.isRfpHintApplicable(search_depth, alpha, beta)) {
         ctx.noteRfpHintProbe();
+        // Zero window only (pruning.isRfpHintApplicable): a hint above alpha
+        // is at least beta, so the hint cuts or does nothing.
         if (resources.rfp_hint.lookup(pos.zobrist_key, @intCast(search_depth))) |hint_score| {
             if (hint_score >= beta) {
                 ctx.noteRfpHintCutoff(search_depth);
                 return hint_score;
-            }
-            if (hint_score > alpha) {
-                ctx.noteRfpHintAlphaRaise();
-                alpha = hint_score;
             }
         }
     }
@@ -551,7 +566,14 @@ fn negamax(
     }
     var static_eval: ?types.Score = null;
     var raw_static_eval: ?types.Score = null;
+    // Uncertainty: |correction| widens the RFP and futility margins and shortens
+    // LMR (basin.Params unc_rfp, unc_futility, lmr_complexity_coeff). With the
+    // learned mean never applied, |c| measures class-specific error only.
     var complexity_cp: i32 = 0;
+    var corr_cont = history_mod.CorrCont{};
+    // This node's correction-history class keys (computed with its static
+    // eval); the children's table entries are prefetched from them.
+    var corr_keys: ?history_mod.CorrKeys = null;
     var improving = false;
     if (!in_check) {
         ctx.noteMainStaticEval();
@@ -578,12 +600,21 @@ fn negamax(
             break :blk fresh;
         };
         raw_static_eval = raw;
-        // Correction history: search decisions (pruning margins, improving,
-        // null-move gates) use the corrected eval; the corrhist update at the
-        // node's end measures the search result against the RAW eval.
-        const evaluated = resources.history.correctedEval(pos, raw);
+        // Correction history (bundle): reverse futility, null-move gates,
+        // razoring, ProbCut, quiet futility, bad-capture pruning, the
+        // check-extension gate and `improving` use the corrected eval (the stack
+        // keeps it). TT and eval-cache slots keep the RAW eval and are corrected
+        // on read; the update at the node's end measures against the RAW eval.
+        const corr_params: *const basin.Params = if (comptime build_options.tuning) &basin_config.params else &basin.defaults;
+        corr_cont = corrContFor(ctx, ply, pos.side_to_move);
+        if (resources.history.correction != null) corr_keys = history_mod.corrKeys(pos);
+        const evaluated = if (corr_keys) |keys|
+            resources.history.correctedEvalKeyed(pos.side_to_move, keys, raw, corr_cont, corr_params)
+        else
+            resources.history.correctedEval(pos, raw, corr_cont, corr_params);
         stack_entry.static_eval = evaluated;
         static_eval = evaluated;
+        complexity_cp = @intCast(@abs(evaluated - raw));
         if (shallow_arms.evalPolicyEnabled() and ply > 0) {
             if (stack_entry.prev_piece_type) |previous_piece| {
                 if (stack_entry.prev_move) |previous_move| {
@@ -613,22 +644,24 @@ fn negamax(
                 }
             }
         }
-        complexity_cp = @intCast(@abs(evaluated - raw));
         improving = isImproving(ctx, ply, evaluated);
         const basin_rfp_max_depth: u16 = if (comptime build_options.tuning) @intCast(basin_config.params.rfp_max_depth) else basin.RFP_MAX_DEPTH;
         const basin_rfp_margin = if (comptime build_options.tuning) basin_config.params.rfpMargin(search_depth, improving) else basin.rfpMargin(search_depth, improving);
         const rfp_fires = if (basin.ENABLED)
             (search_depth <= basin_rfp_max_depth and beta - alpha <= 1 and
                 !score_mod.isMateLike(alpha) and !score_mod.isMateLike(beta) and
-                evaluated - basin_rfp_margin - @divTrunc(complexity_cp, 2) >= beta)
+                evaluated - basin_rfp_margin - @divTrunc(complexity_cp * corr_params.unc_rfp, 16) >= beta)
         else
             pruning.shouldReverseFutilityPrune(search_depth, alpha, beta, in_check, evaluated, improving);
         if (rfp_fires) {
             ctx.noteReverseFutilityPrune(search_depth);
             outcome_flags.rfp_cutoff = true;
             if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, beta, alpha_orig, beta, outcome_flags);
+            // The RFP hint keeps beta: a later lookup may raise alpha to the
+            // stored value, so it memoises only what the cutoff claimed.
             if (excluded_move == null) resources.rfp_hint.store(pos.zobrist_key, @intCast(search_depth), beta);
-            return beta;
+            const rfp_softness = if (comptime build_options.tuning) basin_config.params.rfp_softness else basin.defaults.rfp_softness;
+            return fail_soft.evalCutoff(beta, evaluated, rfp_softness);
         }
         if (pruning.shouldRazor(search_depth, alpha, beta, in_check, evaluated)) {
             const razor_score = qsearch.search(ctx, resources, pos, alpha, beta, ply, in_check);
@@ -648,13 +681,21 @@ fn negamax(
         const margin = if (comptime build_options.tuning) basin_config.params.nmpMargin(search_depth, improving) else basin.nmpMargin(search_depth, improving);
         break :blk evaluated >= beta + margin;
     } else true;
-    if (basin_null_ok and ply >= ctx.nmp_min_ply and pruning.shouldTryNullMove(allow_null, pos, search_depth, alpha, beta, in_check, static_eval)) {
+    // No null move inside a singular verification (excluded-move) search: a
+    // pass that clears singular beta says nothing about the alternatives, and
+    // its fail high would turn into a multicut the node's own null move refused.
+    if (excluded_move == null and basin_null_ok and ply >= ctx.nmp_min_ply and pruning.shouldTryNullMove(allow_null, pos, search_depth, alpha, beta, in_check, static_eval)) {
         const reduction = if (basin.ENABLED)
             (if (comptime build_options.tuning) basin_config.params.nmpReduction(search_depth) else basin.nmpReduction(search_depth))
         else
             reductions.nullMoveReduction(search_depth);
         ctx.noteNullTry();
         make_unmake.makeNullMove(pos, &stack_entry.state);
+        // The null child probes the same three tables as a move child; start
+        // its misses now, as the move loop does after makeMove.
+        resources.tt.prefetch(pos.zobrist_key);
+        resources.rfp_hint.prefetch(pos.zobrist_key);
+        resources.eval_cache.prefetch(pos.zobrist_key);
         resources.evaluator.onMakeNullMove(&ctx.stack, ply);
         ctx.stack.entry(ply + 1).prev_move = null;
         ctx.stack.entry(ply + 1).prev_piece_type = null;
@@ -693,8 +734,9 @@ fn negamax(
                         outcome_flags.null_cutoff = true;
                         if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, beta, alpha_orig, beta, outcome_flags);
                     }
-                    if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), beta, null, tt_store.evalToTt(raw_static_eval), node_ttpv);
-                    return beta;
+                    const null_value = fail_soft.nullCutoff(beta, null_score);
+                    if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), null_value, null, tt_store.evalToTt(raw_static_eval), node_ttpv);
+                    return null_value;
                 }
             } else {
                 ctx.noteNullCutoff();
@@ -702,8 +744,9 @@ fn negamax(
                     outcome_flags.null_cutoff = true;
                     if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, beta, alpha_orig, beta, outcome_flags);
                 }
-                if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), beta, null, tt_store.evalToTt(raw_static_eval), node_ttpv);
-                return beta;
+                const null_value = fail_soft.nullCutoff(beta, null_score);
+                if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), null_value, null, tt_store.evalToTt(raw_static_eval), node_ttpv);
+                return null_value;
             }
         }
     }
@@ -801,6 +844,11 @@ fn negamax(
     var move_picker = ordering.MovePicker.init(&moves, &scores, &capture_see_scores);
     var index: usize = 0;
     var tt_stage = tt_first_move != null;
+    // True when `moves.moves[index]` already holds the pick for `index`: the
+    // pick order is fixed once the list is scored (nothing rewrites moves or
+    // scores in the loop), so picking one slot ahead returns the same move
+    // and leaves the same list as picking it on its own iteration.
+    var lookahead_ready = false;
     while (true) : ({
         if (tt_stage) tt_stage = false else index += 1;
     }) {
@@ -822,7 +870,8 @@ fn negamax(
                 index = 1;
             }
             if (index >= moves.count) break;
-            mv = move_picker.next(index);
+            mv = if (lookahead_ready) moves.moves[index] else move_picker.next(index);
+            lookahead_ready = false;
             capture_see_score = move_picker.captureSee(index);
         }
         if (excluded_move) |excluded| {
@@ -883,23 +932,33 @@ fn negamax(
                 }
             }
         }
-        const basin_futility_fires = if (basin.ENABLED) blk: {
-            if (!can_prune_move) break :blk false;
-            if (!is_quiet or in_check or isKillerMove(stack_entry, mv)) break :blk false;
+        // The futility estimate of a quiet move (eval + margin + history term);
+        // null when the move is not a futility candidate.
+        const basin_futility_value: ?types.Score = if (basin.ENABLED) blk: {
+            if (!can_prune_move) break :blk null;
+            if (!is_quiet or in_check or isKillerMove(stack_entry, mv)) break :blk null;
             const max_lmr_depth = if (comptime build_options.tuning) basin_config.params.futility_lmr_depth_max else basin.FUTILITY_LMRDEPTH_MAX;
             const alpha_cap = if (comptime build_options.tuning) basin_config.params.futility_alpha_cap else basin.FUTILITY_ALPHA_CAP;
-            if (basin_lmr_depth > max_lmr_depth) break :blk false;
-            if (@abs(alpha) >= alpha_cap) break :blk false;
-            const evaluated = static_eval orelse break :blk false;
+            if (basin_lmr_depth > max_lmr_depth) break :blk null;
+            if (@abs(alpha) >= alpha_cap) break :blk null;
+            const evaluated = static_eval orelse break :blk null;
             const margin = if (comptime build_options.tuning) basin_config.params.futilityMargin(search_depth) else basin.futilityMargin(search_depth);
-            break :blk evaluated + margin + @divTrunc(quiet_history_score, 404) <= alpha;
-        } else false;
+            const unc_futility = if (comptime build_options.tuning) basin_config.params.unc_futility else basin.defaults.unc_futility;
+            break :blk evaluated + margin + @divTrunc(complexity_cp * unc_futility, 16) + @divTrunc(quiet_history_score, 404);
+        } else null;
+        const basin_futility_fires = if (basin_futility_value) |value| value <= alpha else false;
         if (basin_futility_fires) {
             const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
             gives_check_hint = gives_check;
             if (!gives_check) {
                 ctx.noteQuietFutilityPrune();
                 outcome_flags.quiet_futility_prune = true;
+                // Fail-soft: the skipped move may be worth up to its estimate, so
+                // a fail low may not report less than that.
+                if (comptime fail_soft.ENABLED) {
+                    const value = basin_futility_value.?;
+                    if (value > best_score and !score_mod.isDecisive(best_score)) best_score = value;
+                }
                 continue;
             }
         }
@@ -992,9 +1051,22 @@ fn negamax(
         // post-make isInCheck this replaced was the same predicate, one attack
         // query per searched move; the context answers in two bitboard tests.
         const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
+        // From the second searched move on (the node did not cut on its first),
+        // or from the first at a node not expected to cut, pick the next move
+        // now and start its child's TT and RFP-hint misses, so they overlap
+        // this move's whole subtree. Hint key only.
+        if (!tt_stage and (moves_searched >= 1 or !node_ctx.cut_node) and index + 1 < moves.count) {
+            const upcoming = move_picker.next(index + 1);
+            lookahead_ready = true;
+            const hinted_key = make_unmake.prefetchKeyAfter(pos, upcoming);
+            resources.tt.prefetch(hinted_key);
+            resources.rfp_hint.prefetch(hinted_key);
+            resources.eval_cache.prefetch(hinted_key);
+        }
         const child_key = make_unmake.makeMove(pos, mv, &stack_entry.state);
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
         resources.rfp_hint.prefetch(child_key); // and the RFP-hint cluster (probed per negamax node)
+        resources.eval_cache.prefetch(child_key); // and the eval-cache set (probed on a TT eval miss)
         ctx.repetition.push(child_key);
         child_entry.prev_move = mv;
         child_entry.prev_piece_type = moved_piece_type;
@@ -1008,7 +1080,11 @@ fn negamax(
         // side that is FAILING, while the bloat is checks given comfortably ahead.
         // So: extend at shallow depth always (tactical net) and at ANY depth when
         // the checker is failing low (this line needs a rescue); never otherwise.
-        const checker_desperate = (static_eval orelse alpha) <= alpha;
+        // Fix 2026-09-29: at a mate-bound alpha every centipawn static eval is below
+        // alpha, so the test called the WINNING side desperate and extended its checks
+        // at every depth (audit position 227: depth 15 past 100M nodes). The desperate
+        // test only means something against a centipawn alpha.
+        const checker_desperate = (static_eval orelse alpha) <= alpha and !score_mod.isMateLike(alpha);
         const check_extension: i16 = if (shallow_arms.checkExtensionEnabled() and gives_check and (search_depth <= CHECK_EXTENSION_MAX_DEPTH or checker_desperate)) 1 else 0;
         var extension = check_extension;
         var check_extension_selected = check_extension > 0;
@@ -1047,6 +1123,15 @@ fn negamax(
         const negative_extension = extension < 0;
         const child_base_depth = shallow_arms.childDepth(search_depth, extension);
         const negative_child_ctx = node_context.NodeContext{ .pv_node = false, .cut_node = true };
+        // A child searched at depth >= 1 takes a corrected static eval. A move
+        // leaves most correction classes untouched (a pawn push changes only the
+        // pawn key, a piece move the mover's non-pawn key and one of minor/major),
+        // so the child's entries for those classes sit at THIS node's keys in the
+        // child's side-to-move row: prefetch all five now, while the child is
+        // made and probes the TT. The changed classes' lines are wasted hints.
+        if (corr_keys) |keys| {
+            if (child_base_depth > 0) resources.history.prefetchCorrection(pos.side_to_move, keys);
+        }
 
         // Lazy accumulator: record the move only (a couple of byte stores). The
         // old ~210B Position snapshot — the store-forward-stall family in the
@@ -1098,8 +1183,15 @@ fn negamax(
                 if (!ctx.stopped and reduction > 0 and score > alpha) {
                     var research_depth: i32 = child_base_depth;
                     const deeper_threshold = if (comptime build_options.tuning) basin_config.params.deeperThreshold(child_base_depth) else basin.deeperThreshold(child_base_depth);
-                    if (score > best_score + deeper_threshold) research_depth += 1;
-                    if (score < best_score + child_base_depth) research_depth -= 1;
+                    // The re-search depth rule keeps the inputs it was tuned on: under
+                    // fail-hard returns a reduced fail high scored alpha + 1 and the
+                    // best score sat at alpha. Fed fail-soft magnitudes it would stop
+                    // shortening re-searches (cold depth 13: +16.8% nodes; clamped
+                    // -4.9%, A3b exploration).
+                    const score_hard = if (comptime fail_soft.ENABLED) @min(score, alpha + 1) else score;
+                    const best_hard = if (comptime fail_soft.ENABLED) @max(best_score, alpha) else best_score;
+                    if (score_hard > best_hard + deeper_threshold) research_depth += 1;
+                    if (score_hard < best_hard + child_base_depth) research_depth -= 1;
                     const verified_depth: u16 = @intCast(std.math.clamp(research_depth, 1, @as(i32, child_base_depth) + 1));
                     ctx.noteLmrResearch(move_index, reduction, score, alpha, quiet_history_score, node_ctx.pv_node, node_ctx.cut_node);
                     if (move_order_sample) |sample| ctx.noteMoveOrderLmrResearch(sample);
@@ -1197,16 +1289,22 @@ fn negamax(
     }
     if (excluded_move == null) {
         // Correction history learning: teach the tables the gap between the raw
-        // static eval and the search result, when the result actually bounds it
-        // (skip mate scores, capture best-moves, and bound-inconsistent pairs:
-        // a fail-high below raw / fail-low above raw says nothing about eval error).
+        // static eval and the search result (history_mod.correctionLearns: the
+        // build's event rule against the caller's window). Mate and tablebase
+        // scores and capture best-moves are tactics or oracle values, not eval
+        // error.
         if (raw_static_eval) |raw| {
             const best_is_capture = if (best_move) |bm| bm.isCapture() else false;
-            if (!score_mod.isMateLike(best_score) and !best_is_capture and
-                !(best_score >= beta_in and best_score <= raw) and
-                !(best_score <= alpha_orig and best_score >= raw))
+            const corr_params: *const basin.Params = if (comptime build_options.tuning) &basin_config.params else &basin.defaults;
+            const estimate: i32 = static_eval.? + resources.history.correctionMean(pos);
+            if (!score_mod.isDecisive(best_score) and !best_is_capture and
+                history_mod.correctionLearns(best_score, alpha_orig, beta_in, estimate))
             {
-                resources.history.updateCorrection(pos, best_score - raw, @intCast(search_depth));
+                if (corr_keys) |keys| {
+                    resources.history.updateCorrectionKeyed(pos, keys, corr_cont, best_score - raw, @intCast(search_depth), corr_params);
+                } else {
+                    resources.history.updateCorrection(pos, corr_cont, best_score - raw, @intCast(search_depth), corr_params);
+                }
             }
         }
         tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), alpha_orig, beta_in, best_score, best_move, tt_store.evalToTt(raw_static_eval), node_ttpv);
@@ -1345,6 +1443,7 @@ fn tryProbCut(
         const moving_piece = pos.pieceAt(mv.from);
         const child_key = make_unmake.makeMove(pos, mv, &entry.state);
         resources.tt.prefetch(child_key);
+        resources.eval_cache.prefetch(child_key);
         ctx.repetition.push(child_key);
         child_entry.prev_move = mv;
         child_entry.prev_piece_type = null;
@@ -1621,6 +1720,14 @@ fn recordTriedQuiet(
     quiet_count.* += 1;
 }
 
+/// Continuation-correction keys of a node: the continuation-history keys of
+/// its 1-ply and 2-ply predecessors (`continuationContext`); CONT_NONE where
+/// that has none (null move, root).
+inline fn corrContFor(ctx: *context_mod.SearchContext, ply: usize, stm: types.Color) history_mod.CorrCont {
+    const cont = continuationContext(ctx, ply, stm);
+    return .{ .k1 = cont.prev[0], .k2 = cont.prev[1] };
+}
+
 fn isImproving(ctx: *context_mod.SearchContext, ply: usize, static_eval: types.Score) bool {
     if (ply < 2) return false;
     const previous = ctx.stack.entry(ply - 2).static_eval orelse return false;
@@ -1767,7 +1874,13 @@ test "reverse futility does not publish a heuristic tt bound" {
     ctx.stack.entry(1).acc.refresh(evaluator.net.?, &pos);
 
     const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, 2, 49, 50, 1, true, node_context.NodeContext.fromWindow(49, 50, false), null, null);
-    try std.testing.expectEqual(@as(types.Score, 50), score);
+    // Fail-soft returns beta moved toward the eval (fail_soft.evalCutoff); a
+    // fail-hard build returns beta itself.
+    if (comptime fail_soft.ENABLED) {
+        try std.testing.expect(score > 50 and !score_mod.isDecisive(score));
+    } else {
+        try std.testing.expectEqual(@as(types.Score, 50), score);
+    }
     try std.testing.expect(table.lookup(pos.zobrist_key) == null);
     try std.testing.expect(hint_table.lookup(pos.zobrist_key, 2) != null);
 }
@@ -1809,6 +1922,71 @@ test "reverse futility hint reuses on second probe without evaluating" {
     try std.testing.expectEqual(evals_after_first, ctx.stats.main_static_evals);
     try std.testing.expectEqual(rf_prunes_after_first, ctx.stats.reverse_futility_prunes);
     if (context_mod.stats_enabled) try std.testing.expect(ctx.stats.rfp_hint_cutoffs >= 1);
+}
+
+const SeededSearchResult = struct {
+    score: types.Score,
+    nodes: u64,
+};
+
+/// Test helper: one negamax call at ply 0 on fresh tables, after `seed`
+/// (a struct with `fn apply(*TranspositionTable, *HintTable, key)`) has
+/// written entries for the searched position.
+fn searchSeededForTest(fen_text: []const u8, depth: u16, alpha: types.Score, beta: types.Score, seed: anytype) !SeededSearchResult {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+
+    var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var ctx = context_mod.SearchContext{
+        .repetition = .{},
+        .control = time.Controller.init(&stop_flag, .{}),
+        .basin_config = if (build_options.tuning) &test_basin_config else {},
+    };
+    var history_table = history_mod.HistoryTable{};
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hint_table = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hint_table.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+    var pos = try fen.parse(fen_text);
+    ctx.repetition.push(pos.zobrist_key);
+    evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+    seed.apply(&table, &hint_table, pos.zobrist_key);
+
+    const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hint_table, .eval_cache = &ecache, .history = &history_table, .evaluator = &evaluator }, &pos, depth, alpha, beta, 0, true, node_context.NodeContext.fromWindow(alpha, beta, false), null, null);
+    try std.testing.expect(!ctx.stopped);
+    return .{ .score = score, .nodes = ctx.nodes };
+}
+
+const NoSeed = struct {
+    fn apply(_: NoSeed, _: *tt_mod.TranspositionTable, _: anytype, _: u64) void {}
+};
+
+const HintSeed = struct {
+    score: i32,
+    fn apply(self: HintSeed, _: *tt_mod.TranspositionTable, hints: anytype, key: u64) void {
+        hints.store(key, 30, self.score);
+    }
+};
+
+const SEEDED_TEST_FEN = "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+
+test "a PV window neither cuts on nor raises alpha from the reverse-futility hint" {
+    const alpha: types.Score = -400;
+    const beta: types.Score = 400;
+    const clean = try searchSeededForTest(SEEDED_TEST_FEN, 4, alpha, beta, NoSeed{});
+    // A hint inside the window (would raise alpha) and one at beta (would cut).
+    for ([_]i32{ 0, clean.score + 20, beta }) |hint_score| {
+        const hinted = try searchSeededForTest(SEEDED_TEST_FEN, 4, alpha, beta, HintSeed{ .score = hint_score });
+        try std.testing.expectEqual(clean.score, hinted.score);
+        try std.testing.expectEqual(clean.nodes, hinted.nodes);
+    }
 }
 
 test "basin futility searches a first quiet move before pruning" {
@@ -1974,6 +2152,42 @@ test "singular alternative quality rejects strong tactical alternatives and reco
     see_scores = [_]i32{0} ** move_mod.MAX_MOVES;
     const killer_quality = classifySingularAlternatives(&pos, &moves, &see_scores, tt_move, &stack_entry, null, &history_table, 0);
     try std.testing.expect(killer_quality.has_killer_or_countermove);
+}
+
+test "null move is not tried inside a singular verification search" {
+    @import("startup.zig").ensure();
+    if (comptime !context_mod.stats_enabled) return error.SkipZigTest;
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hints = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hints.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+    // Queen up, beta far below the eval, depth above the RFP range: the plain
+    // node tries null move first. Node limit 2 stops at the first child.
+    const excluded = move_mod.Move.init(.e2, .e4, .quiet);
+    for ([_]?move_mod.Move{ null, excluded }) |excluded_move| {
+        var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+        var stop_flag = std.atomic.Value(bool).init(false);
+        var ctx = context_mod.SearchContext{
+            .repetition = .{},
+            .control = time.Controller.init(&stop_flag, .{ .node_limit = 2 }),
+            .basin_config = if (build_options.tuning) &test_basin_config else {},
+        };
+        var history = history_mod.HistoryTable{};
+        table.clear();
+        var pos = try fen.parse("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1");
+        ctx.repetition.push(pos.zobrist_key);
+        evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+        _ = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, 20, -201, -200, 0, true, node_context.NodeContext.fromWindow(-201, -200, false), excluded_move, false);
+        try std.testing.expectEqual(@as(u64, if (excluded_move == null) 1 else 0), ctx.stats.null_tries);
+    }
 }
 
 test "root LMR starts with the third quiet move and preserves tactical guards" {

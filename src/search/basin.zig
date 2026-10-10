@@ -7,6 +7,11 @@
 //! terms taken as-is. The implementation, its integration, guards and
 //! score-unit calibration are zigqueen's; no source text was transcribed.
 //! In 6.2.0, a local 12-coordinate pruning SPSA retune changed 11 defaults.
+//! A2 candidate (2026-10): a local 17-coordinate SPSA retune for the BT4 net
+//! changed 15 defaults (artifacts/research/a2-spsa-20261001/).
+//! Correction-history bundle (2026-10): a joint 26-coordinate SPSA (margins,
+//! reductions, correction, uncertainty, fail-soft softness) on top of A2
+//! changed 21 defaults (artifacts/research/cbundle-20261003/).
 //! Remaining inherited values and the original formulas retain that provenance.
 //! See docs/PROVENANCE.md, section 1, for the before/after values.
 //!
@@ -31,17 +36,17 @@ const LMR_MAX_M: usize = 64;
 
 pub const Params = struct {
     // Decimal LMR coefficients in integer 1/1000 units.
-    lmr_quiet_base_1000: i32 = 780,
-    lmr_quiet_divisor_1000: i32 = 2360,
+    lmr_quiet_base_1000: i32 = 832,
+    lmr_quiet_divisor_1000: i32 = 1686,
     lmr_noisy_base_1000: i32 = -100,
     lmr_noisy_divisor_1000: i32 = 2490,
 
     // Fractional reduction adjustments in 1/1024-ply units.
     lmr_base_adjust: i32 = -37,
-    lmr_non_pv_adjust: i32 = 1069,
+    lmr_non_pv_adjust: i32 = 1307,
     lmr_noisy_history_coeff: i32 = 423,
     lmr_quiet_history_coeff: i32 = 447,
-    lmr_improving_adjust: i32 = -1242,
+    lmr_improving_adjust: i32 = -1195,
     lmr_check_adjust: i32 = -852,
     lmr_cut_adjust: i32 = 1945,
     lmr_noisy_tt_move_adjust: i32 = 1081,
@@ -52,32 +57,32 @@ pub const Params = struct {
     lmr_depth_tt_pv_offset: i32 = 726,
 
     // Published-margin units; scaled once by unit_percent at use.
-    nmp_margin_base: i32 = 219,
-    nmp_margin_depth_coeff: i32 = 1327,
-    nmp_margin_improving_coeff: i32 = 39,
-    nmp_reduction_base: i32 = 6,
+    nmp_margin_base: i32 = 207,
+    nmp_margin_depth_coeff: i32 = 1357,
+    nmp_margin_improving_coeff: i32 = 38,
+    nmp_reduction_base: i32 = 8,
     nmp_reduction_depth_divisor: i32 = 5,
 
     lmp_base: i32 = 3,
     lmp_quadratic: i32 = 1,
     lmp_non_improving_divisor: i32 = 2,
 
-    rfp_linear: i32 = 84,
+    rfp_linear: i32 = 79,
     rfp_quadratic: i32 = 7,
-    rfp_improving_coeff: i32 = 70,
+    rfp_improving_coeff: i32 = 72,
     rfp_max_depth: i32 = 12,
 
-    history_prune_linear: i32 = -2482,
-    history_prune_base: i32 = -1313,
+    history_prune_linear: i32 = -2653,
+    history_prune_base: i32 = -1345,
     history_prune_lmr_depth_max: i32 = 5,
 
-    futility_base: i32 = 237,
-    futility_per_depth: i32 = 71,
+    futility_base: i32 = 240,
+    futility_per_depth: i32 = 75,
     futility_lmr_depth_max: i32 = 8,
     futility_alpha_cap: i32 = 500,
 
-    see_quiet_coeff: i32 = -21,
-    see_noisy_per_depth: i32 = -116,
+    see_quiet_coeff: i32 = -20,
+    see_noisy_per_depth: i32 = -126,
 
     history_bonus_per_depth: i32 = 277,
     history_bonus_offset: i32 = -575,
@@ -90,6 +95,34 @@ pub const Params = struct {
     research_per_depth: i32 = 4,
     lmr_tt_pv_brake: i32 = -886,
     unit_percent: i32 = 25,
+
+    // Fail-soft returns (A3b): an RFP or stand-pat cutoff returns beta moved
+    // toward the eval by this many sixteenths of the gap (fail_soft.zig).
+    rfp_softness: i32 = 6,
+    standpat_softness: i32 = 9,
+    // Correction history (A3c, history.zig): relative class weights of the
+    // applied average, applied scale (64 = 1.0), learning steps and the cap
+    // on a learning target.
+    corr_weight_pawn: i32 = 16,
+    corr_weight_nonpawn: i32 = 16,
+    corr_weight_minor: i32 = 17,
+    corr_weight_major: i32 = 16,
+    corr_apply_scale: i32 = 77,
+    /// Class entries move min(depth, 16) * corr_step / 1024 of the gap.
+    corr_step: i32 = 16,
+    /// The bucket mean moves corr_mean_step / 4096 of the gap.
+    corr_mean_step: i32 = 15,
+    corr_target_cap: i32 = 128,
+    /// Continuation classes (previous move, move before that).
+    corr_weight_cont1: i32 = 14,
+    corr_weight_cont2: i32 = 16,
+
+    // Uncertainty (bundle step 2): |correction| makes pruning and reduction
+    // less aggressive. RFP and quiet futility margins grow by |c| * unc / 16;
+    // LMR loses lmr_complexity_coeff / 1024 ply per cp of |c|.
+    unc_rfp: i32 = 8,
+    unc_futility: i32 = 7,
+    lmr_complexity_coeff: i32 = 10,
 
     inline fn scalePublished(self: *const Params, value: i32) i32 {
         return @divTrunc(value * self.unit_percent, 100);
@@ -160,7 +193,7 @@ pub const Params = struct {
         r += @as(i32, @intCast(m)) * self.lmr_move_number_adjust;
         if (in.ttpv) r += self.lmr_tt_pv_adjust;
         if (in.ttpv_fail_low) r += self.lmr_tt_pv_fail_low_adjust;
-        r -= in.complexity * 15;
+        r -= in.complexity * self.lmr_complexity_coeff;
         return r;
     }
 
@@ -393,11 +426,26 @@ pub const specs = [_]Spec{
     .{ .uci_name = "BasinResearchPerDepth", .field = "research_per_depth", .default = defaults.research_per_depth, .min = 2, .max = 6, .unit = "published margin/depth" },
     .{ .uci_name = "BasinLmrTtPvBrake", .field = "lmr_tt_pv_brake", .default = defaults.lmr_tt_pv_brake, .min = -4096, .max = 4096, .unit = "1/1024 ply" },
     .{ .uci_name = "BasinUnitPercent", .field = "unit_percent", .default = defaults.unit_percent, .min = 10, .max = 60, .unit = "percent" },
+    .{ .uci_name = "BasinRfpSoftness", .field = "rfp_softness", .default = defaults.rfp_softness, .min = 0, .max = 16, .unit = "1/16 of eval - beta" },
+    .{ .uci_name = "BasinStandPatSoftness", .field = "standpat_softness", .default = defaults.standpat_softness, .min = 0, .max = 16, .unit = "1/16 of eval - beta" },
+    .{ .uci_name = "CorrWeightPawn", .field = "corr_weight_pawn", .default = defaults.corr_weight_pawn, .min = 0, .max = 64, .unit = "relative weight" },
+    .{ .uci_name = "CorrWeightNonPawn", .field = "corr_weight_nonpawn", .default = defaults.corr_weight_nonpawn, .min = 0, .max = 64, .unit = "relative weight (each colour)" },
+    .{ .uci_name = "CorrWeightMinor", .field = "corr_weight_minor", .default = defaults.corr_weight_minor, .min = 0, .max = 64, .unit = "relative weight" },
+    .{ .uci_name = "CorrWeightMajor", .field = "corr_weight_major", .default = defaults.corr_weight_major, .min = 0, .max = 64, .unit = "relative weight" },
+    .{ .uci_name = "CorrApplyScale", .field = "corr_apply_scale", .default = defaults.corr_apply_scale, .min = 0, .max = 128, .unit = "1/64" },
+    .{ .uci_name = "CorrStep", .field = "corr_step", .default = defaults.corr_step, .min = 4, .max = 48, .unit = "1/1024 per depth" },
+    .{ .uci_name = "CorrMeanStep", .field = "corr_mean_step", .default = defaults.corr_mean_step, .min = 4, .max = 64, .unit = "1/4096" },
+    .{ .uci_name = "CorrTargetCap", .field = "corr_target_cap", .default = defaults.corr_target_cap, .min = 32, .max = 256, .unit = "cp" },
+    .{ .uci_name = "CorrWeightCont1", .field = "corr_weight_cont1", .default = defaults.corr_weight_cont1, .min = 0, .max = 64, .unit = "relative weight" },
+    .{ .uci_name = "CorrWeightCont2", .field = "corr_weight_cont2", .default = defaults.corr_weight_cont2, .min = 0, .max = 64, .unit = "relative weight" },
+    .{ .uci_name = "UncRfp", .field = "unc_rfp", .default = defaults.unc_rfp, .min = 0, .max = 32, .unit = "1/16 of |correction|" },
+    .{ .uci_name = "UncFutility", .field = "unc_futility", .default = defaults.unc_futility, .min = 0, .max = 32, .unit = "1/16 of |correction|" },
+    .{ .uci_name = "UncLmr", .field = "lmr_complexity_coeff", .default = defaults.lmr_complexity_coeff, .min = 0, .max = 48, .unit = "1/1024 ply per cp" },
 };
 
 pub fn setParam(params: *Params, uci_name: []const u8, value: i32) bool {
     inline for (specs) |spec| {
-        if (std.mem.eql(u8, uci_name, spec.uci_name)) {
+        if (std.ascii.eqlIgnoreCase(uci_name, spec.uci_name)) {
             @field(params, spec.field) = std.math.clamp(value, spec.min, spec.max);
             return true;
         }

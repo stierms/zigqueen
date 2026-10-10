@@ -119,7 +119,12 @@ pub const TranspositionTable = struct {
     /// before that node probes -- hides the random-access TT miss latency.
     pub inline fn prefetch(self: *const TranspositionTable, key: u64) void {
         if (self.entries.len == 0) return;
-        @prefetch(&self.entries[index(self.mask, key)], .{ .rw = .read, .locality = 3, .cache = .data });
+        // A 48-byte cluster straddles two 64-byte lines at every index = 1, 2
+        // (mod 4): hint its first and its last byte, so both lines are in flight
+        // (a redundant second hint to the same line costs one load-port slot).
+        const first: [*]const u8 = @ptrCast(&self.entries[index(self.mask, key)]);
+        @prefetch(first, .{ .rw = .read, .locality = 3, .cache = .data });
+        @prefetch(first + (@sizeOf(Cluster) - 1), .{ .rw = .read, .locality = 3, .cache = .data });
     }
 
     /// Copy the matching entry at the table boundary. The caller owns this

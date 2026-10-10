@@ -1,6 +1,6 @@
 # Provenance and licensing record
 
-**Updated September 25, 2026 for 6.3.0.** This record distinguishes inherited
+**Updated October 2026 for 6.4.0.** This record distinguishes inherited
 ideas and initial parameters, local implementations and retunes, trained
 weights, data transformations and redistributed third-party code.
 
@@ -29,12 +29,12 @@ https://github.com/stierms/zigqueen/issues.
 | Component / source | License | How zigqueen relates to it |
 |---|---|---|
 | zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
-| Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1); threat-conditioned quiet history is a published idea it also uses (§1, 6.3.0). No code. GPL-compatible. |
-| Stockfish 18 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§2, §3). No code. Training data: see next row. |
-| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/from_kaggle_2_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03 and 2026-09-14); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the 6.3.0 network (40 of its 42 components) and for the 6.2.0 network (§4), with local score alterations. Notice and alteration offer below. |
+| Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1); threat-conditioned quiet history is a published idea it also uses (§1, 6.3.0); fail-firm cutoff returns, correction-history classes and the \|correction\| terms in pruning and reductions are published ideas it also uses (§1, 6.4.0). No code. GPL-compatible. |
+| Stockfish 18 and 19 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§1, §2, §3); pawn-pair input concept (SFNNv16, credited to Pawnocchio's author; §2, 6.4.0). No code. Training data: see next row. |
+| Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/from_kaggle_2_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03 and 2026-09-14); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the 6.4.0 and 6.3.0 networks (40 of their 42 components, same database) and for the 6.2.0 network (§4), with local score alterations. Notice and alteration offer below. |
 | `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the two 2024 components. |
 | Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | LCZero-derived components of the training mix (§4). ODbL notice below. |
-| bullet (Jamie Whiting) | MIT | NNUE trainer, used with a full-threats input extension written for zigqueen and published as a patch (§4). Not linked into the engine. |
+| bullet (Jamie Whiting) | MIT | NNUE trainer, used with full-threat, pawn-pair and deployed-arithmetic QAT extensions written for zigqueen and published as patches (§4). Not linked into the engine. |
 | Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, three local modifications (§5). |
 | chessenginesupport-androidlib (gkalab) | Apache-2.0 | Vendored unmodified in `android/oex/…/com/kalab/chess/enginesupport/` for the OEX APK (§5). |
 | Gradle wrapper | Apache-2.0 | `android/oex/gradle/wrapper/gradle-wrapper.jar` (§5). |
@@ -99,6 +99,93 @@ GPL terms; this attribution is retained independently of the retune.
   transposition-table cluster, the job-wide node budget and the tablebase
   service were written for zigqueen.
 
+**Local retuning in 6.4.0.** Two zigqueen SPSA runs, judged by zigqueen
+match results, moved 17 of the inherited coordinates:
+
+- a 17-coordinate retune (800 iterations; 15 defaults changed);
+- the joint 26-coordinate tune of the correction-history bundle below
+  (1,219 iterations), which also set the bundle's own new parameters.
+
+Raw policy values, before any `UNIT_PERCENT` scaling:
+
+| Parameter | Original default | 6.2.0 | 6.4.0 |
+|---|---:|---:|---:|
+| `lmr_quiet_base_1000` | 780 | 780 | 832 |
+| `lmr_quiet_divisor_1000` | 2360 | 2360 | 1686 |
+| `lmr_non_pv_adjust` | 1069 | 1069 | 1307 |
+| `lmr_improving_adjust` | -1242 | -1242 | -1195 |
+| LMR complexity coefficient | 15 | 15 | 10 |
+| `nmp_margin_base` | 213 | 219 | 207 |
+| `nmp_margin_depth_coeff` | 1281 | 1327 | 1357 |
+| `nmp_margin_improving_coeff` | 41 | 39 | 38 |
+| `nmp_reduction_base` | 6 | 6 | 8 |
+| `rfp_linear` | 85 | 84 | 79 |
+| `rfp_improving_coeff` | 75 | 70 | 72 |
+| `history_prune_linear` | -2242 | -2482 | -2653 |
+| `history_prune_base` | -1315 | -1313 | -1345 |
+| `futility_base` | 274 | 237 | 240 |
+| `futility_per_depth` | 68 | 71 | 75 |
+| `see_quiet_coeff` | -20 | -21 | -20 |
+| `see_noisy_per_depth` | -111 | -116 | -126 |
+
+`rfp_quadratic` (7) and the coordinates not listed keep their original
+values. The formula lineage stays Stormphrax's. The retunes were accepted
+on zigqueen tests:
+
+- the 17-coordinate retune: STC and LTC SPRT H1, +4.7 ± 3.8 Elo at
+  60s+0.6s;
+- the bundle: STC and LTC SPRT H1, +18.0 ± 9.7 Elo at 60s+0.6s after an
+  early stop.
+
+**Search changes in 6.4.0.** None of these copies code from another engine.
+The correction-history bundle and the SEE fix each passed an independent
+review that included an originality check.
+
+- *Correction history.* This is now enabled. The search learns online how
+  far the raw evaluation misses in a class of positions, and corrects the
+  static evaluation by that amount.
+  - Published idea: Stockfish's correction history. Stormphrax 8.0.0 uses
+    pawn, per-colour non-pawn, major-piece and continuation tables, and
+    Stockfish also keeps a minor-piece table.
+  - zigqueen's classes are pawn, non-pawn per colour, minor, major, and two
+    continuation tables keyed by the previous move and the move before it.
+  - It learns only from scores consistent with their bound and skips
+    captures and positions in check. That is the conventional rule.
+  - Our own: the drift-removed learner. A running mean error per side to
+    move and pawn-count bucket is learned but never applied. Also ours are
+    the keys, the table layout and the SPSA-tuned weights and steps.
+  - The author's earlier private engine had a correction table. The
+    overlap is idea-level, and nothing was taken from it.
+- *Uncertainty terms.* The size of the correction raises the
+  reverse-futility and futility margins and lowers late-move reductions.
+  - Stormphrax 8.0.0's RFP margin and LMR formula carry the same
+    |correction| ("complexity") term.
+  - The LMR coefficient is the inherited one in the table above. It had no
+    effect while correction history was parked.
+  - The futility term extends the same idea. Its weights come from our SPSA.
+- *Fail-soft cutoff returns.* Reverse futility and quiescence stand-pat
+  return beta moved toward the evaluation, by 6/16 and 9/16 of the gap.
+  Null move returns its search score.
+  - Stormphrax 8.0.0 blends its returns the same way ("fail-firm"), with
+    other weights. In quiescence it also raises a fail-low to the futility
+    estimate of a pruned move; zigqueen does this in the main search.
+  - Our weights come from the joint SPSA.
+- *SEE king captures.* In the exchange sequence, a king may capture only
+  onto a square the opponent no longer attacks. That is the standard
+  legality rule. The author's earlier private engine uses the same rule in
+  different code, and nothing was taken from it.
+- *No null move inside the singular verification search.* This is the
+  conventional rule; Stormphrax 8.0.0 and Stockfish also skip null move at
+  excluded-move nodes.
+- *zigqueen's own fixes, with no outside source:*
+  - no desperation check extension at a mate-bound alpha;
+  - aspiration opens the failing side fully once its delta is capped;
+  - the reverse-futility hint table is read only at zero windows;
+  - checkmate takes precedence over the fifty-move count, as the rules of
+    chess require;
+  - no time plan may exceed the remaining clock;
+  - helper threads split the single-thread hint-table and eval-cache budget.
+
 ## 2. NNUE evaluation: published forms, our own implementation
 
 - **Feature transformer.** Mirrored HalfKA with 8 king buckets (each perspective's own king; files e–h mirrored onto
@@ -106,6 +193,17 @@ GPL terms; this attribution is retained independently of the retune.
   split, then ranks 3, 4, 5–6, 7–8) is the common 8-bucket layout used by many bullet-trained engines
   (it is not the layout of bullet's bundled examples, which use ten buckets); it is stored in the net header, not
   hard-coded in the engine.
+- **16 king buckets (6.4.0).** The 6.4.0 network splits each of those eight buckets in two (ranks 1 and 2 by file,
+  then ranks 3, 4, 5–6, 7–8 into a-b and c-d). Current engines commonly use 12–16 mirrored buckets. This map is
+  ours and, as before, is stored in the net header.
+- **Pawn-pair inputs (6.4.0).** Features for pairs of pawns on the same or adjacent files are a published idea.
+  Stockfish adopted it in SFNNv16 (Stockfish 19), crediting Jonathan Hallström (Pawnocchio), and Stormphrax 8.0.0
+  and Viridithas 20 shipped pawn-pawn inputs in 2026. Our dictionary, PP1, was fixed in a written specification
+  before any code. Its frame, colour classes, rank-pair tables, index layout, the `ZQBA` format and the incremental
+  update are ours. So is its exclusion rule: pair rows that duplicate a P→P threat feature are dropped, whereas
+  Stockfish drops the duplicate threat features instead. No other engine's code, index layout, tables, constants
+  or weights were read. The trainer's input type and the engine's implementation were written separately from the
+  specification and are cross-checked through shared index vectors.
 - **Layer stack and PSQT head.** SFNNv5-style: clipped ReLU + pairwise multiply on the accumulator halves,
   `1024 → 16` (i8) → squared-clipped-ReLU → `16 → 32` → `32 → 1`, eight material buckets, plus a per-feature PSQT head
   shared across the eight nonlinear output buckets. These are Stockfish's published network shapes.
@@ -139,6 +237,21 @@ no longer shipped.
 
 ## 4. The network: weights and data
 
+- **Weights (6.4.0).** The 6.4.0 network was trained from seeded random
+  initialisation, with 16 king buckets and pawn-pair inputs. Its float run
+  used 6.3.0's recipe. Then came 330 superbatches of quantisation-aware
+  training through the engine's integer arithmetic, for every layer.
+  Straight-through estimators are a standard technique. The graph that
+  reproduces zigqueen's integer inference is ours. No weights from the
+  6.3.0 network, its `v2` sibling or any third-party network were used for
+  initialisation, fine-tuning or logit distillation. The QAT stage continued
+  this network's own float run.
+- **Data (6.4.0).** This is the 6.3.0 database without change: the same 42
+  components, admission index, filter, holdout, quotas and target, as
+  listed below. No row was added, removed or relabelled. Only the reading
+  order differs. The QAT stage made two extra passes over the start of the
+  same stream with two new shuffle seeds (62021008, 62021009). The 6.3.0
+  alteration offer (`data-r2`) covers it.
 - **Weights (6.3.0).** The 6.3.0 network was trained from seeded random
   initialisation, then its nonlinear heads went through a QAT stage. No
   weights from the 6.2.0 network or any third-party network were used for
@@ -178,9 +291,11 @@ no longer shipped.
 - **Trainer.** bullet (MIT) with locally written feature mapping, loading,
   recipe and deployed-arithmetic training extensions. `docs/trainer/`
   publishes them as patches against `d372d48`: `bullet-fullthreats.patch`
-  for the original base, and `bullet-bt4-full.patch` and
-  `bullet-bt4-head-qat.patch` for the 6.3.0 network, with the two zigqueen
-  export scripts in `docs/trainer/tools/`. The trainer change behind the
+  for the original base, `bullet-bt4-full.patch` and
+  `bullet-bt4-head-qat.patch` for the 6.3.0 network, and `bullet-v2.patch`
+  and `bullet-v2-extend.patch` for the 6.4.0 network. The zigqueen export
+  scripts are in `docs/trainer/tools/`; `v2_net.py` reproduces the 6.4.0 file
+  byte for byte from the trainer's output. The trainer change behind the
   6.2.0 head continuation is not published.
   [NETWORK.md](NETWORK.md) records the recipes and model hashes.
 - **Data (6.0.0–6.2.0).** Twenty-seven published components, with exact source families
@@ -214,7 +329,10 @@ no longer shipped.
   the holdout keys, the quotas, the target and the code for each step,
   offered free of charge. The derivative database and our alterations are
   offered under ODbL-1.0 and individual contents under DbCL-1.0; we added no
-  individual contents. The `data-r1` offer covers the 6.2.0 network only.
+  individual contents. The same `data-r2` offer covers the 6.4.0 network,
+  which was trained on the same derivative database; the archive is attached
+  unchanged to the 6.4.0 release. The `data-r1` offer covers the 6.2.0
+  network only.
 
 ## 5. Third-party code compiled or packaged with zigqueen
 
@@ -283,3 +401,7 @@ at https://github.com/stierms/zigqueen/issues.
 - September 25, 2026, 6.3.0: new network trained from scratch on 42
   components and its data changes; search ideas added in 6.3.0; third local
   Fathom change.
+- October 2026, 6.4.0: network with 16 king buckets and pawn-pair inputs,
+  trained from scratch on the 6.3.0 database and finished with full-network
+  QAT; its trainer patches and export script; local retune of 17 inherited
+  search coordinates; origins of the 6.4.0 search changes.

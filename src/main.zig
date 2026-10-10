@@ -2,9 +2,6 @@ const std = @import("std");
 const attacks = @import("movegen/attacks.zig");
 const bench = @import("tools/bench.zig");
 const bitboard = @import("core/bitboard.zig");
-const corpus_from_pgn = @import("tools/corpus_from_pgn.zig");
-const corpus_search_label = @import("tools/corpus_search_label.zig");
-const corpus_validate = @import("tools/corpus_validate.zig");
 const datagen = @import("tools/datagen.zig");
 const fen = @import("core/fen.zig");
 const history_report = @import("tools/history_report.zig");
@@ -27,6 +24,7 @@ const square = @import("core/square.zig");
 const stability = @import("tools/stability.zig");
 const threats = @import("eval/threats.zig");
 const fullthreats = @import("eval/fullthreats.zig");
+const pawnpairs = @import("eval/pawnpairs.zig");
 const ft6_stats = @import("tools/ft6_stats.zig");
 const time_profile = @import("tools/time_profile.zig");
 const types = @import("core/types.zig");
@@ -70,67 +68,6 @@ pub fn main() !void {
         const pos = try parsePositionArg(args.next());
         const eval_options = try parseEvalOptions(args.next(), args.next());
         try bench.runWithOptions(stdout, &pos, depth, eval_options);
-        try stdout.flush();
-        return;
-    }
-
-    if (std.mem.eql(u8, mode, "corpus_from_pgn")) {
-        const path = args.next() orelse return error.InvalidCommand;
-        const min_ply = if (args.next()) |text| try std.fmt.parseInt(u32, text, 10) else 8;
-        const stride = if (args.next()) |text| try std.fmt.parseInt(u32, text, 10) else 2;
-        try corpus_from_pgn.run(stdout, path, min_ply, stride);
-        try stdout.flush();
-        return;
-    }
-
-    if (std.mem.eql(u8, mode, "corpus_validate")) {
-        const path = args.next() orelse return error.InvalidCommand;
-        const tuning_corpus = @import("tuning/corpus.zig");
-        const validation_permille = if (args.next()) |text| try std.fmt.parseInt(u16, text, 10) else tuning_corpus.default_validation_permille;
-        const seed = if (args.next()) |text| try std.fmt.parseInt(u64, text, 10) else tuning_corpus.default_split_seed;
-        const split_mode = if (args.next()) |text| try tuning_corpus.SplitMode.parse(text) else .fen;
-        const test_permille = if (args.next()) |text| try std.fmt.parseInt(u16, text, 10) else tuning_corpus.default_test_permille;
-        try corpus_validate.run(stdout, path, validation_permille, test_permille, seed, split_mode);
-        try stdout.flush();
-        return;
-    }
-
-    if (std.mem.eql(u8, mode, "corpus_search_label")) {
-        const path = args.next() orelse return error.InvalidCommand;
-        const depth = if (args.next()) |text| try std.fmt.parseInt(u16, text, 10) else return error.InvalidCommand;
-        const eval_options = try parseEvalOptions(args.next(), args.next());
-        const default_hash_mb = @import("search/tt.zig").DEFAULT_HASH_MB;
-        const hash_mb = if (args.next()) |text| try std.fmt.parseInt(u32, text, 10) else default_hash_mb;
-        const emit_header = if (args.next()) |text|
-            if (std.mem.eql(u8, text, "true"))
-                true
-            else if (std.mem.eql(u8, text, "false"))
-                false
-            else
-                return error.InvalidCommand
-        else
-            true;
-        try corpus_search_label.run(stdout, path, depth, hash_mb, eval_options, emit_header);
-        try stdout.flush();
-        return;
-    }
-
-    if (std.mem.eql(u8, mode, "corpus_search_label_nodes")) {
-        const path = args.next() orelse return error.InvalidCommand;
-        const node_limit = if (args.next()) |text| try std.fmt.parseInt(u64, text, 10) else return error.InvalidCommand;
-        const eval_options = try parseEvalOptions(args.next(), args.next());
-        const default_hash_mb = @import("search/tt.zig").DEFAULT_HASH_MB;
-        const hash_mb = if (args.next()) |text| try std.fmt.parseInt(u32, text, 10) else default_hash_mb;
-        const emit_header = if (args.next()) |text|
-            if (std.mem.eql(u8, text, "true"))
-                true
-            else if (std.mem.eql(u8, text, "false"))
-                false
-            else
-                return error.InvalidCommand
-        else
-            true;
-        try corpus_search_label.runNodes(stdout, path, node_limit, hash_mb, eval_options, emit_header);
         try stdout.flush();
         return;
     }
@@ -400,6 +337,8 @@ fn parseEvalOptions(eval_file_path_text: ?[]const u8, nnue_scale_text: ?[]const 
     return .{
         .nnue_scale_percent = nnue_scale_percent,
         .eval_file_path = eval_file_path,
+        // A scale given on the command line is explicit even when it equals the default.
+        .scale_explicit = nnue_scale_text != null,
     };
 }
 
@@ -417,6 +356,11 @@ test "parse eval options reads scale and eval file" {
     try std.testing.expectEqualStrings("<builtin>", options.eval_file_path.?);
 }
 
+test "a command-line scale equal to the default is explicit; no scale is not" {
+    try std.testing.expectEqual(@as(?bool, true), (try parseEvalOptions(null, "44")).scale_explicit);
+    try std.testing.expectEqual(@as(?bool, false), (try parseEvalOptions(null, null)).scale_explicit);
+}
+
 test "parse eval options treats default sentinel as no override" {
     const options = try parseEvalOptions("<default>", "100");
     try std.testing.expectEqual(@as(u16, 100), options.nnue_scale_percent);
@@ -427,9 +371,6 @@ test "root modules compile" {
     _ = attacks;
     _ = bench;
     _ = bitboard;
-    _ = corpus_from_pgn;
-    _ = corpus_search_label;
-    _ = corpus_validate;
     _ = datagen;
     _ = fen;
     _ = history_report;
@@ -450,6 +391,7 @@ test "root modules compile" {
     _ = stability;
     _ = threats;
     _ = fullthreats;
+    _ = pawnpairs;
     _ = time_profile;
     _ = types;
     _ = uci;

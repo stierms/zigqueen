@@ -57,7 +57,14 @@ pub fn run(progress: *std.Io.Writer, opts: Options) !void {
 
     const allocator = std.heap.page_allocator;
 
-    const data = try std.fs.cwd().readFileAlloc(allocator, opts.input_path, 8 << 30);
+    // Line offsets and lengths are u32, so the input must stay below 4 GiB.
+    const max_input_bytes = std.math.maxInt(u32);
+    if ((try std.fs.cwd().statFile(opts.input_path)).size > max_input_bytes) {
+        try progress.print("relabel: {s} is 4 GiB or larger; line offsets are 32-bit, split the input\n", .{opts.input_path});
+        try progress.flush();
+        return error.InputTooLarge;
+    }
+    const data = try std.fs.cwd().readFileAlloc(allocator, opts.input_path, max_input_bytes);
     defer allocator.free(data);
 
     // Index the lines once so workers can take contiguous, equal ranges.
@@ -117,11 +124,17 @@ pub fn run(progress: *std.Io.Writer, opts: Options) !void {
     const handles = try allocator.alloc(std.Thread, opts.threads);
     defer allocator.free(handles);
     var spawned: usize = 0;
+    var spawn_err: ?anyerror = null;
     for (handles, contexts) |*h, *ctx| {
-        h.* = std.Thread.spawn(.{}, workerMain, .{ctx}) catch break;
+        h.* = std.Thread.spawn(.{}, workerMain, .{ctx}) catch |err| {
+            spawn_err = err;
+            break;
+        };
         spawned += 1;
     }
     for (handles[0..spawned]) |h| h.join();
+    // An unstarted worker leaves its row range unprocessed.
+    if (spawn_err) |err| return err;
     if (shared.failed.load(.acquire)) return error.RelabelWorkerFailed;
 
     const done = shared.rows_done.load(.monotonic);

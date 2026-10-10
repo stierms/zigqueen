@@ -17,10 +17,12 @@ src/
   movegen/        attack tables (magics), pseudo-legal generation, legality
                   filtering, make/unmake, perft
   eval/           NNUE runtime (nnue768.zig), full-threat enumeration/deltas
-                  (fullthreats.zig), eval backend dispatch, embedded default net
+                  (fullthreats.zig), pawn-pair block (pawnpairs.zig), eval
+                  backend dispatch, embedded default net
   search/         engine state, search context/stack, TT, eval cache, qsearch,
-                  root/negamax, pruning, reductions (basin), move ordering,
-                  history tables, SEE, repetition, PV, Syzygy probing, time
+                  root/negamax, pruning, reductions (basin), fail-soft returns,
+                  move ordering, history and correction-history tables, SEE,
+                  repetition, fifty-move rule, PV, Syzygy probing, time
                   management, tunables (compiled in; exposed only in
                   `-Dtuning` builds)
   uci/            UCI protocol, options, search worker integration
@@ -43,23 +45,33 @@ Structural rules:
 
 ## NNUE evaluation
 
-![ZQB9 network dataflow](diagrams/net-architecture-annotated.svg)
+![Network dataflow, 6.3.0 (ZQB9) layout](diagrams/net-architecture-annotated.svg)
+
+The diagram shows the 6.3.0 `ZQB9` network. 6.4.0 doubles the king buckets
+to 16 and adds the pawn-pair block.
 
 The evaluator is a pure NNUE (no hand-crafted evaluation) in the engine's own
-`ZQB` family of net formats, loaded from an embedded 74.6 MB net
+`ZQB` family of net formats, loaded from an embedded 88.7 MB net
 (`src/eval/default_net.zqb`) or an external file via the `EvalFile` UCI
-option. The deployed generation is **ZQB9**:
+option. The deployed generation is **ZQBA** (6.4.0), which is `ZQB9` plus a
+pawn-pair block; `ZQB9` files still load:
 
-- **Feature transformer — HalfKA-8.** Standard Chess768 features (color x
-  piece type x square, 768 per block) replicated over 8 king buckets with
+- **Feature transformer — HalfKA-16.** Standard Chess768 features (color x
+  piece type x square, 768 per block) replicated over 16 king buckets with
   horizontal mirroring: per perspective, the bucket is chosen by that side's
   own king square (black's frame is rank-flipped via `sq ^ 56`), and files
-  e-h are mirrored onto a-d. Accumulator width is 1024 per perspective, i16
-  quantized.
+  e-h are mirrored onto a-d. The bucket map is read from the net header
+  (6.0.0–6.3.0 nets: 8 buckets). Accumulator width is 1024 per perspective,
+  i16 quantized.
 - **Threat features.** The `zqHalfKA9` full-threat mapping has 60,144 sparse
   attacker/target-relation inputs. Threat rows are stored as i8 weights and
   maintained in a separate incremental half before the readout combines them
   with the HalfKA accumulator.
+- **Pawn-pair features (ZQBA).** 1,488 inputs (1,278 live): pairs of pawns
+  on ranks 2–7 on the same or adjacent files, in the same oriented frame.
+  Pairs that duplicate a pawn-on-pawn threat feature are left out. The rows
+  are i8 and live in the threat half, because they depend on the mirror flip
+  but not on the king bucket.
 - **PSQT head.** One per-feature scalar head, added outside the eight
   material-bucketed nonlinear stacks.
 - **Layerstack readout.** An SFNNv5-style output stack per material bucket:
@@ -67,6 +79,9 @@ option. The deployed generation is **ZQB9**:
   `1024 -> 16` l1 (i8 weights, VNNI/dot-product matmul) ->
   squared-clipped-ReLU -> `16 -> 32` l2 -> `32 -> 1` l3, blended with the
   PSQT head. There are eight material buckets.
+- **Output scale.** `NNUE Scale Percent` defaults to 44 for `ZQBA` and
+  `ZQB9` nets (6.3.0: 48 for `ZQB9`); the default follows the loaded net's
+  format.
 
 Inference uses portable `@Vector` SIMD (lowers to AVX-512/AVX2/NEON with a
 scalar fallback); integer SIMD is bit-exact, so eval output is identical
@@ -87,7 +102,9 @@ tuning for x86-64-v4 had kept them at 256 bits.
 - **Refresh caches and barriers.** HalfKA uses a per-(side,
   king-bucket/flip) finny cache. Full-threat updates use lazy per-ply deltas,
   with barrier records and a small flip cache when a king changes the
-  perspective's bucket/mirror orientation.
+  perspective's bucket/mirror orientation. Pawn-pair rows change only on
+  moves that change a pawn set; their deltas go into the same batch as the
+  threat deltas.
 
 The net is trained with the [bullet](https://github.com/jw1912/bullet)
 trainer on the publicly published Stockfish NNUE training datasets
@@ -99,7 +116,10 @@ mapping is validated bit-for-bit against a trainer-faithful reference.
 
 ![Search pipeline](diagrams/search-pipeline.png)
 
-Iterative deepening with aspiration windows around a PVS/negamax core.
+Iterative deepening with aspiration windows around a PVS/negamax core. Once
+an aspiration delta reaches its cap, the failing side of the window opens
+fully (6.4.0), so a search near a mate score can no longer fail low or high
+forever.
 
 - **Threads (Lazy SMP).** With `Threads` above 1, every thread runs its own
   iterative deepening on the same root. The threads share one transposition
@@ -108,7 +128,9 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
   root tablebase decision, all UCI output and the final move, and one
   job-wide node budget covers `go nodes`. Helper threads are created when
   `Threads` changes and park between searches; nothing is allocated during a
-  search. `Threads=1` runs the serial search with no helper threads.
+  search. `Threads=1` runs the serial search with no helper threads. Since
+  6.4.0 the threads split the single-thread budget for hint tables and eval
+  caches between them; before, each thread sized its own from `Hash`.
 - **Transposition table.** Clustered, generation-based depth-preferred
   replacement, prefetched, and it caches the raw static eval so a TT hit
   without a cutoff still skips the NNUE forward pass. At one thread a
@@ -124,27 +146,51 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
   remembering.
 - **Pruning/reductions:** interior reductions and the forward-pruning
   families (null move with verification, reverse futility with a prefetched
-  hint table, futility, late-move and history pruning, SEE pruning) share
-  one fractional "basin" depth-dose scheme. The formulas and initial
-  constants of that scheme were taken from Stormphrax 8.0.0's published
-  parameter set and re-implemented in Zig (`docs/PROVENANCE.md`, section 1);
+  hint table read only at zero windows, futility, late-move and history
+  pruning, SEE pruning) share one fractional "basin" depth-dose scheme. The
+  formulas and initial constants of that scheme were taken from Stormphrax
+  8.0.0's published parameter set and re-implemented in Zig, then partly
+  retuned by local SPSA runs in 6.2.0 and 6.4.0 (`docs/PROVENANCE.md`,
+  section 1);
   probcut and razoring sit alongside it with zigqueen's own constants. At the
   root, post-PV moves are scouted at reduced depth and re-searched at full
-  depth on a fail-high.
+  depth on a fail-high. Null move is not tried inside a singular verification
+  (excluded-move) search.
+- **Fail-soft cutoffs (6.4.0):** reverse futility and quiescence stand-pat
+  return beta moved part of the way toward the static eval. Null move
+  returns its search score, and capture and check cutoffs in quiescence
+  return their score. Decisive values fall back to the bound. TT entries
+  store the returned values.
+- **Correction history (6.4.0):** per-thread tables learn during search how
+  far the raw static eval misses. The classes are pawn structure, each
+  colour's non-pawn pieces, minor pieces, major pieces, and the previous two
+  moves. A mean error per side to move and pawn-count bucket is learned and
+  subtracted; only class deviations correct the eval.
+  - The corrected eval feeds the pruning decisions (reverse futility,
+    null-move gates, razoring, ProbCut, futility, bad-capture pruning), the
+    extension gates and `improving`.
+  - TT and eval-cache slots keep the raw eval, and so does the quiescence
+    stand-pat.
+  - The size of the correction widens the reverse-futility and futility
+    margins and shrinks late-move reductions.
 - **Extensions:** a singular-extension family, plus desperation-conditioned
   check extensions (checks extend at shallow depth always, and at any depth
   only when the static eval is at or below alpha — never while ahead, which
-  keeps the branching factor position-aware).
+  keeps the branching factor position-aware). Since 6.4.0 there is no
+  desperation extension when alpha is a mate bound.
 - **Move ordering:** TT move first, captures by SEE, killers, countermove,
   quiet history (kept in four tables by whether the move's from- and
-  to-squares are attacked by the opponent), continuation history. Correction
-  history is implemented but parked in this release (its tables are not
-  allocated, so the static eval is used uncorrected).
+  to-squares are attacked by the opponent), continuation history.
+- **SEE:** a king may capture in the exchange sequence only onto a square
+  the opponent no longer attacks (6.4.0; before, every king recapture counted
+  as free).
 - **Quiescence:** captures/promotions plus SEE-gated quiet checks at the
   first qsearch ply (a direct-check generator keeps the horizon
   check-aware without a movegen pass).
 - **Node accounting:** one visited position, one node — `nodes`/`nps` are
   honest counts.
+- **Fifty-move rule:** a node at halfmove clock 100 is a draw unless the side
+  to move is checkmated (6.4.0).
 - **Endgames:** Syzygy WDL probing at search time via the vendored Fathom
   prober (`SyzygyPath`). At a root the tables cover, a clock-aware DTZ probe
   of every legal move restricts the search to the moves that keep the best
@@ -156,8 +202,9 @@ Iterative deepening with aspiration windows around a PVS/negamax core.
 - **Time management:** iteration-based budgeting with a `Move Overhead`
   guard; the hard per-move deadline extends beyond its normal ceiling only
   for the iteration after a completed iteration that changed its best move
-  or dropped the score. The per-node clock check is throttled off the hot
-  path.
+  or dropped the score. No plan may exceed the remaining clock (6.4.0;
+  earlier versions could at `movestogo 1`). The per-node clock check is
+  throttled off the hot path.
 
 At `Threads=1`, search behavior at fixed depth is bit-deterministic, which
 the tooling exploits: performance work is validated by node-identity
@@ -174,7 +221,8 @@ With more threads the result depends on scheduling and is not reproducible.
   `madvise(HUGEPAGE)` on a 2 MB-aligned region -> plain heap; on Windows it
   is `VirtualAlloc(MEM_LARGE_PAGES)` (self-enabling `SeLockMemoryPrivilege`
   when the account has been granted "Lock pages in memory") with a silent
-  fallback to regular pages.
+  fallback to regular pages. Since 6.4.0 the search context (about 2.4 MB of
+  search stack and accumulator state) is mapped the same way.
 - **Prefetching.** TT and RFP-hint probes for the child position are
   prefetched at make time. Any new per-node randomly indexed table should be
   audited for the same treatment.

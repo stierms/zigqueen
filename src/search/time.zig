@@ -8,15 +8,17 @@ const SUDDEN_DEATH_DIVISOR: u64 = 24;
 const SUDDEN_DEATH_NO_INCREMENT_DIVISOR: u64 = 28;
 const LOW_TIME_DIVISOR: u64 = 32;
 
-/// TM arc r1 (2026-08-06): every mechanism below is env-gated and DEFAULT OFF.
-/// With no ZQ_TM_* variables set, budgets are bit-identical to the legacy
-/// planner. Knob reference lives in docs/TIME_MANAGEMENT.md.
+/// TM arc r1 (2026-08-06): the phase and signal mechanisms below are env-gated
+/// and DEFAULT OFF. Knob reference lives in docs/archive/TIME_MANAGEMENT.md.
 ///
-/// Gates (booleans, set =1 to enable):
-///   ZQ_TM_CLAMP  — audit fix: clamp optimum (and thus returned maximum) to the
-///                  remaining-clock hard cap. Without it, the increment/4 term
-///                  can push the budget past the clock at increment-heavy low
-///                  clocks (e.g. 100ms left + 1s inc plans a 252ms maximum).
+/// Gates (booleans, set =1 to enable, =0 to disable):
+///   ZQ_TM_CLAMP  — DEFAULT ON since 2026-09-30: clamp optimum (and thus the
+///                  returned maximum) to the remaining-clock hard cap. Without
+///                  it a plan can exceed the clock in two regimes: the last
+///                  move before a time control (movestogo 1 plans 130% of the
+///                  remaining clock at the shipped spend level) and
+///                  increment-heavy low clocks (100ms left + 1s inc plans
+///                  255ms). ZQ_TM_CLAMP=0 recovers the 6.0.0–6.3.0 plans.
 ///   ZQ_TM_PHASE  — game-phase soft-budget ramp keyed on the full-move clock.
 ///   ZQ_TM_NF     — soft-limit scaling by node-fraction of the best root move.
 ///   ZQ_TM_BM     — soft-limit scaling by best-move stability streak.
@@ -30,8 +32,8 @@ const LOW_TIME_DIVISOR: u64 = 32;
 /// 300 / 6 (was 50 / 8). Set 50 / 8 to recover the pre-r6 1.5x ceiling
 /// bit-for-bit.
 pub const TmConfig = struct {
-    /// ZQ_TM_CLAMP: fix the budget-exceeds-clock defect (see above).
-    clamp_fix: bool = false,
+    /// ZQ_TM_CLAMP: no plan may exceed the remaining clock (see above).
+    clamp_fix: bool = true,
 
     /// ZQ_TM_OPT_PCT (r2 spend-level knob): uniform percent scale on the soft
     /// (optimum) budget, applied with the phase ramp BEFORE the low-time
@@ -176,6 +178,11 @@ fn envFlag(allocator: std.mem.Allocator, name: []const u8) ?bool {
     return parsed != 0;
 }
 
+/// Largest clock, increment or movetime the planner works with (about 34
+/// years). UCI accepts any u64; larger values saturate here so the pool,
+/// percentage and nanosecond arithmetic below cannot wrap.
+pub const MAX_PLAN_INPUT_MS: u64 = 1 << 40;
+
 pub const Plan = struct {
     optimum_ms: u64,
     maximum_ms: u64,
@@ -190,6 +197,11 @@ pub const Limits = struct {
     /// ceiling only after a completed unstable iteration.
     maximum_budget_ns: ?u64 = null,
     wider_maximum_budget_ns: ?u64 = null,
+    /// UCI `go mate N`: stop once a completed iteration proves a mate in N
+    /// moves or fewer; 0 = not requested. Other limits still apply; alone it
+    /// searches to the depth ceiling. A plain u16 on purpose: it sits in this
+    /// struct's existing padding, so the search context keeps its layout.
+    mate_in_moves: u16 = 0,
     /// Preserve the UCI `go infinite` intent after GoLimits is converted so
     /// search policy cannot treat the request like a finite depth-64 search.
     infinite: bool = false,
@@ -211,6 +223,8 @@ pub const GoLimits = struct {
     winc_ms: u64 = 0,
     binc_ms: u64 = 0,
     movestogo: ?u32 = null,
+    /// `go mate N`; 0 = not requested.
+    mate_in_moves: u16 = 0,
     infinite: bool = false,
 
     pub fn hasExplicitLimit(self: GoLimits) bool {
@@ -219,6 +233,7 @@ pub const GoLimits = struct {
             self.node_limit != null or
             self.wtime_ms != null or
             self.btime_ms != null or
+            self.mate_in_moves != 0 or
             self.infinite;
     }
 
@@ -229,22 +244,25 @@ pub const GoLimits = struct {
     pub fn planWithConfig(self: GoLimits, cfg: TmConfig, side: types.Color, move_overhead_ms: u64, fullmove_number: u16) ?Plan {
         if (self.infinite) return null;
 
-        if (self.movetime_ms) |ms| {
+        if (self.movetime_ms) |raw_ms| {
             // Exact per-move budget: neither the phase ramp nor the clamp fix
             // applies (there is no clock to protect or redistribute).
+            // Typed: @min with a comptime-known bound narrows to u41, and the
+            // optimum's ×17 below would then overflow for clamped values.
+            const ms: u64 = @min(raw_ms, MAX_PLAN_INPUT_MS);
             const maximum_ms = @max(@as(u64, 1), ms);
             const optimum_ms = @max(@as(u64, 1), (maximum_ms * 17) / 20);
             return .{ .optimum_ms = optimum_ms, .maximum_ms = maximum_ms };
         }
 
-        const remaining = switch (side) {
+        const remaining: u64 = @min(switch (side) {
             .white => self.wtime_ms,
             .black => self.btime_ms,
-        } orelse return null;
-        const increment = switch (side) {
+        } orelse return null, MAX_PLAN_INPUT_MS);
+        const increment: u64 = @min(switch (side) {
             .white => self.winc_ms,
             .black => self.binc_ms,
-        };
+        }, MAX_PLAN_INPUT_MS);
         const hard_cap = @max(@as(u64, 1), if (remaining > move_overhead_ms) remaining - move_overhead_ms else 1);
         const phase_pct: u64 = if (cfg.phase) phaseFactorPct(cfg, fullmove_number) else 100;
         // r2 spend-level scale composes with the phase ramp; 100 * 100 / 100
@@ -262,6 +280,7 @@ pub const GoLimits = struct {
         var limits = Limits{
             .depth = self.depth,
             .node_limit = self.node_limit,
+            .mate_in_moves = self.mate_in_moves,
             .infinite = self.infinite,
         };
 
@@ -302,10 +321,10 @@ pub fn phaseFactorPct(cfg: TmConfig, fullmove_number: u16) u64 {
     return min_pct + span * h / (h + (m - 1));
 }
 
-/// Legacy return path vs the ZQ_TM_CLAMP fix. Legacy raises maximum up to
-/// optimum even when optimum overshot the remaining-clock hard cap (the
-/// documented flag-risk defect); the fix clamps optimum down instead so no
-/// budget ever exceeds hard_cap.
+/// Default (clamped) return path vs ZQ_TM_CLAMP=0. The unclamped form raises
+/// maximum up to optimum even when optimum overshot the remaining-clock hard
+/// cap (the 6.0.0–6.3.0 flag-risk defect); the clamp lowers optimum instead so
+/// no budget ever exceeds hard_cap.
 fn finishPlan(cfg: TmConfig, optimum_ms: u64, maximum_ms: u64, hard_cap: u64) Plan {
     if (cfg.clamp_fix) {
         const capped_maximum = @max(@as(u64, 1), @min(maximum_ms, hard_cap));
@@ -488,6 +507,12 @@ pub const Controller = struct {
     }
 };
 
+// Limits is embedded in the search context. Its size is part of that context's
+// layout, which hot-path timing has proved sensitive to.
+test "limits keep their size" {
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(Limits));
+}
+
 test "controller stops at node limit" {
     var stop_flag = std.atomic.Value(bool).init(false);
     var controller = Controller.init(&stop_flag, .{ .node_limit = 8 });
@@ -559,11 +584,12 @@ test "burst headroom stays inside the clock and stands down in time trouble" {
     }
 
     // Low-time regime (<= 1s left): the legacy 1.5x ceiling still applies, so
-    // the scramble behaviour is bit-identical to the head (values pinned).
+    // the scramble behaviour is bit-identical to the head (values pinned). The
+    // last case is the increment-heavy one the clamp protects: 100 - 20 = 80.
     const scramble = [_]struct { limits: GoLimits, optimum: u64, maximum: u64 }{
         .{ .limits = .{ .wtime_ms = 1_000, .winc_ms = 100 }, .optimum = 71, .maximum = 121 },
         .{ .limits = .{ .wtime_ms = 500, .winc_ms = 50 }, .optimum = 35, .maximum = 60 },
-        .{ .limits = .{ .wtime_ms = 100, .winc_ms = 1_000 }, .optimum = 255, .maximum = 255 },
+        .{ .limits = .{ .wtime_ms = 100, .winc_ms = 1_000 }, .optimum = 80, .maximum = 80 },
     };
     for (scramble) |case| {
         const plan = case.limits.planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 60).?;
@@ -607,18 +633,18 @@ test "go limits keep short moves-to-go plans on low time" {
     try std.testing.expectEqual(@as(u64, 63), plan.maximum_ms);
 }
 
-// PINNED DEFECT (default-off documents it; ZQ_TM_CLAMP fixes it): with 100ms
-// on the clock and a 1s increment, the legacy sudden-death plan lets the
-// unclamped increment/4 optimum term drag `maximum` to 252ms — past the 80ms
-// remaining-clock hard cap. Spending it forfeits on time; the increment lands
-// only AFTER the move is played.
-test "legacy sudden-death budget exceeds the clock at increment-heavy low time" {
+// PINNED DEFECT of the unclamped planner (ZQ_TM_CLAMP=0, the 6.0.0–6.3.0
+// default): with 100ms on the clock and a 1s increment, the sudden-death plan
+// lets the unclamped increment/4 optimum term drag `maximum` to 252ms — past
+// the 80ms remaining-clock hard cap. Spending it forfeits on time; the
+// increment lands only AFTER the move is played.
+test "unclamped sudden-death budget exceeds the clock at increment-heavy low time" {
     const limits = GoLimits{
         .wtime_ms = 100,
         .winc_ms = 1_000,
     };
 
-    const plan = limits.planWithConfig(.{ .opt_pct = 100 }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    const plan = limits.planWithConfig(.{ .opt_pct = 100, .clamp_fix = false }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
     try std.testing.expectEqual(@as(u64, 252), plan.optimum_ms);
     try std.testing.expectEqual(@as(u64, 252), plan.maximum_ms); // > 80ms hard cap
 }
@@ -643,7 +669,7 @@ test "clamp fix keeps moves-to-go budgets inside the remaining clock" {
         .movestogo = 40,
     };
 
-    const legacy = limits.planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    const legacy = limits.planWithConfig(.{ .clamp_fix = false }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
     try std.testing.expectEqual(@as(u64, 255), legacy.maximum_ms); // pinned defect, > 80ms cap
 
     const fixed = limits.planWithConfig(cfg, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
@@ -663,11 +689,82 @@ test "clamp fix leaves comfortable-clock plans unchanged" {
         .{ .wtime_ms = 8_000, .winc_ms = 80 },
     };
     for (cases) |limits| {
-        const legacy = limits.planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+        const legacy = limits.planWithConfig(.{ .clamp_fix = false }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
         const fixed = limits.planWithConfig(cfg, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
         try std.testing.expectEqual(legacy.optimum_ms, fixed.optimum_ms);
         try std.testing.expectEqual(legacy.maximum_ms, fixed.maximum_ms);
     }
+}
+
+// The last move before a time control. At the shipped 130% spend level the
+// unclamped planner budgets (remaining - 3 * overhead) * 1.3 for it, soft and
+// hard alike: 12.9s on a 10s clock. The refill arrives only after the move.
+test "moves-to-go 1 never plans past the remaining clock" {
+    const clocks = [_]u64{ 1_500, 2_000, 10_000, 45_000, 900_000 };
+    for (clocks) |remaining| {
+        const limits = GoLimits{ .wtime_ms = remaining, .movestogo = 1 };
+        const unclamped = limits.planWithConfig(.{ .clamp_fix = false }, .white, DEFAULT_MOVE_OVERHEAD_MS, 40).?;
+        try std.testing.expect(unclamped.maximum_ms > remaining); // pinned defect
+
+        const plan = limits.planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 40).?;
+        try std.testing.expectEqual(remaining - DEFAULT_MOVE_OVERHEAD_MS, plan.maximum_ms);
+        try std.testing.expect(plan.optimum_ms <= plan.maximum_ms);
+    }
+}
+
+// The clamp acts exactly where the unclamped plan is past the remaining clock,
+// and nowhere else. Three regimes reach that: movestogo 1; an increment clock
+// below one increment; and moves-to-go with an increment, where the pooled
+// future increments can outweigh a short clock. Everywhere else the two
+// planners agree, so the default changes no other budget.
+test "clamp changes a plan only where the unclamped plan is past the clock" {
+    const on = TmConfig{};
+    const off = TmConfig{ .clamp_fix = false };
+    const increments = [_]u64{ 0, 80, 200, 600, 1_000, 2_000, 8_000, 10_000 };
+    const overheads = [_]u64{ 0, 20, 100, 1_000 };
+    const moves_to_go = [_]?u32{ null, 1, 2, 3, 10, 40, 60 };
+    var changed: usize = 0;
+    for (overheads) |overhead| {
+        for (increments) |inc| {
+            for (moves_to_go) |mtg| {
+                var remaining: u64 = 30;
+                while (remaining <= 1_000_000) : (remaining += @max(@as(u64, 7), remaining / 9)) {
+                    const limits = GoLimits{ .wtime_ms = remaining, .winc_ms = inc, .movestogo = mtg };
+                    const hard_cap = @max(@as(u64, 1), if (remaining > overhead) remaining - overhead else 1);
+                    const a = limits.planWithConfig(on, .white, overhead, 30).?;
+                    const b = limits.planWithConfig(off, .white, overhead, 30).?;
+                    try std.testing.expect(a.maximum_ms <= hard_cap);
+                    try std.testing.expect(a.optimum_ms <= a.maximum_ms);
+                    if (b.maximum_ms <= hard_cap) {
+                        try std.testing.expectEqual(b.optimum_ms, a.optimum_ms);
+                        try std.testing.expectEqual(b.maximum_ms, a.maximum_ms);
+                    } else {
+                        changed += 1;
+                        // Sudden death: only a clock shorter than its own
+                        // increment (plus the overhead) is ever affected.
+                        if (mtg == null) try std.testing.expect(remaining < inc + overhead + 2);
+                        // Without an increment only the last move before
+                        // the control is.
+                        if (inc == 0) try std.testing.expectEqual(@as(?u32, 1), mtg);
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(changed != 0);
+}
+
+test "absurd clock values saturate instead of wrapping" {
+    const huge = std.math.maxInt(u64);
+    const movetime = (GoLimits{ .movetime_ms = 18_446_744_073_710 }).planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expectEqual(MAX_PLAN_INPUT_MS, movetime.maximum_ms);
+    const sudden = (GoLimits{ .wtime_ms = huge, .winc_ms = huge }).planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expect(sudden.optimum_ms <= sudden.maximum_ms);
+    try std.testing.expect(sudden.maximum_ms <= MAX_PLAN_INPUT_MS);
+    const pooled = (GoLimits{ .wtime_ms = huge, .winc_ms = huge, .movestogo = 50 }).planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expect(pooled.maximum_ms <= MAX_PLAN_INPUT_MS);
+    const limits = (GoLimits{ .wtime_ms = huge, .winc_ms = huge }).toControllerLimits(.white, DEFAULT_MOVE_OVERHEAD_MS, 1);
+    try std.testing.expect(limits.maximum_budget_ns.? >= limits.optimum_budget_ns.?);
 }
 
 test "phase factor decays hyperbolically from max toward min" {
@@ -719,16 +816,18 @@ test "phase ramp scales sudden-death optimum by game progress" {
 }
 
 test "phase ramp never overrides the low-time emergency cap" {
-    const cfg = TmConfig{ .phase = true };
     const limits = GoLimits{
         .wtime_ms = 200,
         .winc_ms = 1_000,
     };
 
     // Base optimum 255ms would ramp to 357ms at move 1, but the low-time
-    // emergency cap (180/16 + 250 = 261ms) still binds.
-    const plan = limits.planWithConfig(cfg, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
-    try std.testing.expectEqual(@as(u64, 261), plan.optimum_ms);
+    // emergency cap (180/16 + 250 = 261ms) still binds. Shown unclamped: the
+    // cap itself is past this 180ms clock, which the default clamp then cuts.
+    const unclamped = limits.planWithConfig(.{ .phase = true, .clamp_fix = false }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expectEqual(@as(u64, 261), unclamped.optimum_ms);
+    const plan = limits.planWithConfig(.{ .phase = true }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
+    try std.testing.expectEqual(@as(u64, 180), plan.optimum_ms);
 }
 
 test "phase ramp leaves movetime budgets alone" {
@@ -757,7 +856,7 @@ test "phase ramp off is bit-identical across the full-move clock" {
 
 test "tm config defaults keep every signal mechanism off" {
     const cfg = TmConfig{};
-    try std.testing.expect(!cfg.clamp_fix);
+    try std.testing.expect(cfg.clamp_fix); // safety clamp, not a signal
     try std.testing.expect(!cfg.phase);
     try std.testing.expect(!cfg.signalsEnabled());
     // Shipped levels: r2 spend 130, r6 burst headroom 300/6.

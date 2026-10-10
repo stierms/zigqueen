@@ -1,10 +1,11 @@
 //! Debug dump for NNUE inference validation. For each FEN (one per line in
-//! `fen_file`) prints `eval;white_acc_csv;black_acc_csv`, where the accumulators
-//! are the RAW i16 feature-transformer output (pre-activation) and `eval` is the
-//! engine eval at scale_percent=100. A numpy reference can then recompute the
-//! output stage from the same accumulator and the net file, validating the
-//! layerstack forward pass element-wise (the accumulator/feature-extraction is
-//! already covered by the TreeVerifier; this isolates the new output code).
+//! `fen_file`) prints `eval;white_acc_csv;black_acc_csv`, where `eval` is the
+//! engine eval at scale_percent=100 and the accumulators are the RAW i16 HalfKA
+//! feature-transformer output (pre-activation) only. For a HalfKA-only net a
+//! numpy reference can recompute the output stage from that accumulator and the
+//! net file. For nets with threat inputs or a PSQT head (the deployed ZQB9
+//! among them) `eval` also depends on the threat rows and the PSQT value, which
+//! are not dumped, so these rows do not suffice to reconstruct it.
 const std = @import("std");
 const nnue = @import("../eval/nnue768.zig");
 const fen = @import("../core/fen.zig");

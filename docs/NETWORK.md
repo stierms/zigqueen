@@ -1,18 +1,103 @@
 # The network: data, training, and provenance
 
-zigqueen has shipped a `zqHalfKA9` full-threats network in the engine's
-`ZQB9` container since 6.0.0. 6.3.0 ships a new one with the same
-architecture, trained from scratch on a wider set of published data. The
-6.0.0–6.2.0 network is described further down.
+zigqueen shipped `ZQB9` full-threat networks from 6.0.0 to 6.3.0. 6.4.0
+ships a `ZQBA` network. It keeps 6.3.0's architecture, adds 16 king buckets
+and a pawn-pair input block, and was trained from scratch on 6.3.0's data. A
+full-network QAT stage finished it. The 6.3.0 and 6.0.0–6.2.0 networks are
+described further down.
 
 | | |
 |---|---|
-| **Training data** | 42 published, relabelled components of Stockfish and LCZero training data |
-| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat feature set; the extensions are published as patches in [`trainer/`](trainer/README.md) |
-| **Architecture** | 8-bucket mirrored HalfKA + 60,144 full-threat inputs; width 1024; `1024 -> 16 -> 32 -> 1` layer stack in each of 8 output buckets |
-| **Weights** | 6.3.0: trained from seeded random initialisation, then a head-only QAT stage |
-| **Engine format** | `ZQB9`, 74.6 MB embedded net, default scale 48 |
+| **Training data** | 6.3.0's database, unchanged: 42 published, relabelled components of Stockfish and LCZero training data |
+| **Trainer** | [bullet](https://github.com/jw1912/bullet), extended for zigqueen's full-threat and pawn-pair inputs; the extensions are published as patches in [`trainer/`](trainer/README.md) |
+| **Architecture** | 16-bucket mirrored HalfKA + 60,144 full-threat + 1,488 pawn-pair inputs; width 1024; `1024 -> 16 -> 32 -> 1` layer stack in each of 8 output buckets |
+| **Weights** | trained from seeded random initialisation (float run), then full-network QAT through the engine's integer arithmetic |
+| **Engine format** | `ZQBA`, 88.7 MB embedded net, default `NNUE Scale Percent` 44 |
 | **Engine inference** | Written from scratch in Zig and checked against independent reference calculations |
+
+## 6.4.0 network
+
+| | |
+|---|---|
+| Released model | SHA-256 `1342ac4691324a632418d6e1fc8696807c364d9a8bb63fbbc9b74e771cf1ffac` |
+| Size | 88,724,892 bytes. That is 14,137,160 more than 6.3.0: 12,582,912 for the second set of 8 king buckets (i16), 24,576 for their PSQT entries and 1,529,672 for the pawn-pair block |
+| Changes from 6.3.0 | 16 king buckets instead of 8; pawn-pair block PP1. The threat inputs, width, layer stack, PSQT head and quantisation are unchanged |
+| Initialisation | seeded random weights (seed 62020914, 6.3.0's procedure), SHA-256 `1f09225f9afc4931…`; nothing taken from the 6.3.0 network or any other network |
+| Data | 6.3.0's database, unchanged (see below) |
+| Float run | 6.3.0's schedule and data stream: 5,902 superbatches of 100,007,936 samples. Main phase 4,721, cosine 0.001 → 2.43e-6; tail 1,181, cosine → 2.43e-7 |
+| QAT | 330 superbatches (33,002,618,880 samples) continue the raw superbatch-5,902 weights and Adam moments. Every layer runs through the engine's integer arithmetic, with straight-through gradients. Cosine 2.43e-6 → 2.43e-7. Threat and pawn weights are clamped to ±0.496 (±126 deployed), so no weight sits at the i8 limit, where the gradient is zero |
+| Endpoint | raw superbatch 330, fixed in advance; no checkpoint averaging and no head-only QAT |
+| Target | `0.9 × sigmoid(0.92568 × score / 400) + 0.1 × game_result`, as in 6.3.0 |
+| Scale | 44. A fixed rule matches the eval spread of the 6.3.0 net at 44, and this net's spread is 0.9954 of that net's. `ZQB9` nets loaded with `EvalFile` now also default to 44 (6.3.0: 48) |
+| Compute | RTX 5080: float run 375,179 s, QAT 37,642 s |
+
+**King buckets.** Each perspective picks its bucket from its own king
+square, with files e–h mirrored onto a–d and black's frame rank-flipped, as
+before. Each 6.3.0 bucket is split in two:
+
+| Own-king rank | a | b | c | d |
+|---|---|---|---|---|
+| 1 | 0 | 1 | 2 | 3 |
+| 2 | 4 | 5 | 6 | 7 |
+| 3 | 8 | 8 | 9 | 9 |
+| 4 | 10 | 10 | 11 | 11 |
+| 5–6 | 12 | 12 | 13 | 13 |
+| 7–8 | 14 | 14 | 15 | 15 |
+
+**Pawn pairs (PP1).** The block works per perspective, in the frame the
+HalfKA and threat inputs use. Each feature is an unordered pair of pawns, of
+either colour, on ranks 2–7 whose files differ by at most one:
+
+- same file: 4 colourings × 8 files × 15 rank pairs = 480 rows;
+- adjacent files: 4 colourings × 7 file pairs × 36 rank pairs = 1,008 rows.
+
+Some adjacent-file pairs one rank apart are pawn attack or defence contacts.
+The threat block already encodes those as P→P features, so their 210 rows
+stay at zero. That leaves 1,278 live rows, with at most 120 active per
+perspective. The weights are i8 at the threat block's scale. They add into
+the same accumulator and PSQT head. They depend on the mirror flip but not
+on the king bucket. `ZQBA` is the `ZQB9` layout plus two header words (row
+count, layout code) and the appended pawn-pair weights and PSQT entries.
+
+**Why full-network QAT.** Without it, the export loses accuracy. The sibling
+net `v2` is the same float run finished the 6.3.0 way, with averaged late
+checkpoints and head-only QAT. Its held-out MSE rose from 5.8224e-3 (float)
+to 5.9842e-3 (deployed), +2.8% ± 0.2, and head-only QAT recovered none of
+that (+0.07%). Most of the loss was in the feature transformer. 3,843
+threat and 557 pawn weights lay beyond the i8 clamp, where the
+straight-through gradient is zero. After full-network QAT, deployed held-out
+MSE against `v2` is −1.9% ± 0.2 on the holdout fixture and −0.9% ± 0.2 on
+100,000 random positions.
+
+**Measured.** Self-play, same engine binary in each pair; STC 8s+0.08s, LTC
+60s+0.6s, normalized SPRT [0, 10]:
+
+| Test | Clock | Result | Elo | Games |
+|---|---|---|---|---|
+| `v2` at 45 vs 6.3.0 net at 44 | STC | H1 | +22.7 ± 11.8 | 1,010 |
+| `v2` at 45 vs 6.3.0 net at 44 | LTC | H1 | +15.5 ± 9.1 | 1,350 |
+| 6.4.0 net at 44 vs `v2` at 45 | STC | H1 | +5.75 ± 4.61 | 5,743 |
+| control: `v2` with refitted output biases only, vs `v2` | STC | H0 | −2.8 ± 6.1 | 3,510 |
+
+The 6.4.0 net has no LTC of its own; it went in on the STC result. External
+results are in [STRENGTH.md](STRENGTH.md).
+
+**Data.** This is 6.3.0's database, unchanged: the same admission index
+(SHA-256 `e9e87c68…`), 42 components, 131,124,072,315 admitted positions,
+filter, 7,998,177 held-out positions, quotas and target. Nothing was added,
+relabelled or removed. The float run read 6.3.0's main-run stream
+(presentations 0 to 590,246,838,271 at seed 62020914). The QAT stage read
+33.0 billion more presentations: two passes over the stream's first 21
+billion records, reshuffled with new seeds 62021008 and 62021009. That
+changes the order, not the data. The r2 alteration offer and the ODbL notice below cover this
+network.
+
+**Trainer.** The trainer is published in [trainer/](trainer/README.md) as
+`bullet-v2.patch` (float run) and `bullet-v2-extend.patch` (QAT stage),
+against upstream bullet `d372d48`, with the export script
+`tools/v2_net.py`. Running that script on the trainer's output reproduces
+the released file byte for byte. GPU training is not bitwise repeatable, so
+retraining gives the same programs, not these exact weights.
 
 ## 6.3.0 network
 
@@ -40,7 +125,7 @@ Self-play against the 6.2.0 network, same engine code: +10.8 ± 7.5 Elo at
 8s+0.08s (2,554 games) and +7.9 ± 6.0 Elo at 60s+0.6s (3,368 games), SPRT H1
 at both. Match evidence is in [STRENGTH.md](STRENGTH.md).
 
-### 6.3.0 training data
+### Training data (6.3.0 and 6.4.0)
 
 All 42 components are published *relabelled* collections on Hugging Face,
 scored with Leela BT4 evaluations:
@@ -82,8 +167,10 @@ totals, and the release asset `zigqueen-training-data-r2-alterations.tar.xz` on
 the [6.3.0 release](https://github.com/stierms/zigqueen/releases/tag/v6.3.0)
 holds the manifests, indexes, tables and code to repeat them. Both are free of
 charge. The derivative database and our alterations are offered under
-ODbL-1.0, individual contents under DbCL-1.0. The `r1` archive below covers
-the 6.2.0 network only.
+ODbL-1.0, individual contents under DbCL-1.0. The same offer covers the 6.4.0
+network, and the archive is attached unchanged to the
+[6.4.0 release](https://github.com/stierms/zigqueen/releases/tag/v6.4.0). The
+`r1` archive below covers the 6.2.0 network only.
 
 **Trainer changes.** The bullet changes that trained this network are
 published in [trainer/](trainer/README.md) as two patches against the same
@@ -104,11 +191,13 @@ these exact weights.
 
 Stockfish trains its own networks with `nnue-pytorch`. zigqueen uses bullet,
 an independent open-source NNUE trainer, plus a project-specific extension
-that teaches bullet the 60,144-input full-threat mapping.
+that teaches bullet the 60,144-input full-threat mapping and, for 6.4.0, the
+pawn-pair inputs.
 
-Both zigqueen network lineages were trained **from scratch**, starting from
-random weights: the 6.0.0 base, and the 6.3.0 network from a new seed. Their
-weights were never:
+Each zigqueen network lineage was trained **from scratch**, starting from
+random weights: the 6.0.0 base, the 6.3.0 network and the 6.4.0 network.
+The 6.4.0 network's QAT stage continued its own float run. Their weights
+were never:
 
 - initialized from a Stockfish or other third-party network;
 - fine-tuned from third-party network weights; or
@@ -185,25 +274,31 @@ training loss.
 
 ## Architecture
 
-The `zqHalfKA9` network combines two sparse input families per perspective:
+The 6.4.0 network combines three sparse input families per perspective:
 
-- **Mirrored HalfKA.** Eight king buckets; files e-h mirror onto a-d. Each
-  side selects a bucket in its own oriented frame.
+- **Mirrored HalfKA.** Sixteen king buckets (6.0.0–6.3.0: eight); files e-h
+  mirror onto a-d. Each side selects a bucket in its own oriented frame.
 - **Full threats.** 60,144 sparse attacker/target relation inputs, retaining
   the richer relation set used by the v6 architecture rather than the 7,680
   lean-threat inputs shipped in the 5.x network.
+- **Pawn pairs (6.4.0).** 1,488 inputs (1,278 live) for pawn pairs on the same
+  or adjacent files, described above.
 
 Those inputs feed a width-1024 feature transformer. The readout is a
 material-bucketed layer stack with eight buckets, each
 `1024 -> 16 -> 32 -> 1`, plus the network's PSQT head. Integer weights and
-activations are quantized in the `ZQB9` file format.
+activations are quantized in the `ZQBA` file format (`ZQB9` up to 6.3.0,
+which the engine still loads through `EvalFile`).
 
-The engine maintains HalfKA and full-threat accumulator state incrementally.
-Threat relationships are non-local—a move may create or remove attacks away
-from its source and destination—so the runtime uses a dedicated threat-delta
-engine, lazy materialization, and refresh barriers for king-orientation
-changes. Integer inference is designed to be bit-exact across supported
-x86-64 and AArch64 release targets.
+The engine maintains HalfKA, full-threat and pawn-pair accumulator state
+incrementally. Threat relationships are non-local—a move may create or
+remove attacks away from its source and destination—so the runtime uses a
+dedicated threat-delta engine, lazy materialization, and refresh barriers for
+king-orientation changes. Pawn-pair rows sit next to the threat rows, in the
+part of the accumulator that depends on the mirror flip but not the king
+bucket. Only moves that change a pawn set touch them, and they go into the
+same update batch as the threat deltas. Integer inference is designed to be
+bit-exact across supported x86-64 and AArch64 release targets.
 
 ## Validation
 
@@ -211,6 +306,11 @@ The feature mapping and incremental path are tested against full refreshes,
 including castling, en passant, promotions, king-bucket changes, and mirrored
 positions. Release builds must also agree on fixed-depth search node counts
 and on the standard evaluation probe suite.
+
+At export, the engine's evaluation of the 6.4.0 network equals an exact reference
+built from the trainer's own feature lists on 3,934 test positions, with 0
+mismatches, in both the AVX2 and the AVX-512 VNNI builds. A range gate checks
+that no deployed weight or accumulator sum can overflow.
 
 Candidate networks are screened for color symmetry and material ordering,
 then judged by match play; training loss alone does not decide promotion.

@@ -10,7 +10,9 @@ const position = @import("../core/position.zig");
 const pv = @import("pv.zig");
 const repetition = @import("repetition.zig");
 const rfp_hint_mod = @import("rfp_hint.zig");
+const rule50 = @import("rule50.zig");
 const eval_cache_mod = @import("eval_cache.zig");
+const hugealloc = @import("../util/hugealloc.zig");
 const root = @import("root.zig");
 const qsearch = @import("qsearch.zig");
 const score_mod = @import("score.zig");
@@ -89,7 +91,8 @@ pub const Engine = struct {
     tt: tt.TranspositionTable,
     rfp_hint: rfp_hint_mod.HintTable,
     /// Raw-eval memo (perf-r11): position-keyed cache of the exact raw static
-    /// eval, sized off Hash (Hash/4, clamped [4,64] MB; 2-way since perf-r12).
+    /// eval, sized off Hash (Hash/4, clamped [4,64] MB; 2-way since perf-r12;
+    /// split across engines at Threads > 1, see PrivateTableSizes).
     /// No UCI option.
     eval_cache: eval_cache_mod.EvalCache,
     history: history_mod.HistoryTable = .{},
@@ -101,6 +104,11 @@ pub const Engine = struct {
     /// 1024-wide net, too large for the call stack (overflows smaller worker /
     /// test threads), so it lives on the heap and is reset per search.
     ctx: *context_mod.SearchContext = undefined,
+    /// How `ctx` is backed. The context is ~2.4 MB (128 plies of ~18.5 KB
+    /// stack entries, each spanning five 4 KB pages), touched at random plies
+    /// by every accumulator materialization; hugealloc maps it on 2 MB pages
+    /// where the OS grants them. Frees go through hugealloc with this.
+    ctx_method: hugealloc.Method = .heap,
     record_static_search_outcomes: bool = false,
     record_move_order_outcomes: bool = false,
     /// Draw contempt in engine cp (UCI "Contempt"), forwarded into the search
@@ -141,37 +149,39 @@ pub const Engine = struct {
     /// Takes ownership of `evaluator` (moved into the returned engine); on
     /// error the caller's errdefer still owns it.
     fn initWithEvaluator(allocator: std.mem.Allocator, hash_mb: u32, evaluator: *eval_backend.EngineState) !Engine {
-        return initWithTables(allocator, hash_mb, evaluator, true);
+        return initWithTables(allocator, hash_mb, PrivateTableSizes.forThreads(hash_mb, 1), evaluator, true);
     }
 
     /// A parallel worker has private search/caches but no private serial TT.
-    pub fn initForParallel(allocator: std.mem.Allocator, hash_mb: u32, owner: *const eval_backend.EngineState) !Engine {
+    /// `threads` is the whole configuration (coordinator plus helpers): every
+    /// engine of it receives the same 1/threads share of the private-table
+    /// budget, so the shared TT plus all private tables stay near Hash.
+    pub fn initForParallel(allocator: std.mem.Allocator, hash_mb: u32, threads: u32, owner: *const eval_backend.EngineState) !Engine {
         var evaluator = owner.borrow(allocator);
         errdefer evaluator.deinit();
-        return initWithTables(allocator, hash_mb, &evaluator, false);
+        return initWithTables(allocator, hash_mb, PrivateTableSizes.forThreads(hash_mb, threads), &evaluator, false);
     }
 
-    fn initWithTables(allocator: std.mem.Allocator, hash_mb: u32, evaluator: *eval_backend.EngineState, comptime serial_table: bool) !Engine {
+    fn initWithTables(allocator: std.mem.Allocator, hash_mb: u32, sizes: PrivateTableSizes, evaluator: *eval_backend.EngineState, comptime serial_table: bool) !Engine {
         @import("startup.zig").ensure();
         var tt_table = if (serial_table) try tt.TranspositionTable.init(allocator, hash_mb) else tt.TranspositionTable{ .allocator = allocator };
         errdefer tt_table.deinit();
-        var hint_table = try rfp_hint_mod.HintTable.init(allocator, hintSizeFor(hash_mb));
+        var hint_table = try rfp_hint_mod.HintTable.init(allocator, sizes.hint_mb);
         errdefer hint_table.deinit();
-        var eval_cache = try eval_cache_mod.EvalCache.init(allocator, eval_cache_mod.sizeForHash(hash_mb));
+        var eval_cache = try eval_cache_mod.EvalCache.init(allocator, sizes.eval_mb);
         errdefer eval_cache.deinit();
         var history = history_mod.HistoryTable{};
         try history.initContinuation(allocator);
         errdefer history.deinitContinuation(allocator);
-        // Correction history is PARKED (tables not allocated -> corrhist reads/updates
-        // are no-ops, play is identical to v4.0.3): v1 (+/-72cp, qsearch read) self-SPRT
-        // -17.4 +/-13.2; v2 (+/-32cp, main-search only) -3.5 +/-7.4 = flat. Hypothesis:
-        // the PSQT-anchored eval has little systematic error to correct, and the pruning
-        // margins want CO-TUNING with the correction (the deferred SPSA campaign).
-        // Revive by uncommenting when SPSA can co-tune the constants:
-        // try history.initCorrection(allocator);
-        // errdefer history.deinitCorrection(allocator);
-        const ctx = try allocator.create(context_mod.SearchContext);
-        errdefer allocator.destroy(ctx);
+        // Correction history, A3 form (history.zig): learned only from exact
+        // search scores, applied to the main search's eval-gated decisions. The
+        // earlier forms (parked 2026-06; C15 field form -12.7 +/-7.0, 2026-08)
+        // learned from window-pinned bounds; see the A3 diagnosis.
+        if (comptime build_options.correction_history) try history.initCorrection(allocator);
+        errdefer if (comptime build_options.correction_history) history.deinitCorrection(allocator);
+        const ctx_backed = try hugealloc.alloc(context_mod.SearchContext, allocator, 1);
+        errdefer hugealloc.free(context_mod.SearchContext, allocator, ctx_backed);
+        const ctx = &ctx_backed.items[0];
         return .{
             .tt = tt_table,
             .rfp_hint = hint_table,
@@ -181,6 +191,7 @@ pub const Engine = struct {
             .basin_config = if (build_options.tuning) basin.Config.init(.{}) else {},
             .allocator = allocator,
             .ctx = ctx,
+            .ctx_method = ctx_backed.method,
         };
     }
 
@@ -191,7 +202,8 @@ pub const Engine = struct {
         self.eval_cache.deinit();
         self.history.deinitContinuation(self.allocator);
         self.history.deinitCorrection(self.allocator);
-        self.allocator.destroy(self.ctx);
+        const ctx_items: []context_mod.SearchContext = @as([*]context_mod.SearchContext, @ptrCast(self.ctx))[0..1];
+        hugealloc.free(context_mod.SearchContext, self.allocator, .{ .items = ctx_items, .method = self.ctx_method });
     }
 
     pub fn reset(self: *Engine) void {
@@ -246,9 +258,12 @@ pub const Engine = struct {
     /// Quiescent configuration transaction: every fallible preparation finishes
     /// before any live table or history changes. The pool/worker owns the idle
     /// barrier; this method neither stops a search nor publishes to live readers.
+    /// Serial (Threads = 1) engines only: a parallel configuration is rebuilt
+    /// whole by the UCI worker, with its per-thread table shares.
     fn resizeHashWithFactory(self: *Engine, hash_mb: u32, factory: anytype) !void {
-        const hint_mb = hintSizeFor(hash_mb);
-        const eval_mb = eval_cache_mod.sizeForHash(hash_mb);
+        const sizes = PrivateTableSizes.forThreads(hash_mb, 1);
+        const hint_mb = sizes.hint_mb;
+        const eval_mb = sizes.eval_mb;
         if (hash_mb == self.tt.hashSizeMb() and
             hint_mb == self.rfp_hint.hintSizeMb() and
             eval_mb == self.eval_cache.cacheSizeMb())
@@ -372,6 +387,17 @@ pub const Engine = struct {
 
         if (working.halfmove_clock >= 100 or ctx.repetition.isClaimableCurrentRepetition(working.halfmove_clock)) {
             best.score = 0;
+            // Checkmate outranks the fifty-move claim: a mated root is lost,
+            // and a mating move still wins where every other move draws.
+            if (working.halfmove_clock >= 100) {
+                if (fallback == null) {
+                    if (legal.isInCheck(&working, working.side_to_move)) best.score = -score_mod.MATE_SCORE;
+                } else if (rule50.matingMove(&working, root_moves)) |mv| {
+                    best.best_move = mv;
+                    best.score = score_mod.MATE_SCORE - 1;
+                    best.pv.push(mv);
+                }
+            }
             return best;
         }
 
@@ -575,6 +601,8 @@ pub const Engine = struct {
                 } });
             }
 
+            if (!helper and foundRequestedMate(ctx.control.limits, best.score)) break;
+
             var soft_policy = SoftLimitPolicy{};
             if (tm_signals_enabled) {
                 soft_policy = .{
@@ -636,6 +664,27 @@ fn hintSizeFor(hash_mb: u32) u32 {
     return half;
 }
 
+/// Sizes of one engine's private, Hash-derived tables: the RFP-hint table and
+/// the raw-eval cache. Both stay private per thread (the eval cache writes its
+/// LRU bit on hits; hints carry thread-local search results), so with
+/// Threads = N there are N copies. UCI Hash is the process budget: the
+/// Threads = 1 sizes (hint Hash/2 in [1, 1024] MB, eval Hash/4 in [4, 64] MB)
+/// are the budget of all private copies together, split N ways. Threads = 1 is
+/// the identity. The per-table floors (1 MB hint, 4 MB eval) can exceed the
+/// split budget by at most 5 MB per engine (e.g. eval at T32 >= Hash 256).
+pub const PrivateTableSizes = struct {
+    hint_mb: u32,
+    eval_mb: u32,
+
+    pub fn forThreads(hash_mb: u32, threads: u32) PrivateTableSizes {
+        const ways = @max(threads, 1);
+        return .{
+            .hint_mb = @max(hintSizeFor(hash_mb) / ways, rfp_hint_mod.MIN_HINT_MB),
+            .eval_mb = @max(eval_cache_mod.sizeForHash(hash_mb) / ways, eval_cache_mod.MIN_CACHE_MB),
+        };
+    }
+};
+
 fn aspirationGuess(previous: ?IterationTrace, depth: u16) ?i32 {
     const prior = previous orelse return null;
     if (depth < ASPIRATION_MIN_DEPTH) return null;
@@ -683,11 +732,17 @@ fn isTablebaseWdlProof(alpha: i32, beta: i32, score: i32) bool {
 
 fn widenAspirationWindow(guess: i32, alpha: *i32, beta: *i32, delta: *i32, score: i32) void {
     delta.* = @min(qsearch.INF, delta.* * 2);
+    // Fix 2026-09-29: once delta is capped, open the failing side fully. With the
+    // bound pinned at guess -/+ INF, a previous score of +(1000+N) cp could never let
+    // alpha reach a mated-in-N score (MATE_SCORE 29,000 < INF 30,000), so the fail-low
+    // loop never ended; the mirror case failed high forever. Before the cap the window
+    // is unchanged.
+    const capped = delta.* >= qsearch.INF;
     if (score <= alpha.*) {
-        alpha.* = @max(-qsearch.INF, guess - delta.*);
+        alpha.* = if (capped) -qsearch.INF else @max(-qsearch.INF, guess - delta.*);
         return;
     }
-    beta.* = @min(qsearch.INF, guess + delta.*);
+    beta.* = if (capped) qsearch.INF else @min(qsearch.INF, guess + delta.*);
 }
 
 /// Find the legal move matching a Fathom root-probe verdict (from/to squares
@@ -859,6 +914,13 @@ fn nextTablebaseDecisionStreak(previous_streak: u8, previous: ?IterationTrace, c
     return if (previous_streak == std.math.maxInt(u8)) previous_streak else previous_streak + 1;
 }
 
+/// `go mate N` is answered by the first completed iteration whose score is a
+/// mate for the side to move in N moves or fewer.
+fn foundRequestedMate(limits: time.Limits, score: types.Score) bool {
+    if (limits.mate_in_moves == 0) return false;
+    return score > 0 and score_mod.isMateLike(score) and score_mod.scoreToMate(score) <= limits.mate_in_moves;
+}
+
 fn shouldStopOnTablebaseDecision(limits: time.Limits, streak: u8, previous: ?IterationTrace) bool {
     if (!limits.hasFiniteLimit() or streak < 2) return false;
     const prior = previous orelse return false;
@@ -947,6 +1009,38 @@ test "tablebase decision reuse requires two matching decisive iterations" {
     try std.testing.expectEqual(@as(u8, 1), nextTablebaseDecisionStreak(2, later_loss, .{ .score = score_mod.TB_WIN_SCORE - 8, .best_move = best }));
     try std.testing.expectEqual(@as(u8, 1), nextTablebaseDecisionStreak(2, later_loss, .{ .score = -score_mod.TB_WIN_SCORE + 9, .best_move = other }));
     try std.testing.expectEqual(@as(u8, 0), nextTablebaseDecisionStreak(2, later_loss, .{ .score = score_mod.MATE_SCORE - 1, .best_move = best }));
+}
+
+test "aspiration widening reaches the full window when a mate lies beyond guess -/+ INF" {
+    // Fail low: previous score +1284, the side is actually mated in 1 (-(MATE_SCORE - 1)).
+    const mated = -(score_mod.MATE_SCORE - 1);
+    var alpha: i32 = 1284 - ASPIRATION_START_CP;
+    var beta: i32 = 1284 + ASPIRATION_START_CP;
+    var delta: i32 = ASPIRATION_START_CP;
+    var passes: usize = 0;
+    while (mated <= alpha) : (passes += 1) {
+        try std.testing.expect(passes < 32);
+        widenAspirationWindow(1284, &alpha, &beta, &delta, mated);
+    }
+    try std.testing.expectEqual(@as(i32, -qsearch.INF), alpha);
+    try std.testing.expectEqual(@as(i32, 1284 + ASPIRATION_START_CP), beta);
+    // Fail high mirror: previous score -1284, a mate in 1 exists for the side to move.
+    const mating = score_mod.MATE_SCORE - 1;
+    alpha = -1284 - ASPIRATION_START_CP;
+    beta = -1284 + ASPIRATION_START_CP;
+    delta = ASPIRATION_START_CP;
+    passes = 0;
+    while (mating >= beta) : (passes += 1) {
+        try std.testing.expect(passes < 32);
+        widenAspirationWindow(-1284, &alpha, &beta, &delta, mating);
+    }
+    try std.testing.expectEqual(@as(i32, qsearch.INF), beta);
+    // Before the cap the window is exactly the old one.
+    alpha = 100 - ASPIRATION_START_CP;
+    beta = 100 + ASPIRATION_START_CP;
+    delta = ASPIRATION_START_CP;
+    widenAspirationWindow(100, &alpha, &beta, &delta, 50);
+    try std.testing.expectEqual(@as(i32, 100 - 2 * ASPIRATION_START_CP), alpha);
 }
 
 test "tablebase WDL aspiration proof requires matching bound direction" {
@@ -1291,6 +1385,30 @@ test "engine finds a mate in one at depth one" {
     try std.testing.expect(pv.isLegal(&pos, &history, &result.pv));
 }
 
+test "go mate stops at the first iteration that proves the requested mate" {
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+
+    const pos = try fen.parse("k7/8/1P6/K7/p1P5/1p4Q1/8/8 w - - 2 40");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    const result = engine.search(&pos, &history, .{ .mate_in_moves = 2 }, &stop_flag);
+    try std.testing.expectEqual(score_mod.MATE_SCORE - 3, result.score);
+    try std.testing.expect(result.depth < 64);
+    try std.testing.expect(pv.isLegal(&pos, &history, &result.pv));
+
+    try std.testing.expect(foundRequestedMate(.{ .mate_in_moves = 2 }, score_mod.MATE_SCORE - 3));
+    try std.testing.expect(foundRequestedMate(.{ .mate_in_moves = 2 }, score_mod.MATE_SCORE - 1));
+    try std.testing.expect(!foundRequestedMate(.{ .mate_in_moves = 1 }, score_mod.MATE_SCORE - 3));
+    try std.testing.expect(!foundRequestedMate(.{ .mate_in_moves = 2 }, -score_mod.MATE_SCORE + 2));
+    try std.testing.expect(!foundRequestedMate(.{ .mate_in_moves = 2 }, 500));
+    try std.testing.expect(!foundRequestedMate(.{}, score_mod.MATE_SCORE - 1));
+}
+
 test "engine treats fifty-move root as draw" {
     const fen = @import("../core/fen.zig");
 
@@ -1305,6 +1423,76 @@ test "engine treats fifty-move root as draw" {
     const result = engine.search(&pos, &history, .{ .depth = 3 }, &stop_flag);
     try std.testing.expectEqual(@as(i32, 0), result.score);
     try std.testing.expect(result.best_move != null);
+}
+
+test "checkmate outranks the fifty-move clock" {
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    // Every mating move here is the hundredth reversible ply. The game ends
+    // by mate, not by the fifty-move claim, at the horizon and in the main
+    // search alike.
+    const depths = [_]u16{ 1, 2, 5 };
+    for (depths) |depth| {
+        const pos = try fen.parse("7k/4Q3/6K1/8/8/8/8/8 w - - 99 1");
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        engine.reset();
+        const result = engine.search(&pos, &history, .{ .depth = depth }, &stop_flag);
+        try std.testing.expectEqual(score_mod.MATE_SCORE - 1, result.score);
+        var child = pos;
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&child, result.best_move.?, &state);
+        try std.testing.expect(rule50.isCheckmated(&child, null));
+    }
+
+    // Mate in two whose last move lands on clock 100: Kg6 Kg8, Qd8#.
+    {
+        const pos = try fen.parse("7k/8/5K2/8/8/8/8/3Q4 w - - 97 1");
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        engine.reset();
+        const result = engine.search(&pos, &history, .{ .depth = 6 }, &stop_flag);
+        try std.testing.expectEqual(score_mod.MATE_SCORE - 3, result.score);
+    }
+
+    // A root that is already mated stays lost past the clock.
+    {
+        const pos = try fen.parse("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1");
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        engine.reset();
+        const result = engine.search(&pos, &history, .{ .depth = 3 }, &stop_flag);
+        try std.testing.expectEqual(-score_mod.MATE_SCORE, result.score);
+        try std.testing.expect(result.best_move == null);
+    }
+
+    // A root past the clock still plays an available mate.
+    {
+        const pos = try fen.parse("7k/4Q3/6K1/8/8/8/8/8 w - - 100 1");
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        engine.reset();
+        const result = engine.search(&pos, &history, .{ .depth = 3 }, &stop_flag);
+        try std.testing.expectEqual(score_mod.MATE_SCORE - 1, result.score);
+        var child = pos;
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&child, result.best_move.?, &state);
+        try std.testing.expect(rule50.isCheckmated(&child, null));
+    }
+
+    // No mate on the board: the clock still draws, as before.
+    {
+        const pos = try fen.parse("4k3/8/8/8/8/8/4N3/4K3 w - - 99 1");
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        engine.reset();
+        const result = engine.search(&pos, &history, .{ .depth = 4 }, &stop_flag);
+        try std.testing.expectEqual(@as(i32, 0), result.score);
+    }
 }
 
 test "engine treats repeated root position as draw" {
@@ -1595,6 +1783,61 @@ test "hash resize commits all tables and preserves eval associativity" {
         try std.testing.expectEqual(net, engine.evaluator.net);
         try std.testing.expectEqual(context, engine.ctx);
     }
+}
+
+test "private table sizes are the serial sizes at one thread and a split budget beyond" {
+    // Threads = 1 is the identity on every Hash a GUI can send (bit-identical
+    // single-thread search depends on it).
+    var mb: u32 = 1;
+    while (mb <= 65_536) : (mb += if (mb < 4_096) 1 else 61) {
+        const serial = PrivateTableSizes.forThreads(mb, 1);
+        try std.testing.expectEqual(hintSizeFor(mb), serial.hint_mb);
+        try std.testing.expectEqual(eval_cache_mod.sizeForHash(mb), serial.eval_mb);
+    }
+    // CCRL-style configurations: each engine gets 1/T of the serial budget.
+    const cases = [_]struct { hash: u32, threads: u32, hint: u32, eval: u32 }{
+        .{ .hash = 1024, .threads = 4, .hint = 128, .eval = 16 },
+        .{ .hash = 2048, .threads = 8, .hint = 128, .eval = 8 },
+        .{ .hash = 256, .threads = 8, .hint = 16, .eval = 8 },
+        .{ .hash = 2048, .threads = 32, .hint = 32, .eval = 4 }, // eval floor (64/32 = 2)
+        .{ .hash = 16, .threads = 32, .hint = 1, .eval = 4 }, // both floors
+        .{ .hash = 65_536, .threads = 2, .hint = 512, .eval = 32 },
+    };
+    for (cases) |c| {
+        const sizes = PrivateTableSizes.forThreads(c.hash, c.threads);
+        try std.testing.expectEqual(c.hint, sizes.hint_mb);
+        try std.testing.expectEqual(c.eval, sizes.eval_mb);
+    }
+    // All private copies together never exceed the serial budget by more than
+    // the per-table floors (1 MB hint + 4 MB eval per engine).
+    for ([_]u32{ 1, 16, 64, 256, 1024, 2048, 4096, 65_536 }) |hash| {
+        const serial = PrivateTableSizes.forThreads(hash, 1);
+        for (1..33) |t| {
+            const threads: u32 = @intCast(t);
+            const sizes = PrivateTableSizes.forThreads(hash, threads);
+            try std.testing.expect(threads * sizes.hint_mb <= serial.hint_mb + threads * rfp_hint_mod.MIN_HINT_MB);
+            try std.testing.expect(threads * sizes.eval_mb <= serial.eval_mb + threads * eval_cache_mod.MIN_CACHE_MB);
+        }
+    }
+}
+
+test "parallel engines size their private tables from the thread share" {
+    var owner = try eval_backend.EngineState.init(std.testing.allocator, .{});
+    defer owner.deinit();
+    var serial = try Engine.initWithBorrowedEvaluator(std.testing.allocator, 32, &owner);
+    defer serial.deinit();
+    try std.testing.expectEqual(@as(u32, 16), serial.rfp_hint.hintSizeMb());
+    try std.testing.expectEqual(@as(u32, 8), serial.eval_cache.cacheSizeMb());
+    var one = try Engine.initForParallel(std.testing.allocator, 32, 1, &owner);
+    defer one.deinit();
+    try std.testing.expectEqual(serial.rfp_hint.entries.len, one.rfp_hint.entries.len);
+    try std.testing.expectEqual(serial.eval_cache.entries.len, one.eval_cache.entries.len);
+    var quarter = try Engine.initForParallel(std.testing.allocator, 32, 4, &owner);
+    defer quarter.deinit();
+    try std.testing.expectEqual(@as(u32, 4), quarter.rfp_hint.hintSizeMb());
+    try std.testing.expectEqual(@as(u32, 4), quarter.eval_cache.cacheSizeMb());
+    try std.testing.expectEqual(serial.rfp_hint.entries.len / 4, quarter.rfp_hint.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), quarter.tt.entries.len);
 }
 
 test "same hash reset requires no replacement allocations" {

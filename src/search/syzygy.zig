@@ -2,6 +2,7 @@
 //! SyzygyPath is set — with no path, probeWdl always returns null and play is
 //! bit-identical to a TB-less build.
 const std = @import("std");
+const builtin = @import("builtin");
 const position = @import("../core/position.zig");
 const score_mod = @import("score.zig");
 const types = @import("../core/types.zig");
@@ -70,8 +71,31 @@ const TablebaseService = @import("tb_service.zig").Service(Backend);
 // The C backend is a singleton, so there is exactly one process service.
 var service: TablebaseService = .{};
 
+/// Fathom's path-list separator (tbprobe.c SEP_CHAR).
+const PATH_LIST_SEPARATOR: u8 = if (builtin.os.tag == .windows) ';' else ':';
+
+/// `path` without trailing list separators, copied into `buffer` when anything
+/// was trimmed. Fathom counts an empty last component after a trailing
+/// separator and then scans past the end of its copy of the string looking for
+/// it, so the list must never reach tb_init ending in one. Null when nothing
+/// is left or the result does not fit.
+fn withoutTrailingSeparators(path: [:0]const u8, buffer: []u8) ?[:0]const u8 {
+    const trimmed = std.mem.trimRight(u8, path, &[_]u8{PATH_LIST_SEPARATOR});
+    if (trimmed.len == 0) return null;
+    if (trimmed.len == path.len) return path;
+    if (trimmed.len >= buffer.len) return null;
+    @memcpy(buffer[0..trimmed.len], trimmed);
+    buffer[trimmed.len] = 0;
+    return buffer[0..trimmed.len :0];
+}
+
 pub fn init(path: [:0]const u8) bool {
-    return service.init(path);
+    var buffer: [1024]u8 = undefined;
+    const list = withoutTrailingSeparators(path, &buffer) orelse {
+        service.disable();
+        return false;
+    };
+    return service.init(list);
 }
 pub fn disable() void {
     service.disable();
@@ -418,4 +442,22 @@ test "real root policy excludes the two gauntlet losing moves" {
         try std.testing.expectEqual(Wdl.loss, restricted.wdl);
         try std.testing.expectEqual(c[1], restricted.moves.moves[0]);
     }
+}
+
+test "tablebase path lists never reach Fathom with a trailing separator" {
+    const sep = if (builtin.os.tag == .windows) ";" else ":";
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/tb/345", withoutTrailingSeparators("/tb/345", &buffer).?);
+    try std.testing.expectEqualStrings("/tb/345", withoutTrailingSeparators("/tb/345" ++ sep, &buffer).?);
+    try std.testing.expectEqualStrings("/tb/345" ++ sep ++ "/tb/6", withoutTrailingSeparators("/tb/345" ++ sep ++ "/tb/6" ++ sep ++ sep, &buffer).?);
+    // Leading and doubled separators are harmless to Fathom and stay as given.
+    try std.testing.expectEqualStrings(sep ++ "/tb" ++ sep ++ sep ++ "/x", withoutTrailingSeparators(sep ++ "/tb" ++ sep ++ sep ++ "/x", &buffer).?);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), withoutTrailingSeparators(sep, &buffer));
+    try std.testing.expectEqual(@as(?[:0]const u8, null), withoutTrailingSeparators(sep ++ sep ++ sep, &buffer));
+    try std.testing.expectEqual(@as(?[:0]const u8, null), withoutTrailingSeparators("", &buffer));
+    // A separator-only list loads nothing and leaves tablebases off.
+    try std.testing.expect(!init(sep));
+    try std.testing.expect(!enabled());
+    try std.testing.expect(!init("/nonexistent-zigqueen-tablebases" ++ sep));
+    try std.testing.expect(!enabled());
 }

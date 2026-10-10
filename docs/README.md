@@ -6,10 +6,12 @@
   sources, trainer, and what was and was not taken from other projects.
 - [`STRENGTH.md`](STRENGTH.md) — anchored gauntlet results and the
   self-assessment methodology.
-- [`RELEASE_NOTES_6.3.0.md`](RELEASE_NOTES_6.3.0.md) — current release.
-- [`RELEASE_VALIDATION_6.3.0.md`](RELEASE_VALIDATION_6.3.0.md) — release checks and artifact identity.
+- [`RELEASE_NOTES_6.4.0.md`](RELEASE_NOTES_6.4.0.md) — current release.
+- [`RELEASE_VALIDATION_6.4.0.md`](RELEASE_VALIDATION_6.4.0.md) — release checks and artifact identity.
+- [`RELEASE_NOTES_6.3.0.md`](RELEASE_NOTES_6.3.0.md) — what changed in 6.3.0.
+- [`RELEASE_VALIDATION_6.3.0.md`](RELEASE_VALIDATION_6.3.0.md) — 6.3.0 release checks.
 - [`data-r2/README.md`](data-r2/README.md) — the training-data changes behind
-  the 6.3.0 network and how to reproduce them.
+  the 6.3.0 and 6.4.0 networks and how to reproduce them.
 - [`trainer/README.md`](trainer/README.md) — the bullet trainer patches.
 - [`RELEASE_NOTES_6.2.0.md`](RELEASE_NOTES_6.2.0.md) — what changed in 6.2.0.
 - [`RELEASE_VALIDATION_6.2.0.md`](RELEASE_VALIDATION_6.2.0.md) — 6.2.0 release checks.

@@ -129,11 +129,17 @@ pub fn run(progress: *std.Io.Writer, opts: Options) !void {
     const handles = try allocator.alloc(std.Thread, opts.threads);
     defer allocator.free(handles);
     var spawned: usize = 0;
+    var spawn_err: ?anyerror = null;
     for (handles, ctxs) |*h, *c| {
-        h.* = std.Thread.spawn(.{}, workerMain, .{c}) catch break;
+        h.* = std.Thread.spawn(.{}, workerMain, .{c}) catch |err| {
+            spawn_err = err;
+            break;
+        };
         spawned += 1;
     }
     for (handles[0..spawned]) |h| h.join();
+    // An unstarted worker leaves its record range unprocessed.
+    if (spawn_err) |err| return err;
     if (shared.failed.load(.acquire)) return error.TbRescoreWorkerFailed;
 
     var st = Stats{};

@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const attacks = @import("../movegen/attacks.zig");
 const basin = @import("basin.zig");
 const hugealloc = @import("../util/hugealloc.zig");
@@ -85,29 +87,109 @@ pub const ContContext = struct {
 
 const ContTable = [CONT_PLIES][CONT_KEYS][CONT_KEYS]i16;
 
-/// Correction history: small per-thread tables that learn, ONLINE during search,
-/// the systematic error of the static eval in position classes (keyed by pawn
-/// structure and by each colour's non-pawn piece placement), and nudge the static
-/// eval used for pruning/improving/stand-pat decisions toward the search truth.
-/// Entries are a depth-weighted EMA of (search score - raw static eval), stored
-/// at CORR_GRAIN x centipawns. Distilled from the SF-family corrhist.
+/// Correction history, drift-removed (A3c form): small per-thread tables that
+/// learn, online during search, how the raw static eval's error in five
+/// position classes per side to move (pawn structure, each colour's non-pawn
+/// placement, minor-piece placement, major-piece placement) DIFFERS from the
+/// running mean error of its side to move and pawn-count bucket. The mean
+/// itself is never applied: the search's learning events are selected (RFP and
+/// null move cut high-eval nodes before any update), so their mean is a shift
+/// the pruning margins already price (A3 diagnosis and A3b premise, +18 to
+/// +24 cp). Only class deviations reach the eval; an untrained class adds 0.
+///
+/// Entries are in 1/CORR_GRAIN cp, means in 1/CORR_MEAN_GRAIN cp (a slow mean
+/// needs the finer grain or its small steps truncate). The applied correction is the
+/// weighted average of the five class entries (basin.Params corr_*). Which
+/// node results teach the tables is decided in root.zig (`corr_learn`).
 pub const CORR_SIZE: usize = 16384; // entries per table (power of two)
 const CORR_MASK: u64 = CORR_SIZE - 1;
-const CORR_GRAIN: i32 = 256; // stored value = correction_cp * CORR_GRAIN
-const CORR_LIMIT: i32 = 32 * CORR_GRAIN; // per-table clamp (~+/-32 cp)
+const CORR_GRAIN: i32 = 64; // stored value = correction_cp * CORR_GRAIN
+const CORR_MEAN_GRAIN: i32 = 4096;
+pub const CORR_BUCKETS: usize = 4; // total pawns 0-4, 5-8, 9-12, 13-16
+const CORR_DEVIATION_LIMIT: i32 = 32000;
+
+const CorrRows = [2][CORR_SIZE]i16; // [stm][class key]
+
+/// Learning events (build option `corr-learn`): bound-consistent scores or
+/// exact scores only.
+pub const CorrLearn = enum { bound, exact };
+pub const corr_learn: CorrLearn = std.meta.stringToEnum(CorrLearn, build_options.corr_learn) orelse
+    @compileError("-Dcorr-learn must be bound or exact");
+
+/// Whether a node result teaches the tables. `estimate` is the learner's full
+/// value estimate (raw + applied correction + bucket mean). Bound-consistent:
+/// a fail high above it, a fail low below it, or any score inside the caller's
+/// window; exact: only scores inside the caller's window.
+pub inline fn correctionLearns(best: types.Score, alpha_orig: types.Score, beta: types.Score, estimate: i32) bool {
+    const inside = best > alpha_orig and best < beta;
+    return switch (comptime corr_learn) {
+        .exact => inside,
+        .bound => inside or (best >= beta and best > estimate) or (best <= alpha_orig and best < estimate),
+    };
+}
+
+const CORR_CONT_KEYS: usize = 12 * 64; // piece-colour * 64 + destination
+const CorrContRows = [2][CORR_CONT_KEYS]i16; // [stm][previous move key]
 
 const CorrTables = struct {
-    pawn: [2][CORR_SIZE]i32, // [stm][pawn-structure key]
-    nonpawn: [2][2][CORR_SIZE]i32, // [piece colour][stm][that colour's non-pawn key]
+    pawn: CorrRows,
+    nonpawn_white: CorrRows,
+    nonpawn_black: CorrRows,
+    minor: CorrRows,
+    major: CorrRows,
+    /// Continuation classes: the move one ply back (the opponent's last move)
+    /// and two plies back (our own last move), keyed by piece-colour and
+    /// destination (`contKeyOfPiece`).
+    cont1: CorrContRows,
+    cont2: CorrContRows,
+    /// Running mean learning target per [stm][pawn bucket]; never applied.
+    mean: [2][CORR_BUCKETS]i32,
 };
+
+/// The previous-move keys of a node for the continuation classes; CONT_NONE
+/// after a null move, at the root and in quiescence (which keeps no move
+/// stack). Plain sentinel keys, not optionals: a `?u16` built in negamax's
+/// frame was written as a 2-byte payload plus a 1-byte flag and read back as
+/// one 4-byte word, a failed store-to-load forward on every static eval.
+pub const CorrCont = struct {
+    k1: u16 = CONT_NONE,
+    k2: u16 = CONT_NONE,
+};
+
+/// Pawn-count bucket of a position (total pawns of both colours).
+pub inline fn corrBucket(pos: *const position.Position) usize {
+    const pawns = @popCount(pos.pieces[0][0] | pos.pieces[1][0]);
+    return @min(@as(usize, @intCast(pawns)) -| 1, 15) / 4;
+}
+
+/// One EMA step toward `target` (grain units): min(depth, 16) * step / 1024 of the gap.
+inline fn corrStep(entry: *i16, target: i32, depth: u16, step: i32) void {
+    const w: i32 = @min(@as(i32, depth), 16);
+    const current: i32 = entry.*;
+    entry.* = @intCast(current + @divTrunc((target - current) * w * step, 1024));
+}
+
+/// Without AVX-512DQ there is no vector 64-bit multiply: LLVM's SLP pass
+/// still packs the five independent key chains of `corrKeys` into ymm lanes
+/// and emulates every `*%` with three vpmuludq plus shifts and adds, which
+/// made the key line ~8% of negamax's samples. Routing each product through
+/// an empty register-constrained asm keeps the chains scalar (one imul each);
+/// the value is untouched. With AVX-512DQ (vpmullq) the packed form stays.
+const keep_mix_scalar = builtin.cpu.arch == .x86_64 and
+    !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512dq);
+
+inline fn inGpr(x: u64) u64 {
+    if (comptime keep_mix_scalar) return asm ("" : [ret] "=r" (-> u64) : [x] "0" (x));
+    return x;
+}
 
 /// 64-bit finalizer (splitmix64/murmur3 style) — turns raw bitboards into table keys.
 inline fn mix64(x_in: u64) u64 {
     var x = x_in;
     x ^= x >> 33;
-    x *%= 0xff51afd7ed558ccd;
+    x = inGpr(x *% 0xff51afd7ed558ccd);
     x ^= x >> 33;
-    x *%= 0xc4ceb9fe1a85ec53;
+    x = inGpr(x *% 0xc4ceb9fe1a85ec53);
     x ^= x >> 33;
     return x;
 }
@@ -123,6 +205,48 @@ inline fn nonPawnCorrKey(pos: *const position.Position, color_index: usize) usiz
     h = mix64(h) ^ pos.pieces[color_index][4]; // Q
     h = mix64(h) ^ pos.pieces[color_index][5]; // K
     return @intCast(mix64(h) & CORR_MASK);
+}
+
+inline fn minorCorrKey(pos: *const position.Position) usize {
+    var h = mix64(pos.pieces[0][@intFromEnum(piece.PieceType.knight)]);
+    h ^= pos.pieces[0][@intFromEnum(piece.PieceType.bishop)];
+    h = mix64(h) ^ pos.pieces[1][@intFromEnum(piece.PieceType.knight)];
+    h = mix64(h) ^ pos.pieces[1][@intFromEnum(piece.PieceType.bishop)];
+    return @intCast(mix64(h) & CORR_MASK);
+}
+
+inline fn majorCorrKey(pos: *const position.Position) usize {
+    var h = mix64(pos.pieces[0][@intFromEnum(piece.PieceType.rook)]);
+    h ^= pos.pieces[0][@intFromEnum(piece.PieceType.queen)];
+    h = mix64(h) ^ pos.pieces[1][@intFromEnum(piece.PieceType.rook)];
+    h = mix64(h) ^ pos.pieces[1][@intFromEnum(piece.PieceType.queen)];
+    return @intCast(mix64(h) & CORR_MASK);
+}
+
+/// The five position-class table indices of a position (20 mix64 rounds).
+/// A negamax node computes them once, before its static eval, and shares them
+/// between the prefetch, the corrected eval and the learning step at the
+/// node's end: the same indices the per-call key functions return.
+pub const CorrKeys = struct {
+    pawn: u16,
+    nonpawn_white: u16,
+    nonpawn_black: u16,
+    minor: u16,
+    major: u16,
+};
+
+comptime {
+    std.debug.assert(CORR_SIZE - 1 <= std.math.maxInt(u16));
+}
+
+pub inline fn corrKeys(pos: *const position.Position) CorrKeys {
+    return .{
+        .pawn = @intCast(pawnCorrKey(pos)),
+        .nonpawn_white = @intCast(nonPawnCorrKey(pos, 0)),
+        .nonpawn_black = @intCast(nonPawnCorrKey(pos, 1)),
+        .minor = @intCast(minorCorrKey(pos)),
+        .major = @intCast(majorCorrKey(pos)),
+    };
 }
 pub const HISTORY_SNAPSHOT_BUCKET_NAMES = [_][]const u8{
     "negative_saturated_90p",
@@ -191,7 +315,7 @@ pub const HistoryTable = struct {
     /// them — 2.25MB of random (prev,cur)-keyed access). Frees must go through
     /// hugealloc with this.
     continuation_method: hugealloc.Method = .heap,
-    /// Heap-owned correction-history tables (~384 KB). Null when disabled — all
+    /// Heap-owned correction-history tables (~320 KB). Null when disabled — all
     /// corrhist reads return 0 and updates are no-ops (same pattern as conthist).
     correction: ?*CorrTables = null,
 
@@ -237,45 +361,99 @@ pub const HistoryTable = struct {
         if (saved_corr) |tables| @memset(std.mem.asBytes(tables), 0);
     }
 
-    /// Static eval corrected by the learned per-position-class error, clamped out
-    /// of the mate band (a static eval must never look like a mate score).
-    pub fn correctedEval(self: *const HistoryTable, pos: *const position.Position, raw: types.Score) types.Score {
+    /// Static eval corrected by the learned class deviations, clamped out of the
+    /// mate band (a static eval must never look like a mate score).
+    pub fn correctedEval(self: *const HistoryTable, pos: *const position.Position, raw: types.Score, cont: CorrCont, params: *const basin.Params) types.Score {
+        if (self.correction == null) return raw;
+        return self.correctedEvalKeyed(pos.side_to_move, corrKeys(pos), raw, cont, params);
+    }
+
+    /// Prefetch the five class entries of `keys` (row `stm`), so the corrected
+    /// eval that follows the raw eval finds them in L1 instead of stalling on
+    /// L2/L3 (the tables total 320 KB per thread). No effect on values.
+    pub inline fn prefetchCorrection(self: *const HistoryTable, stm: types.Color, keys: CorrKeys) void {
+        const tables = self.correction orelse return;
+        const s = @intFromEnum(stm);
+        const pawn_row: *const [CORR_SIZE]i16 = &tables.pawn[s];
+        const npw_row: *const [CORR_SIZE]i16 = &tables.nonpawn_white[s];
+        const npb_row: *const [CORR_SIZE]i16 = &tables.nonpawn_black[s];
+        const minor_row: *const [CORR_SIZE]i16 = &tables.minor[s];
+        const major_row: *const [CORR_SIZE]i16 = &tables.major[s];
+        @prefetch(&pawn_row[keys.pawn], .{ .rw = .read, .locality = 3, .cache = .data });
+        @prefetch(&npw_row[keys.nonpawn_white], .{ .rw = .read, .locality = 3, .cache = .data });
+        @prefetch(&npb_row[keys.nonpawn_black], .{ .rw = .read, .locality = 3, .cache = .data });
+        @prefetch(&minor_row[keys.minor], .{ .rw = .read, .locality = 3, .cache = .data });
+        @prefetch(&major_row[keys.major], .{ .rw = .read, .locality = 3, .cache = .data });
+    }
+
+    /// `correctedEval` with the position's class keys already computed
+    /// (`corrKeys` of the same position, `stm` its side to move).
+    pub noinline fn correctedEvalKeyed(self: *const HistoryTable, side_to_move: types.Color, keys: CorrKeys, raw: types.Score, cont: CorrCont, params: *const basin.Params) types.Score {
         const tables = self.correction orelse return raw;
-        const stm = @intFromEnum(pos.side_to_move);
-        // Index via explicit sub-array pointers: `tables.pawn[stm][k]` through the
-        // pointer field materialises a 64KB stack COPY of the sub-array before the
-        // runtime-index lookup (memcpy was 61% of runtime); `&...[stm]` forces
-        // in-place addressing.
-        const pawn_row: *const [CORR_SIZE]i32 = &tables.pawn[stm];
-        const npw_row: *const [CORR_SIZE]i32 = &tables.nonpawn[0][stm];
-        const npb_row: *const [CORR_SIZE]i32 = &tables.nonpawn[1][stm];
-        // Pawn structure weighted double (the strongest signal in reference
-        // implementations); total applied correction capped at ~+/-32 cp — v1's
-        // +/-72 cp ceiling let half-trained tables poison pruning decisions
-        // (self-SPRT -17.4).
-        const v = 2 * pawn_row[pawnCorrKey(pos)] +
-            npw_row[nonPawnCorrKey(pos, 0)] +
-            npb_row[nonPawnCorrKey(pos, 1)];
-        const corrected = @as(i32, raw) + @divTrunc(v, 4 * CORR_GRAIN);
+        const stm = @intFromEnum(side_to_move);
+        // Index via explicit row pointers: `tables.pawn[stm][k]` through the
+        // pointer field can materialise a stack COPY of the whole row before the
+        // runtime-index lookup (the parked form's memcpy was 61% of runtime);
+        // `&...[stm]` forces in-place addressing.
+        const pawn_row: *const [CORR_SIZE]i16 = &tables.pawn[stm];
+        const npw_row: *const [CORR_SIZE]i16 = &tables.nonpawn_white[stm];
+        const npb_row: *const [CORR_SIZE]i16 = &tables.nonpawn_black[stm];
+        const minor_row: *const [CORR_SIZE]i16 = &tables.minor[stm];
+        const major_row: *const [CORR_SIZE]i16 = &tables.major[stm];
+        var weight_sum = params.corr_weight_pawn + 2 * params.corr_weight_nonpawn + params.corr_weight_minor + params.corr_weight_major;
+        var weighted = params.corr_weight_pawn * @as(i32, pawn_row[keys.pawn]) +
+            params.corr_weight_nonpawn * (@as(i32, npw_row[keys.nonpawn_white]) + @as(i32, npb_row[keys.nonpawn_black])) +
+            params.corr_weight_minor * @as(i32, minor_row[keys.minor]) +
+            params.corr_weight_major * @as(i32, major_row[keys.major]);
+        // A missing continuation key drops that class from the average.
+        if (cont.k1 != CONT_NONE) {
+            const row: *const [CORR_CONT_KEYS]i16 = &tables.cont1[stm];
+            weighted += params.corr_weight_cont1 * @as(i32, row[cont.k1]);
+            weight_sum += params.corr_weight_cont1;
+        }
+        if (cont.k2 != CONT_NONE) {
+            const row: *const [CORR_CONT_KEYS]i16 = &tables.cont2[stm];
+            weighted += params.corr_weight_cont2 * @as(i32, row[cont.k2]);
+            weight_sum += params.corr_weight_cont2;
+        }
+        if (weight_sum <= 0) return raw;
+        const correction = @divTrunc(@as(i64, weighted) * params.corr_apply_scale, @as(i64, weight_sum) * CORR_GRAIN * 64);
+        const corrected = @as(i64, raw) + correction;
         return @intCast(std.math.clamp(corrected, -(score_mod.MATE_THRESHOLD - 1), score_mod.MATE_THRESHOLD - 1));
     }
 
-    /// Depth-weighted EMA update of every corrhist table toward `diff_cp`
-    /// (= search score - RAW static eval at a bound-consistent node).
-    pub fn updateCorrection(self: *HistoryTable, pos: *const position.Position, diff_cp: i32, depth: u16) void {
+    /// The running mean learning target (cp) of the position's side to move and
+    /// pawn bucket: part of the learner's estimate, never applied.
+    pub inline fn correctionMean(self: *const HistoryTable, pos: *const position.Position) i32 {
+        const tables = self.correction orelse return 0;
+        return @divTrunc(tables.mean[@intFromEnum(pos.side_to_move)][corrBucket(pos)], CORR_MEAN_GRAIN);
+    }
+
+    /// One learning step toward `diff_cp` (= search score - RAW static eval),
+    /// clamped to +/-corr_target_cap: the bucket mean moves toward it, then every
+    /// class entry toward its deviation from the updated mean.
+    pub fn updateCorrection(self: *HistoryTable, pos: *const position.Position, cont: CorrCont, diff_cp: i32, depth: u16, params: *const basin.Params) void {
+        if (self.correction == null) return;
+        self.updateCorrectionKeyed(pos, corrKeys(pos), cont, diff_cp, depth, params);
+    }
+
+    /// `updateCorrection` with the position's class keys already computed
+    /// (`corrKeys` of the same position).
+    pub fn updateCorrectionKeyed(self: *HistoryTable, pos: *const position.Position, keys: CorrKeys, cont: CorrCont, diff_cp: i32, depth: u16, params: *const basin.Params) void {
         const tables = self.correction orelse return;
         const stm = @intFromEnum(pos.side_to_move);
-        const w: i32 = @min(@as(i32, depth) + 1, 16);
-        const scaled = std.math.clamp(diff_cp * CORR_GRAIN, -CORR_LIMIT, CORR_LIMIT);
-        const slots = [_]*i32{
-            &tables.pawn[stm][pawnCorrKey(pos)],
-            &tables.nonpawn[0][stm][nonPawnCorrKey(pos, 0)],
-            &tables.nonpawn[1][stm][nonPawnCorrKey(pos, 1)],
-        };
-        for (slots) |entry| {
-            const updated = @divTrunc(entry.* * (256 - w) + scaled * w, 256);
-            entry.* = std.math.clamp(updated, -CORR_LIMIT, CORR_LIMIT);
-        }
+        const target_cp = std.math.clamp(diff_cp, -params.corr_target_cap, params.corr_target_cap);
+        const mean = &tables.mean[stm][corrBucket(pos)];
+        mean.* += @divTrunc((target_cp * CORR_MEAN_GRAIN - mean.*) * params.corr_mean_step, 4096);
+        const deviation = std.math.clamp(target_cp * CORR_GRAIN - @divTrunc(mean.*, CORR_MEAN_GRAIN / CORR_GRAIN), -CORR_DEVIATION_LIMIT, CORR_DEVIATION_LIMIT);
+        const step = params.corr_step;
+        corrStep(&tables.pawn[stm][keys.pawn], deviation, depth, step);
+        corrStep(&tables.nonpawn_white[stm][keys.nonpawn_white], deviation, depth, step);
+        corrStep(&tables.nonpawn_black[stm][keys.nonpawn_black], deviation, depth, step);
+        corrStep(&tables.minor[stm][keys.minor], deviation, depth, step);
+        corrStep(&tables.major[stm][keys.major], deviation, depth, step);
+        if (cont.k1 != CONT_NONE) corrStep(&tables.cont1[stm][cont.k1], deviation, depth, step);
+        if (cont.k2 != CONT_NONE) corrStep(&tables.cont2[stm][cont.k2], deviation, depth, step);
     }
 
     pub fn score(self: *const HistoryTable, side: types.Color, moved_piece: piece.PieceType, to: square.Square, bucket: u2) i32 {
@@ -491,6 +669,108 @@ fn applyGravity(current: i32, delta: i32) i32 {
     const magnitude = @min(@abs(delta), HISTORY_LIMIT);
     const decay = @divTrunc(current * magnitude, HISTORY_LIMIT);
     return std.math.clamp(current + delta - decay, -HISTORY_LIMIT, HISTORY_LIMIT);
+}
+
+test "correction history is inert until allocated, then learns a class deviation" {
+    const fen = @import("../core/fen.zig");
+    const params = basin.Params{};
+    var history = HistoryTable{};
+    const pos = try fen.startpos();
+    history.updateCorrection(&pos, .{}, 100, 8, &params);
+    try std.testing.expectEqual(@as(types.Score, 37), history.correctedEval(&pos, 37, .{}, &params));
+
+    try history.initCorrection(std.testing.allocator);
+    defer history.deinitCorrection(std.testing.allocator);
+    try std.testing.expectEqual(@as(types.Score, 37), history.correctedEval(&pos, 37, .{}, &params));
+
+    history.updateCorrection(&pos, .{}, 40, 16, &params);
+    try std.testing.expect(history.correctedEval(&pos, 37, .{}, &params) > 37);
+    // The other side to move has its own tables and means.
+    var black = pos;
+    black.side_to_move = .black;
+    try std.testing.expectEqual(@as(types.Score, 37), history.correctedEval(&black, 37, .{}, &params));
+    try std.testing.expectEqual(@as(i32, 0), history.correctionMean(&black));
+
+    history.clear();
+    try std.testing.expectEqual(@as(types.Score, 37), history.correctedEval(&pos, 37, .{}, &params));
+    try std.testing.expectEqual(@as(i32, 0), history.correctionMean(&pos));
+    try std.testing.expect(history.correction != null);
+}
+
+test "correction history never applies the mean, only class deviations" {
+    const fen = @import("../core/fen.zig");
+    const params = basin.Params{};
+    var history = HistoryTable{};
+    try history.initCorrection(std.testing.allocator);
+    defer history.deinitCorrection(std.testing.allocator);
+    // A uniform residual everywhere is a mean, not a deviation: it fades out.
+    const pos = try fen.startpos();
+    for (0..4000) |_| history.updateCorrection(&pos, .{}, 40, 16, &params);
+    try std.testing.expect(history.correctionMean(&pos) >= 38);
+    try std.testing.expect(@abs(history.correctedEval(&pos, 0, .{}, &params)) <= 1);
+
+    // Two pawn structures in one bucket (same pieces otherwise) with residuals
+    // +60 and -20: the mean settles near +20 and each structure keeps its
+    // deviation, with opposite signs (the shared classes see both and stay small).
+    history.clear();
+    const a = try fen.parse("4k3/pppp4/8/8/8/8/PPPP4/4K3 w - - 0 1");
+    const b = try fen.parse("4k3/4pppp/8/8/8/8/4PPPP/4K3 w - - 0 1");
+    try std.testing.expectEqual(corrBucket(&a), corrBucket(&b));
+    for (0..4000) |_| {
+        history.updateCorrection(&a, .{}, 60, 16, &params);
+        history.updateCorrection(&b, .{}, -20, 16, &params);
+    }
+    const ca = history.correctedEval(&a, 0, .{}, &params);
+    const cb = history.correctedEval(&b, 0, .{}, &params);
+    try std.testing.expect(ca > 0 and cb < 0);
+    try std.testing.expect(ca - cb >= 10);
+    try std.testing.expect(history.correctionMean(&a) >= 18 and history.correctionMean(&a) <= 22);
+}
+
+test "correction history caps the target and never reaches the mate band" {
+    const fen = @import("../core/fen.zig");
+    var params = basin.Params{};
+    params.corr_mean_step = 4; // keep the mean slow so the deviation stays visible
+    var history = HistoryTable{};
+    try history.initCorrection(std.testing.allocator);
+    defer history.deinitCorrection(std.testing.allocator);
+    const pos = try fen.startpos();
+    for (0..50) |_| history.updateCorrection(&pos, .{}, 5000, 16, &params);
+    // Entries are capped at the target cap; the applied correction scales them by
+    // corr_apply_scale / 64, so its bound is the cap times that factor.
+    const applied_cap = @divTrunc(params.corr_target_cap * @max(params.corr_apply_scale, 64), 64);
+    try std.testing.expect(history.correctedEval(&pos, 0, .{}, &params) <= applied_cap);
+    try std.testing.expect(history.correctionMean(&pos) <= params.corr_target_cap);
+    const near_mate: types.Score = score_mod.MATE_THRESHOLD - 2;
+    try std.testing.expect(history.correctedEval(&pos, near_mate, .{}, &params) < score_mod.MATE_THRESHOLD);
+    for (0..200) |_| history.updateCorrection(&pos, .{}, -5000, 16, &params);
+    try std.testing.expect(history.correctedEval(&pos, -near_mate, .{}, &params) > -score_mod.MATE_THRESHOLD);
+}
+
+test "continuation correction applies only with its key" {
+    const fen = @import("../core/fen.zig");
+    const params = basin.Params{};
+    var history = HistoryTable{};
+    try history.initCorrection(std.testing.allocator);
+    defer history.deinitCorrection(std.testing.allocator);
+    const pos = try fen.startpos();
+    const cont = CorrCont{ .k1 = contKeyOfPiece(.black_knight, .f6) };
+    // Train the continuation class against a mean that moves slowly.
+    var slow = params;
+    slow.corr_mean_step = 4;
+    for (0..20) |_| history.updateCorrection(&pos, cont, 60, 16, &slow);
+    // Later evidence without the key moves only the position classes.
+    for (0..40) |_| history.updateCorrection(&pos, .{}, -20, 16, &slow);
+    const with_key = history.correctedEval(&pos, 0, cont, &params);
+    const without = history.correctedEval(&pos, 0, .{}, &params);
+    try std.testing.expect(with_key > without);
+}
+
+test "pawn buckets split by total pawn count" {
+    const fen = @import("../core/fen.zig");
+    try std.testing.expectEqual(@as(usize, 3), corrBucket(&(try fen.startpos())));
+    try std.testing.expectEqual(@as(usize, 0), corrBucket(&(try fen.parse("4k3/8/8/8/8/8/8/4K3 w - - 0 1"))));
+    try std.testing.expectEqual(@as(usize, 1), corrBucket(&(try fen.parse("4k3/pppp4/8/8/8/8/P7/4K3 w - - 0 1"))));
 }
 
 test "history snapshot buckets quiet move scores" {

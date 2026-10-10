@@ -30,7 +30,7 @@ test "pool strict credits, preflight and repeated job barriers" {
     const a = std.testing.allocator;
     var owner = try eval_backend.EngineState.init(a, .{});
     defer owner.deinit();
-    var coordinator = try engine_mod.Engine.initForParallel(a, 1, &owner);
+    var coordinator = try engine_mod.Engine.initForParallel(a, 1, 4, &owner);
     defer coordinator.deinit();
     var external = std.atomic.Value(bool).init(false);
     const pool = try Pool.create(a, 4, 1, &owner, &external, 1, 1);
@@ -95,7 +95,7 @@ test "helper pickup rejects an epoch mismatch in every build mode" {
     const a = std.testing.allocator;
     var owner = try eval_backend.EngineState.init(a, .{});
     defer owner.deinit();
-    var coordinator = try engine_mod.Engine.initForParallel(a, 1, &owner);
+    var coordinator = try engine_mod.Engine.initForParallel(a, 1, 2, &owner);
     defer coordinator.deinit();
     var external = std.atomic.Value(bool).init(false);
     const Spawner = struct {
@@ -129,7 +129,7 @@ test "winning root tablebase result starts no helper and charges once" {
     defer syzygy.disable();
     var owner = try eval_backend.EngineState.init(a, .{});
     defer owner.deinit();
-    var coordinator = try engine_mod.Engine.initForParallel(a, 1, &owner);
+    var coordinator = try engine_mod.Engine.initForParallel(a, 1, 4, &owner);
     defer coordinator.deinit();
     var external = std.atomic.Value(bool).init(false);
     const pool = try Pool.create(a, 4, 1, &owner, &external, 1, 1);
@@ -192,7 +192,7 @@ pub const Pool = struct {
         self.* = .{ .allocator = allocator, .table = table, .helpers = helpers, .network_epoch = network_epoch, .config_epoch = config_epoch, .control = .{ .external_stop = external_stop } };
         errdefer self.closeWorkers();
         for (helpers) |*slot| {
-            slot.* = .{ .engine = try engine_mod.Engine.initForParallel(allocator, hash_mb, owner) };
+            slot.* = .{ .engine = try engine_mod.Engine.initForParallel(allocator, hash_mb, threads, owner) };
             self.initialized += 1;
             slot.thread = try spawner.spawn(self, slot);
         }
@@ -357,7 +357,7 @@ test "drawn root policy is copied before helpers and survives tiny budgets" {
     defer syzygy.disable();
     var owner = try eval_backend.EngineState.init(a, .{});
     defer owner.deinit();
-    var coordinator = try engine_mod.Engine.initForParallel(a, 1, &owner);
+    var coordinator = try engine_mod.Engine.initForParallel(a, 1, 4, &owner);
     defer coordinator.deinit();
     var external = std.atomic.Value(bool).init(false);
     const pool = try Pool.create(a, 4, 1, &owner, &external, 1, 1);

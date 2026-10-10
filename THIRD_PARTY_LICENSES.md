@@ -268,9 +268,9 @@ Our alterations to these data (file selection, local re-encoding, position
 filter, holdout, quotas and score conversion) and the method to reproduce
 them are offered free of charge under ODbL-1.0 (individual contents: DBCL-1.0)
 at:
-https://github.com/stierms/zigqueen/blob/v6.3.0/docs/data-r2/README.md
+https://github.com/stierms/zigqueen/blob/v6.4.0/docs/data-r2/README.md
 Data sources, scope and model lineage:
-https://github.com/stierms/zigqueen/blob/v6.3.0/docs/NETWORK.md
+https://github.com/stierms/zigqueen/blob/v6.4.0/docs/NETWORK.md
 
 The source-only tools in that offer are GPL-3.0-or-later. Cargo fetches their
 dependencies under their own licenses: sfbinpack 0.6.2 (GPL-3.0,

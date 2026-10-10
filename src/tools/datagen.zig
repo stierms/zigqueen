@@ -832,7 +832,7 @@ fn printProgress(
     //   scripts/cloud-burst/zqb-lib.sh  awk positions=$6, pos_per_sec=$10
     //   zq-fleet server/backfill.py + server/launchers.py  regex requiring
     //     "... discards D pos_per_sec R" ADJACENT
-    //   scripts/datagen-mainbox.sh  grep -o 'pos_per_sec [0-9.]*'
+    //   the datagen driver script   grep -o 'pos_per_sec [0-9.]*'
     // (The `datagen done:` line has the opposite constraint: pos_per_sec must
     // stay LAST, because scripts/datagen-run.sh reads it as awk $(NF).)
     try progress.print("datagen progress: games {d}/{d} positions {d} discards {d} pos_per_sec {d:.1} tb_root_hits {d} tb_scored_positions {d}\n", .{

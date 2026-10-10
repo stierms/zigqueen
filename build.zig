@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     // Bump policy: MINOR for an accepted strength gain (each promoted baseline),
     // PATCH for fixes/tooling/perf-neutral changes, MAJOR for architecture
     // milestones. Highest version == newest.
-    const semver = "6.3.0";
+    const semver = "6.4.0";
     const version_override = b.option(
         []const u8,
         "version",
@@ -91,10 +91,48 @@ pub fn build(b: *std.Build) void {
         "Compile runtime search-tuning UCI options (default: false).",
     ) orelse false;
 
+    // Fail-soft cutoff returns (correction-history bundle, step 1). Off builds
+    // return the window bounds exactly as before.
+    const fail_soft = b.option(
+        bool,
+        "fail-soft",
+        "Return fail-soft scores at RFP, null-move and quiescence fail-high cutoffs (default: true).",
+    ) orelse true;
+    // Quiescence fail lows: M > 0 = min(alpha, max(best, stand-pat + M))
+    // outside check; 0 = hard (alpha). Only meaningful with fail-soft.
+    const qs_fail_low_margin = b.option(
+        i32,
+        "qs-fail-low-margin",
+        "Quiescence fail-low margin in cp; 0 keeps fail lows hard (default: 200).",
+    ) orelse 200;
+    // Correction history (bundle step 2). Off builds allocate no tables.
+    const correction_history = b.option(
+        bool,
+        "correction-history",
+        "Learn and apply static-eval correction history (default: true).",
+    ) orelse true;
+    // Which node results teach correction history (A3c): bound-consistent
+    // scores ("bound") or exact scores only ("exact").
+    const corr_learn = b.option(
+        []const u8,
+        "corr-learn",
+        "Correction-history learning events: bound|exact (default: bound).",
+    ) orelse "bound";
+    const corr_qsearch = b.option(
+        bool,
+        "corr-qsearch",
+        "Correct the quiescence stand-pat with correction history (default: false).",
+    ) orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "search_stats", search_stats);
     build_options.addOption(bool, "tuning", tuning);
+    build_options.addOption(bool, "fail_soft", fail_soft);
+    build_options.addOption(i32, "qs_fail_low_margin", qs_fail_low_margin);
+    build_options.addOption(bool, "correction_history", correction_history);
+    build_options.addOption([]const u8, "corr_learn", corr_learn);
+    build_options.addOption(bool, "corr_qsearch", corr_qsearch);
     const build_options_module = build_options.createModule();
 
     const root_module = b.createModule(.{
@@ -126,6 +164,11 @@ pub fn build(b: *std.Build) void {
     stats_options.addOption([]const u8, "version", version);
     stats_options.addOption(bool, "search_stats", true);
     stats_options.addOption(bool, "tuning", tuning);
+    stats_options.addOption(bool, "fail_soft", fail_soft);
+    stats_options.addOption(i32, "qs_fail_low_margin", qs_fail_low_margin);
+    stats_options.addOption(bool, "correction_history", correction_history);
+    stats_options.addOption([]const u8, "corr_learn", corr_learn);
+    stats_options.addOption(bool, "corr_qsearch", corr_qsearch);
     const stats_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

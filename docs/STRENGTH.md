@@ -1,7 +1,8 @@
 # Strength
 
-The 6.3.0 and 6.2.0 gauntlets used different fields, clocks and machines, so
-their numbers cannot be subtracted from each other.
+6.4.0 and 6.3.0 were measured on the same fields, clocks and machine. The
+6.2.0 gauntlet used a different field, clock and machine, so its number cannot
+be subtracted from the later ones.
 
 Development builds are named by their commit in our private history:
 
@@ -12,6 +13,73 @@ Development builds are named by their commit in our private history:
 | 6.3 RC | `48d6a0dcf` | pre-multicore + new network + multithreading + UCI and Fathom fixes; played the 2026-09-22 gauntlets |
 | 6.3 base | `e57c20976` | 6.3 RC + root tablebase fix |
 | 6.3.0 | tested as `2d7193418` (engine source of `4844f5509`) | 6.3 base + speed pass + cut-node labels |
+| 6.4.0 | tested as `c08456bcc` | 6.3.0 + new network + the search, time-management, multithreading and UCI changes below |
+
+## 6.4.0 at one thread
+
+**3701 (95%: 3694–3707)** from 1,628 games, against 3676 for 6.3.0: about
+**+25**. Same 22 engines, anchors, clock (86.349s+0.720s) and machine as 6.3.0
+below; new openings from the same book. Score: **208 wins, 1,371 draws,
+49 losses = 893.5/1628 (54.9%)**, including three opponent time forfeits. No
+zigqueen forfeits. Build `c08456bcc`, AVX2.
+
+| Opponent | Anchor | W–D–L | Points / 74 | Implied rating | 6.3.0 points / 74 |
+|---|---:|---:|---:|---:|---:|
+| Horsie 1.1.0 | 3710 | 2–65–7 | 34.5 | 3686 | 34 |
+| Minke 7.0.0 | 3703 | 4–65–5 | 36.5 | 3698 | 35 |
+| Igel 3.7.0 | 3694 | 4–68–2 | 38 | 3703 | 34.5 |
+| Lizard 11.2 | 3694 | 5–66–3 | 38 | 3703 | 35.5 |
+| Renegade 1.3.0 | 3693 | 5–65–4 | 37.5 | 3698 | 34 |
+| RubiChess 20240817 | 3692 | 12–58–4 | 41 | 3730 | 38 |
+| Starzix 6.0 | 3690 | 8–64–2 | 40 | 3718 | 37 |
+| Uralochka 3.42a | 3689 | 3–69–2 | 37.5 | 3694 | 36 |
+| Tcheran 13.0 | 3683 | 4–69–1 | 38.5 | 3697 | 34.5 |
+| Icarus 1.0 | 3672 | 11–61–2 | 41.5 | 3714 | 38 |
+| Zangdar 7 | 3670 | 5–65–4 | 37.5 | 3675 | 36.5 |
+| Arasan 26.0 | 3658 | 11–61–2 | 41.5 | 3700 | 40.5 |
+| Titan 1.1.0 | 3655 | 5–68–1 | 39 | 3674 | 37 |
+| Cataphract 1.5.1 | 3651 | 12–62–0 | 43 | 3708 | 36.5 |
+| Revenge 4.0 | 3649 | 9–62–3 | 40 | 3677 | 37 |
+| Velvet 8.1.1 | 3647 | 17–56–1 | 45 | 3723 | 38 |
+| Prune 4.0.1 | 3644 | 12–61–1 | 42.5 | 3696 | 40 |
+| Clarity 7.2.0 | 3642 | 28–45–1 | 50.5 | 3775 | 45 |
+| Seer 2.8.0 | 3640 | 8–65–1 | 40.5 | 3673 | 38 |
+| Koivisto 9.0 | 3632 | 10–64–0 | 42 | 3679 | 43 |
+| rofChade 3.1 | 3628 | 11–60–3 | 41 | 3666 | 43.5 |
+| Bread 4.0.0 | 3626 | 22–52–0 | 48 | 3733 | 45.5 |
+
+## 6.4.0 at eight threads
+
+**3736 (95%: 3726–3746)** from 440 games, against 3697 for the 6.3 RC on the
+same openings: **+39 (95%: +24 to +54)**. Same 22 engines, anchors, clock
+(85.531s+0.713s) and machine as the 6.3 RC run below. Score: **55 wins,
+370 draws, 15 losses = 240/440 (54.5%)**, including four opponent faults. No
+zigqueen forfeits.
+
+| Opponent | Anchor | W–D–L | Points / 20 | 6.3 RC points / 20 |
+|---|---:|---:|---:|---:|
+| PlentyChess 6.0.2 | 3768 | 0–18–2 | 9 | 8 |
+| Integral 7.0.0 | 3746 | 0–20–0 | 10 | 9.5 |
+| Stormphrax 7.0.0 | 3742 | 1–19–0 | 10.5 | 9 |
+| Horsie 1.1.0 | 3735 | 0–16–4 | 8 | 8 |
+| Viridithas 17.0.0 | 3734 | 1–19–0 | 10.5 | 9 |
+| Lizard 11.2 | 3732 | 1–18–1 | 10 | 9.5 |
+| RubiChess 20240817 | 3728 | 1–18–1 | 10 | 9.5 |
+| Starzix 6.0 | 3728 | 1–19–0 | 10.5 | 9 |
+| Quanticade Orion 2.0 | 3715 | 4–13–3 | 10.5 | 11 |
+| Velvet 8.1.0 | 3702 | 2–17–1 | 10.5 | 9 |
+| Igel 3.6.0 | 3699 | 0–20–0 | 10 | 10.5 |
+| Uralochka 3.41a | 3697 | 4–15–1 | 11.5 | 9.5 |
+| Seer 2.8.0 | 3696 | 2–18–0 | 11 | 10 |
+| Renegade 1.2.0 | 3688 | 3–17–0 | 11.5 | 11 |
+| rofChade 3.1 | 3687 | 4–16–0 | 12 | 9.5 |
+| Arasan 25.1 | 3686 | 3–15–2 | 10.5 | 9 |
+| Clarity 7.2.0 | 3685 | 6–14–0 | 13 | 12 |
+| Koivisto 9.0 | 3682 | 2–18–0 | 11 | 10.5 |
+| Astra 5.1.1 | 3670 | 1–19–0 | 10.5 | 10 |
+| Peacekeeper 3.01 | 3670 | 5–15–0 | 12.5 | 10.5 |
+| Minic 3.40 | 3660 | 8–12–0 | 14 | 10 |
+| SlowChess Blitz 2.83 | 3644 | 6–14–0 | 13 | 11.5 |
 
 ## 6.3.0 at one thread: CCRL-calibrated gauntlet
 
@@ -266,6 +334,8 @@ every component reached H1 at two time controls.
 
 | Version | Self-assessment | Note |
 |---|---:|---|
+| 6.4.0 | 3701 | 2026-09-21 CCRL-calibrated field, 1,628 games, AVX2, 1 thread, new openings |
+| 6.4.0, 8 threads | 3736 | 8-CPU field, 440 games, same openings as the 6.3 RC |
 | 6.3.0 | 3676 | 2026-09-21 CCRL-calibrated field, 1,628 games, AVX2, 1 thread |
 | 6.3 RC | 3678 | same field and estimator, AVX-512 machine, comparison only |
 | 6.3 RC, 8 threads | 3697 | 8-CPU field, 440 games |
@@ -276,7 +346,7 @@ every component reached H1 at two time controls.
 | 6.0.0 | ~3602 | mean of implied ratings, Hash 64 |
 | 5.8.3 | ~3590 | mean of implied ratings, Hash 64 |
 
-The first three rows use the 2026-09-21 fields and the performance
+The first five rows use the 2026-09-21 fields and the performance
 estimator described above; the rows below them use the older roster and
 their own estimators. Do not subtract across that line.
 

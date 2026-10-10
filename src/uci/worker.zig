@@ -170,7 +170,7 @@ pub const Pool = struct {
         var next_engine = if (count == 1)
             try engine_mod.Engine.initWithBorrowedEvaluator(self.coordinator.engine.allocator, hash_mb, &self.network_owner)
         else
-            try engine_mod.Engine.initForParallel(self.coordinator.engine.allocator, hash_mb, &self.network_owner);
+            try engine_mod.Engine.initForParallel(self.coordinator.engine.allocator, hash_mb, count, &self.network_owner);
         errdefer next_engine.deinit();
         next_engine.contempt_cp = self.coordinator.engine.contempt_cp;
         next_engine.basin_config = self.coordinator.engine.basin_config;
@@ -371,7 +371,9 @@ pub const Pool = struct {
                 info.writeFinalLine(self.output, &result, reported_depth, elapsed_ms, hashfull) catch {};
             } else if (!self.coordinator.info_streamed) self.writeInfoLine(&result, reported_depth, elapsed_ms) catch {};
         } else {
-            self.output.print("info depth 0 score cp 0 nodes {d} time {d}\n", .{ result.nodes, elapsed_ms }) catch {};
+            // No legal move: checkmated (the engine reports -MATE) or stalemated.
+            const mated = result.score <= -@import("../search/score.zig").MATE_SCORE;
+            self.output.print("info depth 0 score {s} nodes {d} time {d}\n", .{ if (mated) "mate 0" else "cp 0", result.nodes, elapsed_ms }) catch {};
         }
 
         // Rule-50/repetition and winning root-TB returns can bypass the engine's
@@ -837,6 +839,52 @@ test "pool publishes independent job values and rejects exhausted identities" {
     try std.testing.expectEqual(before, pool.network_owner.net);
     try std.testing.expectEqual(std.math.maxInt(u64), pool.network_epoch);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.contents(), "bestmove "));
+}
+
+fn expectPrivateTableSizes(pool: *const Pool, hash_mb: u32, threads: u8) !void {
+    const expected = engine_mod.PrivateTableSizes.forThreads(hash_mb, threads);
+    try std.testing.expectEqual(threads, pool.threads());
+    try std.testing.expectEqual(hash_mb, pool.hashSizeMb());
+    try std.testing.expectEqual(expected.hint_mb, pool.coordinator.engine.rfp_hint.hintSizeMb());
+    try std.testing.expectEqual(expected.eval_mb, pool.coordinator.engine.eval_cache.cacheSizeMb());
+    if (pool.parallel) |parallel| {
+        try std.testing.expectEqual(@as(usize, threads - 1), parallel.helpers.len);
+        for (parallel.helpers) |*slot| {
+            try std.testing.expectEqual(expected.hint_mb, slot.engine.rfp_hint.hintSizeMb());
+            try std.testing.expectEqual(expected.eval_mb, slot.engine.eval_cache.cacheSizeMb());
+            try std.testing.expectEqual(@as(usize, 0), slot.engine.tt.entries.len);
+        }
+    } else {
+        try std.testing.expectEqual(@as(u8, 1), threads);
+        try std.testing.expectEqual(hash_mb, pool.coordinator.engine.hashSizeMb());
+    }
+}
+
+test "threads and hash changes resize every engine's private tables to the thread share" {
+    var fixture = try PoolFixture.init();
+    defer fixture.deinit();
+    var output = TestOutput{};
+    var pool = try Pool.initWithAllocator(std.testing.allocator, output.sink(), 32, .{ .eval_file_path = fixture.path });
+    defer pool.deinit();
+    try expectPrivateTableSizes(&pool, 32, 1);
+    // Serial sizes are the historical Hash/2 hint and Hash/4 eval cache.
+    try std.testing.expectEqual(@as(u32, 16), pool.coordinator.engine.rfp_hint.hintSizeMb());
+    try std.testing.expectEqual(@as(u32, 8), pool.coordinator.engine.eval_cache.cacheSizeMb());
+    try pool.setThreads(2);
+    try expectPrivateTableSizes(&pool, 32, 2);
+    try pool.resizeHash(64);
+    try expectPrivateTableSizes(&pool, 64, 2);
+    try pool.setThreads(4);
+    try expectPrivateTableSizes(&pool, 64, 4);
+    try std.testing.expectEqual(@as(u32, 8), pool.coordinator.engine.rfp_hint.hintSizeMb());
+    try pool.resizeHash(32);
+    try expectPrivateTableSizes(&pool, 32, 4);
+    try pool.setThreads(1);
+    try expectPrivateTableSizes(&pool, 32, 1);
+    try pool.resizeHash(64);
+    try expectPrivateTableSizes(&pool, 64, 1);
+    try std.testing.expectEqual(@as(u32, 32), pool.coordinator.engine.rfp_hint.hintSizeMb());
+    try std.testing.expectEqual(@as(u32, 16), pool.coordinator.engine.eval_cache.cacheSizeMb());
 }
 
 test "parallel reconfiguration is transactional at each allocation and detaches every net borrower" {

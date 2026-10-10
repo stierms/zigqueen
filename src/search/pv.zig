@@ -72,6 +72,7 @@ pub fn reconstructFromRootMoveLimited(
     max_len: usize,
 ) void {
     out.clear();
+    if (max_len == 0) return;
 
     const mv = root_move orelse return;
     if (!legal.isLegalMove(pos, mv)) return;

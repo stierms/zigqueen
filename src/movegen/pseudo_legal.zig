@@ -26,8 +26,9 @@ fn generateFor(comptime side: types.Color, pos: *const position.Position, list: 
 }
 
 /// Legality-FUSED generation (perf-r8). Valid only under the caller's proof
-/// that the side to move is NOT in check, NOTHING is pinned, there is no en
-/// passant square and no castling rights remain. In that regime the only
+/// that the side to move is NOT in check, NOTHING is pinned, no pawn of the
+/// side to move can capture en passant and the side to move has no castling
+/// right left (legal.canFuseLegality). In that regime the only
 /// pseudo-legal moves that can be illegal are king steps onto a square the
 /// opponent attacks, so masking the target sets deletes exactly the moves the
 /// legality filter used to delete — and the caller no longer has to re-read and
@@ -63,6 +64,99 @@ fn generateLegalNoPinsFor(
     generateSliderMoves(side, pos, .queen, attacks.queenAttacksOnTheFly, list, true, enemy_king);
     generateLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, true, enemy_king | king_unsafe);
     // No castling moves: the caller only takes this path with no rights left.
+}
+
+/// Candidate generation for a side IN CHECK (perf push 2026-10-08). `allow`
+/// holds the squares a non-king move must land on to possibly resolve the
+/// check: the single checker plus the squares between it and the king, or 0
+/// under double check (see legal.evasionTargets). A pseudo-legal non-king move
+/// that is not en passant and lands outside `allow` leaves the checker
+/// attacking the king, so the legality filter rejects it; masking the target
+/// sets deletes exactly such moves at the source. King moves and en passant
+/// are emitted unmasked, castling is never generated in check, and the caller
+/// still runs the full legality filter over what is emitted, so the filtered
+/// list (content AND order) is identical to generate-then-filter.
+pub fn generateEvasionCandidates(pos: *const position.Position, list: *move_mod.MoveList, allow: bitboard.Bitboard) void {
+    list.clear();
+    switch (pos.side_to_move) {
+        .white => generateEvasionCandidatesFor(.white, pos, list, allow),
+        .black => generateEvasionCandidatesFor(.black, pos, list, allow),
+    }
+}
+
+fn generateEvasionCandidatesFor(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    allow: bitboard.Bitboard,
+) void {
+    generatePawnEvasionCandidates(side, pos, list, allow);
+    // masked=true: targets & ~(own | ~allow) == targets & ~own & allow.
+    generateLeaperMoves(side, pos, .knight, attacks.knightAttacksFrom, list, true, ~allow);
+    generateSliderMoves(side, pos, .bishop, attacks.bishopAttacksOnTheFly, list, true, ~allow);
+    generateSliderMoves(side, pos, .rook, attacks.rookAttacksOnTheFly, list, true, ~allow);
+    generateSliderMoves(side, pos, .queen, attacks.queenAttacksOnTheFly, list, true, ~allow);
+    generateLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, false, 0);
+    // No castling: generateCastlingMoves emits nothing while in check.
+}
+
+/// `generatePawnMoves` (unmasked form) with every push, double push,
+/// promotion and capture target intersected with `allow`; en passant is kept
+/// unmasked (its captured pawn is not on `to`). Same per-pawn emission order.
+fn generatePawnEvasionCandidates(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    allow: bitboard.Bitboard,
+) void {
+    var pawns = pos.pieceBitboard(side, .pawn);
+    const opponent_occ = pos.occupancyFor(side.other());
+    const forward_delta: i8 = if (side == .white) 1 else -1;
+    const start_rank: u3 = if (side == .white) 1 else 6;
+    const promotion_from_rank: u3 = if (side == .white) 6 else 1;
+
+    while (bitboard.popLsb(&pawns)) |from| {
+        const file = from.file();
+        const rank = from.rank();
+
+        const one_step_rank_i: i8 = @as(i8, @intCast(rank)) + forward_delta;
+        if (one_step_rank_i >= 0 and one_step_rank_i < 8) {
+            const one_step = square.Square.fromCoords(file, @intCast(one_step_rank_i));
+            if (!pos.isSquareOccupied(one_step)) {
+                const one_step_allowed = (allow & bitboard.bit(one_step)) != 0;
+                if (rank == promotion_from_rank) {
+                    if (one_step_allowed) addPromotions(list, from, one_step, false);
+                } else {
+                    if (one_step_allowed) list.add(move_mod.Move.init(from, one_step, .quiet));
+                    if (rank == start_rank) {
+                        const two_step_rank_i = one_step_rank_i + forward_delta;
+                        if (two_step_rank_i >= 0 and two_step_rank_i < 8) {
+                            const two_step = square.Square.fromCoords(file, @intCast(two_step_rank_i));
+                            if (!pos.isSquareOccupied(two_step) and (allow & bitboard.bit(two_step)) != 0) {
+                                list.add(move_mod.Move.init(from, two_step, .double_push));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ & allow;
+        while (bitboard.popLsb(&capture_targets)) |to| {
+            if (rank == promotion_from_rank) {
+                addPromotions(list, from, to, true);
+            } else {
+                list.add(move_mod.Move.init(from, to, .capture));
+            }
+        }
+
+        if (pos.en_passant) |ep_square| {
+            const ep_mask = bitboard.bit(ep_square);
+            if ((attacks.pawnAttacksFrom(side, from) & ep_mask) != 0) {
+                list.add(move_mod.Move.init(from, ep_square, .en_passant));
+            }
+        }
+    }
 }
 
 pub fn generateTactical(pos: *const position.Position, list: *move_mod.MoveList) void {
@@ -130,8 +224,9 @@ fn generatePawnMoves(
             }
         }
 
-        // The fused caller guarantees `pos.en_passant == null`, so this whole
-        // block is statically dead on that path.
+        // The fused caller guarantees that no pawn of the side to move attacks
+        // `pos.en_passant` (legal.canFuseLegality), so on that path this block
+        // emits nothing.
         if (!masked) {
             if (pos.en_passant) |ep_square| {
                 const ep_mask = bitboard.bit(ep_square);
@@ -177,8 +272,9 @@ fn generateTacticalPawnMoves(
             }
         }
 
-        // The fused caller guarantees `pos.en_passant == null`, so this whole
-        // block is statically dead on that path.
+        // The fused caller guarantees that no pawn of the side to move attacks
+        // `pos.en_passant` (legal.canFuseLegality), so on that path this block
+        // emits nothing.
         if (!masked) {
             if (pos.en_passant) |ep_square| {
                 const ep_mask = bitboard.bit(ep_square);

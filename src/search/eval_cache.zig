@@ -32,7 +32,8 @@
 //!     8MB table 90-97% full and thrashing against a ~1.1M-entry working
 //!     set; 8->16MB 2-way is +7.7pp hit-after-TT-miss at d18). No UCI option
 //!     of its own; ucinewgame clears it (via Engine.reset), Hash resize
-//!     re-sizes it.
+//!     re-sizes it. At Threads = N every engine keeps a private copy of 1/N
+//!     of that size (floor 4 MB; engine.zig PrivateTableSizes).
 //!   - Allocation routed through util/hugealloc like the TT/rfp-hint tables
 //!     (zobrist-indexed random access over MBs -> same dTLB story).
 //!
@@ -183,6 +184,17 @@ pub const EvalCache = struct {
         const entry = &self.entries[self.index(key)];
         if (entry.key == key and key != 0) return entry.eval;
         return null;
+    }
+
+    /// Overlap a child's eval-cache miss with its TT probe: the parent issues
+    /// this right after makeMove, beside the TT prefetch. The child probes this
+    /// line whenever its TT entry carries no static eval, and the 16 MB+ table
+    /// misses the caches on most probes (the probe compare was 6% of negamax and
+    /// 11-17% of quiescence cycles). A hint only: no value changes.
+    pub inline fn prefetch(self: *const EvalCache, key: u64) void {
+        if (self.entries.len == 0) return;
+        const slot = if (self.isTwoWay()) self.setBase(key) else self.index(key);
+        @prefetch(&self.entries[slot], .{ .rw = .read, .locality = 3, .cache = .data });
     }
 
     /// Memoize a freshly computed raw eval. Direct: always replaces. 2-way:

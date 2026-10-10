@@ -80,16 +80,20 @@ pub const HintTable = struct {
         required_depth: i16,
     ) ?i32 {
         if (self.entries.len == 0) return null;
-        // Reference the cluster (don't copy the whole 32-byte struct to the stack);
-        // iterate entries by pointer.
+        // Reference the cluster (don't copy the whole 32-byte struct to the stack).
+        // Both entries' tests are evaluated without short-circuit branches: the
+        // per-entry `depth < 0` / key / depth tests depend on table contents and
+        // mispredicted at 14-27% each (8% of all mispredicted branches, IBS on
+        // Zen 3). Same answer as the first entry, in order, that is filled,
+        // carries `key` and is deep enough.
+        comptime std.debug.assert(CLUSTER_SIZE == 2);
         const cluster = &self.entries[index(self.mask, key)];
-        for (&cluster.entries) |*entry| {
-            if (entry.depth < 0) continue;
-            if (entry.key != key) continue;
-            if (entry.depth < required_depth) continue;
-            return entry.score;
-        }
-        return null;
+        const e0 = &cluster.entries[0];
+        const e1 = &cluster.entries[1];
+        const hit0 = @intFromBool(e0.depth >= 0) & @intFromBool(e0.key == key) & @intFromBool(e0.depth >= required_depth);
+        const hit1 = @intFromBool(e1.depth >= 0) & @intFromBool(e1.key == key) & @intFromBool(e1.depth >= required_depth);
+        if (hit0 | hit1 == 0) return null;
+        return if (hit0 != 0) e0.score else e1.score;
     }
 
     pub inline fn store(self: *HintTable, key: u64, depth: i16, score: i32) void {

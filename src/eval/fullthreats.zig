@@ -150,6 +150,31 @@ pub inline fn fullIndex(ak: usize, f_o: usize, t_o: usize, victim_own: bool, vra
     return T.ak_offset[ak] + (T.pair_base[ak][f_o] + pairpos) * (2 * nv) + v;
 }
 
+/// One perspective's index frame for one attacker group (attacker key `ak` on
+/// oriented square `f_o`), hoisted out of the per-target loops: fullIndex is
+/// `base + rel(...)` with the same table reads done once per group.
+const GroupIdx = struct {
+    att: u64,
+    base: usize,
+    nv: usize,
+
+    inline fn of(ak: usize, f_o: usize) GroupIdx {
+        const nv = NV[ak % 5];
+        return .{
+            .att = T.empty_att[ak][f_o],
+            .base = T.ak_offset[ak] + @as(usize, T.pair_base[ak][f_o]) * 2 * nv,
+            .nv = nv,
+        };
+    }
+
+    /// fullIndex(ak, f_o, t_o, victim_own, vrank) - base.
+    inline fn rel(g: GroupIdx, t_o: usize, victim_own: bool, vrank: usize) usize {
+        std.debug.assert((g.att >> @as(u6, @intCast(t_o))) & 1 == 1);
+        const pairpos: usize = @popCount(g.att & ((@as(u64, 1) << @as(u6, @intCast(t_o))) - 1));
+        return pairpos * (2 * g.nv) + (if (victim_own) 0 else g.nv) + vrank;
+    }
+};
+
 /// One perspective's active full-threat features as a 60,144-bit set.
 pub const PerspBits = [WORDS]u64;
 
@@ -215,28 +240,18 @@ pub fn enumerateColors(pos: *const position.Position, out_white: *PerspBits, out
 }
 
 // ---------------------------------------------------------------------------
-// Incremental delta engine (docs/V6_INCREMENTAL_DESIGN.md r1, OWN design).
-//
-// Groups = attacker squares: group(sq, colored-type) is the contiguous index
-// range of that piece's outgoing features for one perspective. After a move,
-// recompute the CURRENT truth of every affected group and XOR it against the
-// stored bitset — the XOR is the delta (never reconstruct old state). The
-// caller guarantees both perspectives' mirror flips are UNCHANGED across the
-// move (flip changes take the full-refresh path by design).
+// Per-move delta (docs/V6_INCREMENTAL_DESIGN.md r1 groups; direct form, lane 2
+// #4). Groups = attacker squares: group(sq, colored-type) is the contiguous
+// index range of that piece's outgoing features for one perspective.
 // ---------------------------------------------------------------------------
 
 /// One changed square of a move (from/to/capture/castle-rook), old and new
 /// occupants (piece.Piece.none for empty).
 pub const SquareChange = struct { sq: u6, old: piece.Piece, new: piece.Piece };
 
-/// Undo log of toggled feature bits. Bit 31 of an entry = black perspective.
-pub const Delta = struct {
-    pub const MAX_TOGGLES = 256;
-    idx: [MAX_TOGGLES]u32 = undefined,
-    n: u32 = 0,
-    /// Affected groups recomputed (instrument; cost driver alongside n).
-    groups: u32 = 0,
-};
+/// Bytes of each emitted threat row prefetched at emission (4 cache lines);
+/// the flush walk (nnue768 PendingThreatRowsT(i8)) prefetches from here on.
+pub const ROW_PREFETCH_BYTES: usize = 256;
 
 pub inline fn kingFlips(pos: *const position.Position) struct { w: u6, b: u6 } {
     return .{
@@ -245,272 +260,178 @@ pub inline fn kingFlips(pos: *const position.Position) struct { w: u6, b: u6 } {
     };
 }
 
-inline fn toggleLogged(bits: *PerspBits, idx: usize, persp_bit: u32, delta: *Delta) bool {
-    if (delta.n >= Delta.MAX_TOGGLES) return false;
-    bits[idx >> 6] ^= @as(u64, 1) << @as(u6, @intCast(idx & 63));
-    delta.idx[delta.n] = @as(u32, @intCast(idx)) | persp_bit;
-    delta.n += 1;
-    return true;
+// ---------------------------------------------------------------------------
+// Direct delta (lane 2 #4, artifacts/research/perf-lane2-20261007/
+// SPEC-direct-threat-delta.md): a move's changed features (old truth XOR new
+// truth), each with its direction, generated from the post-move board and the
+// change list alone — no stored feature bitsets, no undo log. It replaces the
+// former bitset-XOR delta engine (applyMoveDelta). For changed squares C:
+//   (R) every feature of each changed square's OLD occupant group, read off the
+//       OLD board (occupancy occ_old, old victims), is REMOVED;
+//   (A) every feature of each changed square's NEW occupant group is ADDED;
+//   (T) attackers on unchanged squares take the targeted update (the same
+//       target rule and proof as updateAttackerGroupBoth), old_on -> REMOVE,
+//       new_on -> ADD.
+// A feature belongs to exactly one group (its attacker's square and coloured
+// type); (R)/(A) groups sit on changed squares, (T) groups on unchanged ones,
+// and an old and a new occupant of one square never share a key. An (R) group
+// has no feature after the move (its piece left the square) and an (A) group
+// had none before it, so (R) emits exactly that group's old-truth \ new-truth
+// and (A) its new-truth \ old-truth; (T) emits exactly the XOR of its group.
+// Row adds/subs wrap and PSQT sums are integers, so emission order is free.
+// `sink.emit(comptime black: bool, comptime add: bool, idx: usize)` receives
+// every (perspective, direction, feature index).
+// ---------------------------------------------------------------------------
+
+/// Old occupant of square `t` (post-move occupant unless `t` changed).
+inline fn oldOccupant(pos: *const position.Position, changes: []const SquareChange, changed_mask: u64, t: usize) piece.Piece {
+    var p = pos.mailbox[t];
+    if (changed_mask & (@as(u64, 1) << @intCast(t)) != 0) {
+        for (changes) |c| {
+            if (c.sq == t) p = c.old;
+        }
+    }
+    return p;
 }
 
-/// Extract one range-local word from [base, base+len). The caller scans only
-/// ceil(len/64) live words and masks the final one. This is the same shift and
-/// neighbor merge as the old fixed five-word temporary, but consumes the value
-/// directly: word/bit traversal (and therefore delta-log order) is identical.
-/// Max group: queen 27 targets x 10 victim classes = 270 bits -> 5 words.
-const MAX_GROUP_WORDS = 5;
-inline fn extractRangeWord(bits: *const PerspBits, base: usize, range_word: usize) u64 {
-    const g = base + range_word * 64;
-    const w = g >> 6;
-    const off: u6 = @intCast(g & 63);
-    var value = bits[w] >> off;
-    if (off != 0 and w + 1 < WORDS)
-        value |= bits[w + 1] << @intCast(64 - @as(u7, off));
-    return value;
-}
-
-/// Recompute one (square, colored-type) group for BOTH perspectives in one pass
-/// and XOR each against its stored bits. The physical work (attack set, target
-/// occupants, victim-class filter) is perspective-independent — computing it
-/// once and mapping each kept target into both index spaces halves the group
-/// recompute's attack lookups and target-loop overhead vs two per-perspective
-/// passes. Toggle order stays "all white toggles, then all black toggles" per
-/// group — the exact log order of the former sequential calls. Returns false
-/// on undo-log overflow.
-fn recomputeGroupBoth(
+/// Emit every feature of the group (sq, color, atype) on one board as `add`.
+/// `occ_use`/`kept` describe that board; `old_board` selects old victims.
+inline fn emitWholeGroup(
+    comptime add: bool,
+    comptime old_board: bool,
     pos: *const position.Position,
+    changes: []const SquareChange,
+    changed_mask: u64,
     sq_idx: u6,
     color: types.Color,
     atype: usize,
+    occ_use: u64,
+    kept: u64,
     wflip: u6,
     bflip: u6,
-    wbits: *PerspBits,
-    bbits: *PerspBits,
-    delta: *Delta,
-) bool {
+    sink: anytype,
+) void {
     const f_ow: usize = @as(usize, sq_idx ^ wflip);
     const f_ob: usize = @as(usize, (sq_idx ^ 56) ^ bflip);
-    const ak_w: usize = (if (color == .white) @as(usize, 0) else 5) + atype;
-    const ak_b: usize = (if (color == .black) @as(usize, 0) else 5) + atype;
-    const npairs_w: usize = @popCount(T.empty_att[ak_w][f_ow]);
-    const npairs_b: usize = @popCount(T.empty_att[ak_b][f_ob]);
-    // Pawn table edge rows (no real piece ever sits there): the oriented rows
-    // mirror rank-wise, so the two perspectives zero out together.
-    if (npairs_w == 0 and npairs_b == 0) return true;
-    const nv = NV[atype];
-    const base_w: usize = T.ak_offset[ak_w] + @as(usize, T.pair_base[ak_w][f_ow]) * 2 * nv;
-    const base_b: usize = T.ak_offset[ak_b] + @as(usize, T.pair_base[ak_b][f_ob]) * 2 * nv;
-
-    // Current truth of the group, both perspectives, from ONE attack-set walk.
-    var truth_w = [_]u64{0} ** MAX_GROUP_WORDS;
-    var truth_b = [_]u64{0} ** MAX_GROUP_WORDS;
-    const occupant = pos.mailbox[sq_idx];
-    if (occupant != .none and occupant.color().? == color and
-        @intFromEnum(occupant.pieceType()) == atype)
-    {
-        const from = square.Square.fromIndex(sq_idx);
-        const pt: piece.PieceType = @enumFromInt(atype);
-        var tb = attackSet(pt, color, from, pos.occupied) & pos.occupied;
-        while (bitboard.popLsb(&tb)) |to| {
-            const to_idx: usize = to.index();
-            const tp = pos.mailbox[to_idx];
-            const vtype_full: usize = @intFromEnum(tp.pieceType());
-            if (vtype_full == 5) continue;
-            const vr = VRANK[atype][vtype_full];
-            if (vr < 0) continue;
-            const vrank: usize = @intCast(vr);
-            const tcolor = tp.color().?;
-            {
-                const t_o = to_idx ^ wflip;
-                const rel = fullIndex(ak_w, f_ow, t_o, tcolor == .white, vrank) - base_w;
-                truth_w[rel >> 6] |= @as(u64, 1) << @as(u6, @intCast(rel & 63));
-            }
-            {
-                const t_o = (to_idx ^ 56) ^ bflip;
-                const rel = fullIndex(ak_b, f_ob, t_o, tcolor == .black, vrank) - base_b;
-                truth_b[rel >> 6] |= @as(u64, 1) << @as(u6, @intCast(rel & 63));
-            }
-        }
+    const gw = GroupIdx.of((if (color == .white) @as(usize, 0) else 5) + atype, f_ow);
+    const gb = GroupIdx.of((if (color == .black) @as(usize, 0) else 5) + atype, f_ob);
+    const pt: piece.PieceType = @enumFromInt(atype);
+    var tb = attackSet(pt, color, square.Square.fromIndex(sq_idx), occ_use) & kept;
+    while (bitboard.popLsb(&tb)) |to| {
+        const t: usize = to.index();
+        const p = if (old_board) oldOccupant(pos, changes, changed_mask, t) else pos.mailbox[t];
+        const vrank: usize = @intCast(VRANK[atype][@intFromEnum(p.pieceType())]);
+        const t_black = p.color().? == .black;
+        sink.emit(false, add, gw.base + gw.rel(t ^ wflip, !t_black, vrank));
+        sink.emit(true, add, gb.base + gb.rel((t ^ 56) ^ bflip, t_black, vrank));
     }
-
-    if (npairs_w != 0) {
-        const len = npairs_w * 2 * nv;
-        const word_count = (len + 63) >> 6;
-        const tail: u6 = @intCast(len & 63);
-        for (0..word_count) |w| {
-            var stored = extractRangeWord(wbits, base_w, w);
-            if (w + 1 == word_count and tail != 0)
-                stored &= (@as(u64, 1) << tail) - 1;
-            var x = truth_w[w] ^ stored;
-            while (x != 0) : (x &= x - 1) {
-                const rel = (w << 6) + @ctz(x);
-                if (!toggleLogged(wbits, base_w + rel, 0, delta)) return false;
-            }
-        }
-    }
-    if (npairs_b != 0) {
-        const len = npairs_b * 2 * nv;
-        const word_count = (len + 63) >> 6;
-        const tail: u6 = @intCast(len & 63);
-        for (0..word_count) |w| {
-            var stored = extractRangeWord(bbits, base_b, w);
-            if (w + 1 == word_count and tail != 0)
-                stored &= (@as(u64, 1) << tail) - 1;
-            var x = truth_b[w] ^ stored;
-            while (x != 0) : (x &= x - 1) {
-                const rel = (w << 6) + @ctz(x);
-                if (!toggleLogged(bbits, base_b + rel, 0x8000_0000, delta)) return false;
-            }
-        }
-    }
-    return true;
 }
 
-/// Toggle one (attacker group, target) feature in both perspectives, if the
-/// victim `p` on target square `t_idx` is a kept victim class for `atype`.
-inline fn toggleTargetBoth(
-    atype: usize,
-    ak_w: usize,
-    f_ow: usize,
-    ak_b: usize,
-    f_ob: usize,
-    wflip: u6,
-    bflip: u6,
-    t_idx: usize,
-    p: piece.Piece,
-    wbits: *PerspBits,
-    bbits: *PerspBits,
-    delta: *Delta,
-) bool {
+/// One (attacker group, target, victim) feature in both perspectives as `add`,
+/// if the victim is a kept class for `atype`.
+inline fn emitTargetBoth(comptime add: bool, atype: usize, gw: GroupIdx, gb: GroupIdx, wflip: u6, bflip: u6, t: usize, p: piece.Piece, sink: anytype) void {
     const vtype_full: usize = @intFromEnum(p.pieceType());
-    if (vtype_full == 5) return true; // king victims excluded
+    if (vtype_full == 5) return; // king victims excluded
     const vr = VRANK[atype][vtype_full];
-    if (vr < 0) return true; // subset-redundant combo
+    if (vr < 0) return; // subset-redundant combo
     const vrank: usize = @intCast(vr);
-    const tcolor = p.color().?;
-    const wi = fullIndex(ak_w, f_ow, t_idx ^ wflip, tcolor == .white, vrank);
-    if (!toggleLogged(wbits, wi, 0, delta)) return false;
-    const bi = fullIndex(ak_b, f_ob, (t_idx ^ 56) ^ bflip, tcolor == .black, vrank);
-    return toggleLogged(bbits, bi, 0x8000_0000, delta);
+    const t_black = p.color().? == .black;
+    sink.emit(false, add, gw.base + gw.rel(t ^ wflip, !t_black, vrank));
+    sink.emit(true, add, gb.base + gb.rel((t ^ 56) ^ bflip, t_black, vrank));
 }
 
-/// Targeted twin of recomputeGroupBoth for an ATTACKER group (hotspot-profile-
-/// 20260924): a piece on an UNCHANGED square, collected by rule 2 below (a
-/// rule-2 piece standing on a changed square is that square's new occupant,
-/// already collected by rule 1 and deduplicated). Its features can differ only
-/// on targets whose victim changed (changed squares it attacks under the old
-/// or new occupancy) or whose attack membership changed (A_old ^ A_new; empty
-/// for pawns and knights). Every other target keeps membership, occupancy and
-/// victim, hence its feature bit. The toggles below are therefore exactly the
-/// XOR of old and new truth that the full recompute finds against the stored
-/// (= old truth) bits — the same SET of toggled features. Only the undo-log
-/// ORDER differs, which no consumer observes: threat-row adds wrap-commute,
-/// PSQT sums commute, undo is XOR, and the 256-toggle overflow test sees the
-/// same total (overflow still falls back to the full re-enumeration barrier).
-fn updateAttackerGroupBoth(
+/// (T): updateAttackerGroupBoth's target rule with directed emission.
+inline fn emitAttackerGroup(
     pos: *const position.Position,
-    sq_idx: u6,
-    color: types.Color,
-    atype: usize,
-    wflip: u6,
-    bflip: u6,
     changes: []const SquareChange,
     changed_mask: u64,
     occ_old: u64,
-    wbits: *PerspBits,
-    bbits: *PerspBits,
-    delta: *Delta,
-) bool {
+    sq_idx: u6,
+    color: types.Color,
+    atype: usize,
+    wflip: u6,
+    bflip: u6,
+    sink: anytype,
+) void {
     const pt: piece.PieceType = @enumFromInt(atype);
     const from = square.Square.fromIndex(sq_idx);
     const a_new = attackSet(pt, color, from, pos.occupied);
     // Pawn and knight attack sets do not depend on occupancy.
     const a_old = if (atype <= 1) a_new else attackSet(pt, color, from, occ_old);
     var targets = ((a_old ^ a_new) | changed_mask) & (a_old | a_new);
-    if (targets == 0) return true;
-    const f_ow: usize = @as(usize, sq_idx ^ wflip);
-    const f_ob: usize = @as(usize, (sq_idx ^ 56) ^ bflip);
-    const ak_w: usize = (if (color == .white) @as(usize, 0) else 5) + atype;
-    const ak_b: usize = (if (color == .black) @as(usize, 0) else 5) + atype;
-    while (bitboard.popLsb(&targets)) |t| {
-        const t_idx: usize = t.index();
-        const bit = @as(u64, 1) << @intCast(t_idx);
-        const new_piece = pos.mailbox[t_idx];
-        var old_piece = new_piece;
-        if (changed_mask & bit != 0) {
-            for (changes) |c| {
-                if (c.sq == t_idx) old_piece = c.old;
-            }
-        }
+    if (targets == 0) return;
+    const gw = GroupIdx.of((if (color == .white) @as(usize, 0) else 5) + atype, @as(usize, sq_idx ^ wflip));
+    const gb = GroupIdx.of((if (color == .black) @as(usize, 0) else 5) + atype, @as(usize, (sq_idx ^ 56) ^ bflip));
+    while (bitboard.popLsb(&targets)) |to| {
+        const t: usize = to.index();
+        const bit = @as(u64, 1) << @intCast(t);
+        const new_piece = pos.mailbox[t];
+        const old_piece = if (changed_mask & bit != 0) oldOccupant(pos, changes, changed_mask, t) else new_piece;
         const old_on = (a_old & bit) != 0 and old_piece != .none;
         const new_on = (a_new & bit) != 0 and new_piece != .none;
         if (old_on and new_on and old_piece == new_piece) continue;
-        if (old_on and !toggleTargetBoth(atype, ak_w, f_ow, ak_b, f_ob, wflip, bflip, t_idx, old_piece, wbits, bbits, delta)) return false;
-        if (new_on and !toggleTargetBoth(atype, ak_w, f_ow, ak_b, f_ob, wflip, bflip, t_idx, new_piece, wbits, bbits, delta)) return false;
+        if (old_on) emitTargetBoth(false, atype, gw, gb, wflip, bflip, t, old_piece, sink);
+        if (new_on) emitTargetBoth(true, atype, gw, gb, wflip, bflip, t, new_piece, sink);
     }
-    return true;
 }
 
-/// Apply a move's threat-feature delta to both perspectives' bitsets.
-/// `changes` = the move's changed squares (<=4, incl. EP capture square and
-/// castle rook squares). Returns false on undo-log overflow — the caller must
-/// then discard `delta` and fall back to full re-enumeration.
-pub fn applyMoveDelta(
-    pos: *const position.Position,
-    changes: []const SquareChange,
-    wbits: *PerspBits,
-    bbits: *PerspBits,
-    delta: *Delta,
-) align(64) bool { // align(64): pins hot entry placement (layout stability, not call speed)
+/// Emit a move's threat-feature delta (both perspectives, with directions) to
+/// `sink`. `pos` is the POST-move board, `changes` the move's changed squares
+/// (<= 4); both perspectives' mirror flips must be unchanged across the move
+/// (a flip-changed perspective's emissions are meaningless and must be ignored
+/// by the sink).
+pub fn emitMoveDelta(pos: *const position.Position, changes: []const SquareChange, sink: anytype) void {
     const occ = pos.occupied;
-
-    // Deduped affected-group collection: seen[color*5+pt] bitboards.
-    var seen = [_]u64{0} ** 10;
-    var entry_sq: [96]u6 = undefined;
-    var entry_key: [96]u8 = undefined; // color*5 + pt
-    var n_entries: usize = 0;
-
-    const addEntry = struct {
-        fn add(seen_: *[10]u64, sqs: *[96]u6, keys: *[96]u8, n: *usize, s: u6, key: u8) void {
-            const m = @as(u64, 1) << s;
-            if (seen_[key] & m != 0) return;
-            seen_[key] |= m;
-            if (n.* < 96) {
-                sqs[n.*] = s;
-                keys[n.*] = key;
-                n.* += 1;
-            }
-        }
-    }.add;
-
-    // 1. Changed squares: old and new occupants' groups (kings have none).
+    const flips = kingFlips(pos);
+    var changed_mask: u64 = 0;
+    var occ_old: u64 = occ;
+    // Old-board piece-type unions (both colours): new unions with the changed
+    // squares' new occupants removed and their old occupants restored.
+    var u = [5]u64{
+        pos.pieces[0][0] | pos.pieces[1][0],
+        pos.pieces[0][1] | pos.pieces[1][1],
+        pos.pieces[0][2] | pos.pieces[1][2],
+        pos.pieces[0][3] | pos.pieces[1][3],
+        pos.pieces[0][4] | pos.pieces[1][4],
+    };
+    const kept_new = keptVictimMasksFrom(u);
     for (changes) |c| {
-        inline for ([_]piece.Piece{ c.old, c.new }) |p| {
-            if (p != .none) {
-                const pt: usize = @intFromEnum(p.pieceType());
-                if (pt < 5) {
-                    const key: u8 = @intCast(@as(usize, @intFromEnum(p.color().?)) * 5 + pt);
-                    addEntry(&seen, &entry_sq, &entry_key, &n_entries, c.sq, key);
-                }
-            }
+        const bit = @as(u64, 1) << c.sq;
+        changed_mask |= bit;
+        if (c.old != .none) occ_old |= bit else occ_old &= ~bit;
+        if (c.new != .none) {
+            const t: usize = @intFromEnum(c.new.pieceType());
+            if (t < 5) u[t] &= ~bit;
+        }
+    }
+    for (changes) |c| {
+        if (c.old != .none) {
+            const t: usize = @intFromEnum(c.old.pieceType());
+            if (t < 5) u[t] |= @as(u64, 1) << c.sq;
+        }
+    }
+    const kept_old = keptVictimMasksFrom(u);
+
+    // (R) and (A): the changed squares' old and new occupant groups.
+    for (changes) |c| {
+        if (c.old != .none) {
+            const at: usize = @intFromEnum(c.old.pieceType());
+            if (at < 5) emitWholeGroup(false, true, pos, changes, changed_mask, c.sq, c.old.color().?, at, occ_old, kept_old[at], flips.w, flips.b, sink);
+        }
+        if (c.new != .none) {
+            const at: usize = @intFromEnum(c.new.pieceType());
+            if (at < 5) emitWholeGroup(true, false, pos, changes, changed_mask, c.sq, c.new.color().?, at, occ, kept_new[at], flips.w, flips.b, sink);
         }
     }
 
-    // Groups from rule 1 (changed squares' old/new occupants) take the full
-    // recompute; every later entry is an attacker on an unchanged square.
-    const n_own = n_entries;
-
-    // 2. Attackers of every changed square under NEW occupancy. This single
-    //    reverse-lookup rule covers BOTH cost centres (perf-r4, proof below):
-    //      (a) victim changed: an attacker of a changed square must re-emit its
-    //          feature to that square (pawn/knight attack sets are occupancy-
-    //          independent; sliders are read back off the from-square rays);
-    //      (b) attack set changed: a slider whose ray geometry moved is ALWAYS
-    //          a new-occupancy attacker of some changed square, so the former
-    //          "walk every slider, compare bishop/rook/queenAttacks(occ) vs
-    //          (old_occ)" rule (2 magic lookups per slider on the board, every
-    //          materialized move) is redundant and has been removed.
-    //
+    // (T): attackers of every changed square under NEW occupancy on UNCHANGED
+    // squares (a candidate on a changed square is its new occupant, done above),
+    // collected per coloured type as bitboards (the union dedupes). This single
+    // reverse-lookup rule covers both reasons an unchanged attacker's features
+    // can change: (a) a victim changed (pawn/knight attack sets are occupancy-
+    // independent; sliders are read back off the changed square's rays), and
+    // (b) a slider's attack set changed, which always makes it a new-occupancy
+    // attacker of some changed square:
     //    Proof of (b). Take a slider S whose attack set differs between old_occ
     //    and occ along some direction d, and let s_1, s_2, ... be d's ray from
     //    S. Some square on the ray changed (otherwise the first blocker, and
@@ -520,81 +441,40 @@ pub fn applyMoveDelta(
     //    before s_k in both, making d's attack set identical — contradiction.
     //    So s_1..s_{k-1} are empty under `occ`, i.e. S attacks s_k under `occ`
     //    (a magic attack set contains every empty square up to and including
-    //    the first blocker). s_k is a changed square, so rule 2 adds S. ∎
-    //    The same argument covers the old-occupancy victims rule 3 used to
-    //    delegate to rule 2: if S attacked changed square c under old_occ but
+    //    the first blocker). s_k is a changed square, so (T) collects S. ∎
+    //    The same argument covers old-occupancy victims: if S attacked changed square c under old_occ but
     //    not under occ, a square between S and c became occupied; that square
     //    is changed and lies before c, so the first changed square s_k on the
     //    ray satisfies k <= index(c), and every s_j (j < k) was empty under
     //    old_occ (S reached c) and is unchanged, hence empty under occ too —
-    //    so S attacks s_k under `occ` and is added. ∎
-    //
-    //    Removing rule 2 leaves the recomputed-group SET identical (only the
-    //    collection ORDER changes), and group recomputes are order-independent
-    //    (XOR against stored truth), so the maintained bitsets — and every
-    //    accumulator/PSQT sum derived from them — are bit-identical.
+    //    so S attacks s_k under `occ` and is collected. ∎
+    var cand = [_]u64{0} ** 10;
     for (changes) |c| {
         const t = square.Square.fromIndex(c.sq);
-        // Colour-independent: hoisted out of the two-colour body (one magic
-        // lookup pair per changed square, not one per changed square per colour).
         const diag = attacks.bishopAttacksDirect(t, occ);
         const ortho = attacks.rookAttacksDirect(t, occ);
         const knight_att = attacks.knightAttacksDirect(t);
         inline for ([_]types.Color{ .white, .black }) |ac| {
-            const ac_idx = @intFromEnum(ac);
+            const ci: usize = @intFromEnum(ac);
             const enemy: types.Color = if (ac == .white) .black else .white;
-            var pawns = attacks.pawnAttacksFrom(enemy, t) & pos.pieces[ac_idx][0];
-            while (bitboard.popLsb(&pawns)) |s|
-                addEntry(&seen, &entry_sq, &entry_key, &n_entries, s.index(), @intCast(@as(usize, ac_idx) * 5 + 0));
-            var knights = knight_att & pos.pieces[ac_idx][1];
-            while (bitboard.popLsb(&knights)) |s|
-                addEntry(&seen, &entry_sq, &entry_key, &n_entries, s.index(), @intCast(@as(usize, ac_idx) * 5 + 1));
-            var bishops = diag & pos.pieces[ac_idx][2];
-            while (bitboard.popLsb(&bishops)) |s|
-                addEntry(&seen, &entry_sq, &entry_key, &n_entries, s.index(), @intCast(@as(usize, ac_idx) * 5 + 2));
-            var rooks = ortho & pos.pieces[ac_idx][3];
-            while (bitboard.popLsb(&rooks)) |s|
-                addEntry(&seen, &entry_sq, &entry_key, &n_entries, s.index(), @intCast(@as(usize, ac_idx) * 5 + 3));
-            var queens = (diag | ortho) & pos.pieces[ac_idx][4];
-            while (bitboard.popLsb(&queens)) |s|
-                addEntry(&seen, &entry_sq, &entry_key, &n_entries, s.index(), @intCast(@as(usize, ac_idx) * 5 + 4));
+            cand[ci * 5 + 0] |= attacks.pawnAttacksFrom(enemy, t) & pos.pieces[ci][0];
+            cand[ci * 5 + 1] |= knight_att & pos.pieces[ci][1];
+            cand[ci * 5 + 2] |= diag & pos.pieces[ci][2];
+            cand[ci * 5 + 3] |= ortho & pos.pieces[ci][3];
+            cand[ci * 5 + 4] |= (diag | ortho) & pos.pieces[ci][4];
         }
     }
-
-    // Recompute every affected group, both perspectives in one fused pass each;
-    // attacker groups take the targeted update over their changed targets only.
-    delta.groups = @intCast(n_entries);
-    const flips = kingFlips(pos);
-    var changed_mask: u64 = 0;
-    var occ_old: u64 = occ;
-    for (changes) |c| {
-        const bit = @as(u64, 1) << c.sq;
-        changed_mask |= bit;
-        if (c.old != .none) occ_old |= bit else occ_old &= ~bit;
-    }
-    for (0..n_entries) |i| {
-        const key = entry_key[i];
+    inline for (0..10) |key| {
         const color: types.Color = if (key < 5) .white else .black;
-        const atype: usize = key % 5;
-        if (i < n_own) {
-            if (!recomputeGroupBoth(pos, entry_sq[i], color, atype, flips.w, flips.b, wbits, bbits, delta)) return false;
-        } else {
-            if (!updateAttackerGroupBoth(pos, entry_sq[i], color, atype, flips.w, flips.b, changes, changed_mask, occ_old, wbits, bbits, delta)) return false;
-        }
+        var bb = cand[key] & ~changed_mask;
+        while (bitboard.popLsb(&bb)) |s|
+            emitAttackerGroup(pos, changes, changed_mask, occ_old, s.index(), color, key % 5, flips.w, flips.b, sink);
     }
-    return true;
 }
 
-/// Reverse a delta (XOR toggles are self-inverse; reversed for hygiene).
-pub fn undoDelta(wbits: *PerspBits, bbits: *PerspBits, delta: *const Delta) void {
-    var i = delta.n;
-    while (i > 0) {
-        i -= 1;
-        const e = delta.idx[i];
-        const idx: usize = e & 0x7FFF_FFFF;
-        const bits = if (e & 0x8000_0000 != 0) bbits else wbits;
-        bits[idx >> 6] ^= @as(u64, 1) << @as(u6, @intCast(idx & 63));
-    }
+inline fn keptVictimMasksFrom(u: [5]u64) [5]u64 {
+    const pnbr = u[0] | u[1] | u[2] | u[3];
+    return .{ u[0] | u[1] | u[3], pnbr | u[4], pnbr, pnbr, pnbr | u[4] };
 }
 
 // ---------------------------------------------------------------------------
@@ -655,75 +535,123 @@ test "full-threats enumeration matches grader reference vectors (spec r2)" {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Delta-engine tree test: walk legal move trees maintaining the bitsets via
-// applyMoveDelta (flip changes -> full-refresh path, as in the real design),
-// asserting delta-maintained == full enumeration at EVERY node, and that the
-// undo log restores the parent exactly. Covers castling, EP, promotions,
-// captures, discovered rays and king moves.
 const make_unmake = @import("../movegen/make_unmake.zig");
 const legal = @import("../movegen/legal.zig");
 const move_mod = @import("../core/move.zig");
 
-fn deltaWalk(pos: *position.Position, wbits: *PerspBits, bbits: *PerspBits, depth: u8) !void {
-    var rw: PerspBits = undefined;
-    var rb: PerspBits = undefined;
-    enumerateColors(pos, &rw, &rb);
-    try std.testing.expect(std.mem.eql(u64, wbits, &rw));
-    try std.testing.expect(std.mem.eql(u64, bbits, &rb));
-    if (depth == 0) return;
+// ---------------------------------------------------------------------------
+// Direct-delta differential check (lane 2 #4): at every move of legal-move
+// trees and of long random legal sequences (captures, promotions, en passant,
+// castling, king walks across d/e = flip crossings, null moves), the directed
+// emissions of emitMoveDelta, applied to the PRE-move enumeration with strict
+// direction checks (an ADD must find its bit clear, a REMOVE set — so no
+// feature is emitted twice or with the wrong direction), must reproduce the
+// POST-move enumeration exactly, per flip-unchanged perspective.
+const CheckSink = struct {
+    w: *PerspBits,
+    b: *PerspBits,
+    use_w: bool,
+    use_b: bool,
+    bad: u32 = 0,
+    count: u32 = 0,
 
+    pub fn emit(self: *CheckSink, comptime black: bool, comptime add: bool, idx: usize) void {
+        if (black and !self.use_b) return;
+        if (!black and !self.use_w) return;
+        self.count += 1;
+        const bits = if (black) self.b else self.w;
+        const m = @as(u64, 1) << @as(u6, @intCast(idx & 63));
+        const was = bits[idx >> 6] & m != 0;
+        if (was == add) self.bad += 1;
+        bits[idx >> 6] ^= m;
+    }
+};
+
+fn checkDirectMove(pos: *position.Position, mv: move_mod.Move) !void {
+    var pre_w: PerspBits = undefined;
+    var pre_b: PerspBits = undefined;
+    enumerateColors(pos, &pre_w, &pre_b);
     const pre_flips = kingFlips(pos);
     var premail: [64]piece.Piece = undefined;
     for (0..64) |i| premail[i] = pos.mailbox[i];
+    var st: make_unmake.StateInfo = .{};
+    _ = make_unmake.makeMove(pos, mv, &st);
+    defer make_unmake.unmakeMove(pos, mv, &st);
+    var post_w: PerspBits = undefined;
+    var post_b: PerspBits = undefined;
+    enumerateColors(pos, &post_w, &post_b);
+    const post_flips = kingFlips(pos);
+    var changes: [4]SquareChange = undefined;
+    var nc: usize = 0;
+    for (0..64) |i| {
+        if (pos.mailbox[i] != premail[i]) {
+            changes[nc] = .{ .sq = @intCast(i), .old = premail[i], .new = pos.mailbox[i] };
+            nc += 1;
+        }
+    }
+    var sink = CheckSink{ .w = &pre_w, .b = &pre_b, .use_w = pre_flips.w == post_flips.w, .use_b = pre_flips.b == post_flips.b };
+    emitMoveDelta(pos, changes[0..nc], &sink);
+    try std.testing.expectEqual(@as(u32, 0), sink.bad);
+    if (sink.use_w) try std.testing.expect(std.mem.eql(u64, &pre_w, &post_w));
+    if (sink.use_b) try std.testing.expect(std.mem.eql(u64, &pre_b, &post_b));
+}
 
+fn directTreeWalk(pos: *position.Position, depth: u8) !void {
     var moves = move_mod.MoveList.init();
     legal.generate(pos, &moves);
     for (moves.slice()) |mv| {
-        var st: make_unmake.StateInfo = .{};
-        _ = make_unmake.makeMove(pos, mv, &st);
-        const post_flips = kingFlips(pos);
-        if (post_flips.w != pre_flips.w or post_flips.b != pre_flips.b) {
-            // Mirror-flip crossing: full-refresh path with snapshot restore.
-            const save_w = wbits.*;
-            const save_b = bbits.*;
-            enumerateColors(pos, wbits, bbits);
-            try deltaWalk(pos, wbits, bbits, depth - 1);
-            wbits.* = save_w;
-            bbits.* = save_b;
-        } else {
-            var changes: [4]SquareChange = undefined;
-            var nc: usize = 0;
-            for (0..64) |i| {
-                if (pos.mailbox[i] != premail[i]) {
-                    changes[nc] = .{ .sq = @intCast(i), .old = premail[i], .new = pos.mailbox[i] };
-                    nc += 1;
-                }
-            }
-            var d = Delta{};
-            try std.testing.expect(applyMoveDelta(pos, changes[0..nc], wbits, bbits, &d));
-            try deltaWalk(pos, wbits, bbits, depth - 1);
-            undoDelta(wbits, bbits, &d);
+        try checkDirectMove(pos, mv);
+        if (depth > 1) {
+            var st: make_unmake.StateInfo = .{};
+            _ = make_unmake.makeMove(pos, mv, &st);
+            try directTreeWalk(pos, depth - 1);
+            make_unmake.unmakeMove(pos, mv, &st);
         }
-        make_unmake.unmakeMove(pos, mv, &st);
     }
 }
 
-test "full-threats delta maintains both perspectives over game trees" {
-    const cases = [_]struct { fen: []const u8, depth: u8 }{
-        .{ .fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", .depth = 3 },
-        // kiwipete: castling both sides, dense tactics, EP after double pushes
-        .{ .fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", .depth = 2 },
-        // promotions (d7 pawn) + underpromotion captures
-        .{ .fen = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", .depth = 2 },
-        // EP-rich endgame with rook rays + king activity (mixed flips)
-        .{ .fen = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", .depth = 3 },
+test "full-threats direct delta equals the enumeration XOR over game trees and random games" {
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "8/8/2pp4/8/3p4/4K3/4P3/k7 w - - 0 1",
+        "4k3/8/8/2pP1p2/8/8/5P2/4K3 w - c6 0 2",
+        "r1bq1rk1/pp2nppp/2n1p3/3pP3/2PP4/P1PB1N2/5PPP/R1BQK2R w KQ - 0 10",
+        "1k6/1P6/8/8/8/8/6p1/K6R w - - 0 1",
     };
-    for (cases) |c| {
-        var pos = try fen.parse(c.fen);
-        var wbits: PerspBits = undefined;
-        var bbits: PerspBits = undefined;
-        enumerateColors(&pos, &wbits, &bbits);
-        try deltaWalk(&pos, &wbits, &bbits, c.depth);
+    for (fens, 0..) |f, fi| {
+        var pos = try fen.parse(f);
+        try directTreeWalk(&pos, if (fi < 2) 2 else 3);
+    }
+    // Random legal games (fixed seed): long sequences through middlegames into
+    // endgames; every move checked, null moves interleaved (no change -> no
+    // emission, the post board must equal the pre board's features).
+    var rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    var games: usize = 0;
+    while (games < 300) : (games += 1) {
+        var pos = try fen.parse(fens[games % fens.len]);
+        var ply: usize = 0;
+        while (ply < 160) : (ply += 1) {
+            var moves = move_mod.MoveList.init();
+            legal.generate(&pos, &moves);
+            if (moves.slice().len == 0) break;
+            rng = rng *% 6364136223846793005 +% 1442695040888963407;
+            const mv = moves.slice()[@intCast((rng >> 33) % moves.slice().len)];
+            try checkDirectMove(&pos, mv);
+            var st: make_unmake.StateInfo = .{};
+            _ = make_unmake.makeMove(&pos, mv, &st);
+            if ((rng >> 20) % 16 == 0 and !legal.isInCheck(&pos, pos.side_to_move)) {
+                var nst: make_unmake.StateInfo = .{};
+                make_unmake.makeNullMove(&pos, &nst);
+                var w: PerspBits = undefined;
+                var b: PerspBits = undefined;
+                enumerateColors(&pos, &w, &b);
+                var sink = CheckSink{ .w = &w, .b = &b, .use_w = true, .use_b = true };
+                emitMoveDelta(&pos, &[_]SquareChange{}, &sink);
+                try std.testing.expectEqual(@as(u32, 0), sink.count);
+            }
+        }
     }
 }

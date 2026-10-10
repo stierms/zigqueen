@@ -97,23 +97,14 @@ pub const Options = struct {
         if (name_len == 0) return error.InvalidOption;
         const name = name_buffer[0..name_len];
 
-        var value_buffer: [max_string_option_len]u8 = undefined;
-        var value_len: usize = 0;
-        if (saw_value) {
-            while (tokens.next()) |token| {
-                if (value_len != 0) {
-                    if (value_len >= value_buffer.len) return error.InvalidValue;
-                    value_buffer[value_len] = ' ';
-                    value_len += 1;
-                }
-                if (value_len + token.len > value_buffer.len) return error.InvalidValue;
-                @memcpy(value_buffer[value_len..][0..token.len], token);
-                value_len += token.len;
-            }
-        }
-        const value = value_buffer[0..value_len];
+        // The value is everything after the `value` token, byte for byte apart
+        // from surrounding whitespace: a path may contain repeated spaces.
+        const raw_value = if (saw_value) std.mem.trim(u8, tokens.rest(), " \t\r\n") else "";
+        // `<empty>` is how UCI spells the empty string, as in our own
+        // `option name SyzygyPath type string default <empty>`.
+        const value = if (std.mem.eql(u8, raw_value, "<empty>")) "" else raw_value;
 
-        if (std.mem.eql(u8, name, "Hash")) {
+        if (std.ascii.eqlIgnoreCase(name, "Hash")) {
             if (value.len == 0) return error.InvalidValue;
             const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
             if (parsed < 1 or parsed > 65536) return error.InvalidValue;
@@ -121,7 +112,7 @@ pub const Options = struct {
             return .applied;
         }
 
-        if (std.mem.eql(u8, name, "Threads")) {
+        if (std.ascii.eqlIgnoreCase(name, "Threads")) {
             if (value.len == 0) return error.InvalidValue;
             const parsed = std.fmt.parseInt(u8, value, 10) catch return error.InvalidValue;
             if (parsed < 1 or parsed > @import("../search/parallel_pool.zig").MAX_THREADS) return error.InvalidValue;
@@ -129,7 +120,7 @@ pub const Options = struct {
             return .applied;
         }
 
-        if (std.mem.eql(u8, name, "Move Overhead")) {
+        if (std.ascii.eqlIgnoreCase(name, "Move Overhead")) {
             if (value.len == 0) return error.InvalidValue;
             const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
             if (parsed > 1000) return error.InvalidValue;
@@ -137,7 +128,7 @@ pub const Options = struct {
             return .applied;
         }
 
-        if (std.mem.eql(u8, name, "NNUE Scale Percent")) {
+        if (std.ascii.eqlIgnoreCase(name, "NNUE Scale Percent")) {
             if (value.len == 0) return error.InvalidValue;
             const parsed = std.fmt.parseInt(u16, value, 10) catch return error.InvalidValue;
             if (parsed > 400) return error.InvalidValue;
@@ -145,7 +136,7 @@ pub const Options = struct {
             return .applied;
         }
 
-        if (std.mem.eql(u8, name, "Contempt")) {
+        if (std.ascii.eqlIgnoreCase(name, "Contempt")) {
             if (value.len == 0) return error.InvalidValue;
             const parsed = std.fmt.parseInt(i16, value, 10) catch return error.InvalidValue;
             if (parsed < -200 or parsed > 200) return error.InvalidValue;
@@ -153,14 +144,14 @@ pub const Options = struct {
             return .applied;
         }
 
-        if (std.mem.eql(u8, name, "SyzygyPath")) {
+        if (std.ascii.eqlIgnoreCase(name, "SyzygyPath")) {
             if (value.len > max_string_option_len) return error.InvalidValue;
             @memcpy(self.syzygy_path_storage[0..value.len], value);
             self.syzygy_path_len = value.len;
             return .applied;
         }
 
-        if (std.mem.eql(u8, name, "EvalFile")) {
+        if (std.ascii.eqlIgnoreCase(name, "EvalFile")) {
             try self.setEvalFilePath(value);
             return .applied;
         }
@@ -247,6 +238,31 @@ test "unknown setoption names are ignored" {
     var options = Options{};
     try std.testing.expectEqual(ApplyOptionResult.ignored, try options.applySetOptionLine("setoption name Clear Hash"));
     try std.testing.expectEqual(@as(u32, 256), options.hash_mb);
+}
+
+test "setoption matches option names without regard to case" {
+    var options = Options{};
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name hash value 64"));
+    try std.testing.expectEqual(@as(u32, 64), options.hash_mb);
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name MOVE overhead value 7"));
+    try std.testing.expectEqual(@as(u32, 7), options.move_overhead_ms);
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name syzygypath value /tb"));
+    try std.testing.expectEqualStrings("/tb", options.syzygyPath());
+}
+
+test "setoption keeps string values byte for byte" {
+    var options = Options{};
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name EvalFile value   /nets/my  net  v2.zqb  "));
+    try std.testing.expectEqualStrings("/nets/my  net  v2.zqb", options.evalFilePath());
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name SyzygyPath value /tb/a  b:/tb/c"));
+    try std.testing.expectEqualStrings("/tb/a  b:/tb/c", options.syzygyPath());
+    // Empty spellings clear the path: no value, a lone space, UCI's <empty>.
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name SyzygyPath value <empty>"));
+    try std.testing.expectEqualStrings("", options.syzygyPath());
+    _ = try options.applySetOptionLine("setoption name SyzygyPath value /tb");
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name SyzygyPath value  "));
+    try std.testing.expectEqualStrings("", options.syzygyPath());
+    try std.testing.expectError(error.InvalidValue, options.applySetOptionLine("setoption name Hash value 64 128"));
 }
 
 test "setoption updates move overhead" {

@@ -9,6 +9,7 @@ const ordering = @import("ordering.zig");
 const piece_values = @import("../core/piece_values.zig");
 const ply_limit = @import("ply_limit.zig");
 const position = @import("../core/position.zig");
+const rule50 = @import("rule50.zig");
 const score_mod = @import("score.zig");
 const see = @import("see.zig");
 const shallow_arms = @import("shallow_arms.zig");
@@ -16,6 +17,18 @@ const tt_mod = @import("tt.zig");
 const tt_probe = @import("tt_probe.zig");
 const tt_store = @import("tt_store.zig");
 const types = @import("../core/types.zig");
+const build_options = @import("build_options");
+const basin = @import("basin.zig");
+const fail_soft = @import("fail_soft.zig");
+/// Quiescence fail lows (-Dqs-fail-low-margin, default 200): outside check a
+/// fail low returns min(alpha, max(best, stand-pat + M)), so it reports a value
+/// below alpha only beyond what a quiet move is taken to gain. Fully soft values
+/// were confirmed 68.8% against 90.1% for alpha (A3b); the margin form 89.5%
+/// against 97.6% on its soft returns (bundle R1m). Hard fail lows everywhere
+/// left 76% of correction-history events pinned. Fail-hard builds ignore it.
+const QS_FAIL_LOW_MARGIN: types.Score = if (fail_soft.ENABLED) build_options.qs_fail_low_margin else 0;
+/// Correct the quiescence stand-pat with correction history (-Dcorr-qsearch).
+const corr_qsearch: bool = build_options.corr_qsearch;
 
 const DELTA_MARGIN: types.Score = 200;
 const LATE_ENDGAME_PHASE_256: u16 = 200;
@@ -63,7 +76,8 @@ fn searchDepth(
 ) align(64) types.Score { // align(64): pins hot entry placement (layout stability, not call speed)
     if (if (comptime @hasField(@TypeOf(resources), "execution")) resources.execution.noteNode(ctx, true) else ctx.noteQNode()) return 0;
     ctx.observePly(ply);
-    if (pos.halfmove_clock >= 100 or ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
+    if (pos.halfmove_clock >= 100) return rule50.interiorScore(ctx, pos, ply, in_check_hint);
+    if (ctx.repetition.isRepetitionForKey(pos.zobrist_key, pos.halfmove_clock)) return ctx.drawScore(pos.side_to_move);
     if (from_horizon) ctx.noteHorizonTransition();
     if (ply_limit.fallback(ctx, resources.evaluator, pos, ply, in_check_hint)) |score| return score;
 
@@ -77,6 +91,16 @@ fn searchDepth(
     // that built the Result); same fix as negamax. Value semantics unchanged.
     const tt_entry: ?*const tt_mod.Entry = if (probe.entry) |*entry| entry else null;
     if (probe.cutoff) |score| return score;
+    // The hash move, when this node searches it, goes first: start its
+    // child's TT and eval-cache misses now, under the stand-pat eval. The key
+    // is a prefetch hint only (make_unmake.prefetchKeyAfter).
+    if (tt_entry) |entry| {
+        if (tt_mod.moveFromEntry(entry.*)) |hash_move| {
+            const hinted_key = make_unmake.prefetchKeyAfter(pos, hash_move);
+            resources.tt.prefetch(hinted_key);
+            resources.eval_cache.prefetch(hinted_key);
+        }
+    }
     // AFTER the TT cutoff: a cutoff returns without ever consulting in_check,
     // so computing it first wasted a full attack query on every TT-cutoff
     // qnode (probe + isInCheck were the two entry-path hot spots).
@@ -85,10 +109,12 @@ fn searchDepth(
     const beta_local = probe.beta;
 
     var stand_pat: ?types.Score = null;
+    // TT slots keep the RAW static eval; `stand_pat` is the value the node
+    // decides on (corrected when -Dcorr-qsearch, raw otherwise).
+    var raw_stand_pat: ?types.Score = null;
     if (!in_check) {
-        // RAW stand-pat: applying corrhist here measured negative (stand-pat fires
-        // at every leaf — too sensitive for half-trained corrections); corrhist is
-        // a main-search device (RFP/futility/null/improving) for now.
+        // Stand-pat correction is a build option (bundle step 2): without it
+        // quiescence decides on the raw eval, as it always has.
         // Lever 1: reuse the TT-cached raw static eval (identical to recomputing).
         // perf-r11: then the dedicated raw-eval cache (full-key verified; a hit
         // skips the NNUE forward AND the lazy-accumulator materialization,
@@ -106,11 +132,18 @@ fn searchDepth(
             if (std.math.cast(i16, fresh)) |memo| resources.eval_cache.store(pos.zobrist_key, memo);
             break :blk fresh;
         };
-        stand_pat = eval_score;
-        if (eval_score >= beta_local) {
+        raw_stand_pat = eval_score;
+        const decided: types.Score = if (comptime corr_qsearch) blk: {
+            const params: *const basin.Params = if (comptime build_options.tuning) &ctx.basin_config.params else &basin.defaults;
+            break :blk resources.history.correctedEval(pos, eval_score, .{}, params);
+        } else eval_score;
+        stand_pat = decided;
+        if (decided >= beta_local) {
             ctx.noteQsearchStandPatCutoff();
-            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, null, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
-            return beta_local;
+            const softness = if (comptime build_options.tuning) ctx.basin_config.params.standpat_softness else basin.defaults.standpat_softness;
+            const value = fail_soft.evalCutoff(beta_local, decided, softness);
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, value, null, tt_store.evalToTt(raw_stand_pat), beta_local - alpha_orig > 1);
+            return value;
         }
     }
 
@@ -126,8 +159,11 @@ fn searchDepth(
     if (moves.count == 0 and tt_quiet_move == null) {
         if (in_check) return -MATE_SCORE + @as(types.Score, @intCast(ply));
         if (stand_pat) |static_eval| {
-            const best_static = @max(alpha, static_eval);
-            tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best_static, null, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
+            const best_static = if (comptime QS_FAIL_LOW_MARGIN > 0)
+                (if (static_eval > alpha) static_eval else failLowValue(alpha, static_eval, static_eval))
+            else
+                @max(alpha, static_eval);
+            tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best_static, null, tt_store.evalToTt(raw_stand_pat), beta_local - alpha_orig > 1);
             return best_static;
         }
         return alpha;
@@ -153,12 +189,20 @@ fn searchDepth(
         ordering.scoreTacticalMoves(pos, &moves, tt_move, &scores, &capture_see_scores);
     }
 
-    var best = alpha;
+    // best starts at alpha: a capture-only value below alpha is not a bound
+    // on the position (a quiet move overturned it in 31% of A3b's sampled
+    // cases). The margin form (failLowValue) reports below alpha only beyond
+    // stand-pat + QS_FAIL_LOW_MARGIN; fail-high cutoffs above are soft.
+    var best: types.Score = alpha;
+    // The best score including those below alpha (stand-pat included), for the
+    // margin form of a fail low.
+    var soft_best: types.Score = stand_pat orelse -INF;
     var best_move: ?move_mod.Move = null;
     if (tt_quiet_move) |mv| {
         const entry = ctx.stack.entry(ply);
         const child_key = make_unmake.makeMove(pos, mv, &entry.state);
         resources.tt.prefetch(child_key);
+        resources.eval_cache.prefetch(child_key);
         ctx.repetition.push(child_key);
         resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
         const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null, false);
@@ -168,9 +212,11 @@ fn searchDepth(
         if (ctx.stopped) return 0;
         if (score >= beta_local) {
             ctx.noteBetaCutoff(0);
-            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
-            return beta_local;
+            const value = if (comptime fail_soft.ENABLED) score else beta_local;
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, value, mv, tt_store.evalToTt(raw_stand_pat), beta_local - alpha_orig > 1);
+            return value;
         }
+        if (comptime QS_FAIL_LOW_MARGIN > 0) soft_best = @max(soft_best, score);
         if (score > best) {
             best = score;
             best_move = mv;
@@ -181,8 +227,15 @@ fn searchDepth(
         if (delta_prune) return best;
     }
     var move_picker = ordering.MovePicker.init(&moves, &scores, &capture_see_scores);
+    // Pick-ahead (same identity argument as negamax's): once a move has been
+    // searched without a cutoff, the next pick is made before the current
+    // child, and a child that will be searched gets its TT and eval-cache
+    // misses started under the current one.
+    var lookahead_ready = false;
+    var searched_moves: usize = @intFromBool(tt_quiet_move != null);
     for (0..moves.count) |index| {
-        const mv = move_picker.next(index);
+        const mv = if (lookahead_ready) moves.moves[index] else move_picker.next(index);
+        lookahead_ready = false;
         const capture_see_score = move_picker.captureSee(index);
         const flag = @intFromEnum(mv.flag);
         const is_promotion = flag >= @intFromEnum(move_mod.MoveFlag.promo_knight);
@@ -196,10 +249,25 @@ fn searchDepth(
         }
 
         const entry = ctx.stack.entry(ply);
+        if (searched_moves >= 1 and index + 1 < moves.count) {
+            const upcoming = move_picker.next(index + 1);
+            lookahead_ready = true;
+            const upcoming_flag = @intFromEnum(upcoming.flag);
+            const upcoming_searched = in_check or upcoming_flag >= @intFromEnum(move_mod.MoveFlag.promo_knight) or
+                ((upcoming_flag == @intFromEnum(move_mod.MoveFlag.capture) or upcoming_flag == @intFromEnum(move_mod.MoveFlag.en_passant)) and
+                    move_picker.captureSee(index + 1) >= 0);
+            if (upcoming_searched) {
+                const hinted_key = make_unmake.prefetchKeyAfter(pos, upcoming);
+                resources.tt.prefetch(hinted_key);
+                resources.eval_cache.prefetch(hinted_key);
+            }
+        }
+        searched_moves += 1;
         // Returned key = register value; avoids reloading the zobrist store
         // makeMove just issued (see makeMove's doc comment).
         const child_key = make_unmake.makeMove(pos, mv, &entry.state);
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
+        resources.eval_cache.prefetch(child_key); // and the eval-cache set (probed on a TT eval miss)
         ctx.repetition.push(child_key);
         // Lazy accumulator: record the move only — boards/undo-state are
         // reconstructed at materialization time from the live position.
@@ -213,9 +281,11 @@ fn searchDepth(
             const move_index = index + @intFromBool(tt_quiet_move != null);
             ctx.noteBetaCutoff(move_index);
             if (is_capture and !is_promotion) ctx.noteCaptureCutoff(move_index, capture_see_score, true);
-            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
-            return beta_local;
+            const value = if (comptime fail_soft.ENABLED) score else beta_local;
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, value, mv, tt_store.evalToTt(raw_stand_pat), beta_local - alpha_orig > 1);
+            return value;
         }
+        if (comptime QS_FAIL_LOW_MARGIN > 0) soft_best = @max(soft_best, score);
         if (score > best) {
             best = score;
             best_move = mv;
@@ -240,6 +310,7 @@ fn searchDepth(
             const entry = ctx.stack.entry(ply);
             const child_key = make_unmake.makeMove(pos, mv, &entry.state);
             resources.tt.prefetch(child_key);
+            resources.eval_cache.prefetch(child_key);
             ctx.repetition.push(child_key);
             resources.evaluator.onMakeMove(&ctx.stack, mv, ply);
             const score = -searchDepth(ctx, resources, pos, -beta_local, -best, ply + 1, qs_depth +| 1, null, false);
@@ -247,9 +318,11 @@ fn searchDepth(
             make_unmake.unmakeMove(pos, mv, &entry.state);
             if (ctx.stopped) return 0;
             if (score >= beta_local) {
-                tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, beta_local, mv, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
-                return beta_local;
+                const value = if (comptime fail_soft.ENABLED) score else beta_local;
+                tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, 0, value, mv, tt_store.evalToTt(raw_stand_pat), beta_local - alpha_orig > 1);
+                return value;
             }
+            if (comptime QS_FAIL_LOW_MARGIN > 0) soft_best = @max(soft_best, score);
             if (score > best) {
                 best = score;
                 best_move = mv;
@@ -257,8 +330,21 @@ fn searchDepth(
         }
     }
 
-    tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, best, best_move, tt_store.evalToTt(stand_pat), beta_local - alpha_orig > 1);
-    return best;
+    // A fail low (best stayed at alpha) outside check may report less than
+    // alpha in the margin form; in check every evasion was searched and the
+    // value stays hard like the rest.
+    const value = if (comptime QS_FAIL_LOW_MARGIN > 0)
+        (if (best <= alpha_orig and !in_check and stand_pat != null) failLowValue(alpha_orig, stand_pat.?, soft_best) else best)
+    else
+        best;
+    tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, 0, alpha_orig, beta_local, value, best_move, tt_store.evalToTt(raw_stand_pat), beta_local - alpha_orig > 1);
+    return value;
+}
+
+/// Margin form of a quiescence fail low: below alpha only by what the
+/// position is short of alpha beyond QS_FAIL_LOW_MARGIN over the stand-pat.
+inline fn failLowValue(alpha: types.Score, stand_pat: types.Score, soft_best: types.Score) types.Score {
+    return @min(alpha, @max(soft_best, stand_pat + QS_FAIL_LOW_MARGIN));
 }
 
 fn selectTtQuietMove(

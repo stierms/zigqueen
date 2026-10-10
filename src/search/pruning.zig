@@ -53,8 +53,13 @@ pub fn shouldReverseFutilityPrune(
     return eval_score - reverseFutilityMargin(depth, improving) >= beta;
 }
 
+/// The hint table memoises reverse-futility cutoffs, which fire only at zero
+/// windows, so the hint is read only there too. At a PV window it would cut
+/// the node on a heuristic its own RFP may not apply, or raise alpha so that a
+/// later fail low against the hint is returned and stored as an exact score.
 pub fn isRfpHintApplicable(depth: u16, alpha: types.Score, beta: types.Score) bool {
     if (depth == 0 or depth > @as(u16, @intCast(tunables.active.rfp_max_depth))) return false;
+    if (isPvWindow(alpha, beta)) return false;
     if (score_mod.isMateLike(alpha) or score_mod.isMateLike(beta)) return false;
     return true;
 }
@@ -303,6 +308,15 @@ test "reverse futility pruning stays conservative" {
     // A node at the deep cap needs a much larger margin (sound): tiny edge off, huge edge on.
     try @import("std").testing.expect(!shouldReverseFutilityPrune(@as(u16, @intCast(tunables.active.rfp_max_depth)), 50, 51, false, 200, true));
     try @import("std").testing.expect(shouldReverseFutilityPrune(@as(u16, @intCast(tunables.active.rfp_max_depth)), 50, 51, false, 9000, true));
+}
+
+test "the reverse-futility hint is read only at zero windows" {
+    try @import("std").testing.expect(isRfpHintApplicable(2, 49, 50));
+    try @import("std").testing.expect(!isRfpHintApplicable(2, -20, 20));
+    try @import("std").testing.expect(!isRfpHintApplicable(2, 48, 50));
+    try @import("std").testing.expect(!isRfpHintApplicable(0, 49, 50));
+    try @import("std").testing.expect(!isRfpHintApplicable(@as(u16, @intCast(tunables.active.rfp_max_depth)) + 1, 49, 50));
+    try @import("std").testing.expect(!isRfpHintApplicable(2, score_mod.MATE_THRESHOLD, score_mod.MATE_THRESHOLD + 1));
 }
 
 test "razoring stays off in pv windows checks and healthy eval nodes" {

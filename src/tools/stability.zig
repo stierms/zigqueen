@@ -36,6 +36,8 @@ pub const StabilityError = error{
 };
 
 pub fn run(writer: anytype, iterations: u8) !void {
+    // The first run is only the baseline; stability needs a second one to compare.
+    if (iterations < 2) return error.InvalidIterationCount;
     for (CASES) |case| {
         try verifyCase(case, iterations);
         try writer.print("ok {s} depth {d} iterations {d}\n", .{ case.name, case.depth, iterations });

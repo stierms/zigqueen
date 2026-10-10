@@ -155,7 +155,14 @@ inline fn bestScoredIndex(scores: *const [move_mod.MAX_MOVES]i32, start: usize, 
     var best_index = start;
     var best_score = scores[start];
 
-    if (count - start >= W) {
+    // Every list of at least W moves takes the vector path to the end: the
+    // last partial chunk is the overlapping chunk [count - W, count) with the
+    // lanes below `index` (already scanned, or before `start`) masked off, so
+    // no scalar remainder loop and none of its per-element data-dependent
+    // branches remain. Each lane still meets its indices in increasing order
+    // (the overlapping chunk's live lanes lie above everything scanned
+    // before), which is all the identity argument above needs.
+    if (count >= W) {
         var vbest: V = @splat(best_score);
         // Lane `j`'s running best index is `vbase[j] + j`: a lane that takes a
         // chunk element records only the chunk's base index, so the loop keeps
@@ -168,6 +175,16 @@ inline fn bestScoredIndex(scores: *const [move_mod.MAX_MOVES]i32, start: usize, 
             const better = chunk > vbest;
             vbest = @select(i32, better, chunk, vbest);
             vbase = @select(i32, better, @as(V, @splat(@as(i32, @intCast(index)))), vbase);
+        }
+        if (index < count) {
+            const tail_base = count - W;
+            const chunk: V = scores[tail_base..][0..W].*;
+            const tail_index: V = @as(V, @splat(@as(i32, @intCast(tail_base)))) + LANE;
+            const live = tail_index >= @as(V, @splat(@as(i32, @intCast(index))));
+            const better = @select(bool, live, chunk > vbest, @as(@Vector(W, bool), @splat(false)));
+            vbest = @select(i32, better, chunk, vbest);
+            vbase = @select(i32, better, @as(V, @splat(@as(i32, @intCast(tail_base)))), vbase);
+            index = count;
         }
         best_score = @reduce(.Max, vbest);
         const at_best = vbest == @as(V, @splat(best_score));

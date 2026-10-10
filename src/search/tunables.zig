@@ -38,11 +38,7 @@ pub const Tunables = struct {
     razor_base: types.Score = 5,
     razor_per_ply: types.Score = 80,
     // Reductions + LMP. (LMR divisor feeds a comptime table -> left const for now.)
-    lmr_non_improving: types.Score = 0, // extra LMR reduction when not improving
-    null_reduction_base: types.Score = 5, // null-move R at depth >= null_reduction_depth
-    null_reduction_depth: types.Score = 7, // depth threshold for the larger null R
     lmp_base: types.Score = 6, // late-move-prune onset base (threshold = lmp_base + d*d)
-    lmr_history_divisor: types.Score = 8192, // LMR history shift = clamp(hist/this, -2, 2)
 
     // --- v3.1.0 depth-efficiency knobs (the +44 bundle), never tuned ---
     rfp_max_depth: types.Score = 6, // reverse-futility extends to this depth (was 3)
@@ -105,11 +101,7 @@ pub const specs = [_]Spec{
     .{ .uci_name = "BadCaptureNonImprovingBonus", .field = "bad_capture_non_improving_bonus", .default = 37, .min = 0, .max = 300 },
     .{ .uci_name = "RazorBase", .field = "razor_base", .default = 5, .min = 0, .max = 500 },
     .{ .uci_name = "RazorPerPly", .field = "razor_per_ply", .default = 80, .min = 10, .max = 500 },
-    .{ .uci_name = "LmrNonImproving", .field = "lmr_non_improving", .default = 0, .min = 0, .max = 3 },
-    .{ .uci_name = "NullReductionBase", .field = "null_reduction_base", .default = 5, .min = 1, .max = 7 },
-    .{ .uci_name = "NullReductionDepth", .field = "null_reduction_depth", .default = 7, .min = 3, .max = 12 },
     .{ .uci_name = "LmpBase", .field = "lmp_base", .default = 6, .min = 0, .max = 12 },
-    .{ .uci_name = "LmrHistoryDivisor", .field = "lmr_history_divisor", .default = 8192, .min = 2048, .max = 32760 },
     // v3.1.0 depth-efficiency knobs.
     .{ .uci_name = "RfpMaxDepth", .field = "rfp_max_depth", .default = 6, .min = 3, .max = 10 },
     .{ .uci_name = "RfpDeepMarginPerPly", .field = "rfp_deep_margin_per_ply", .default = 75, .min = 30, .max = 160 },
@@ -148,7 +140,7 @@ pub const specs = [_]Spec{
 /// SPSA driver never stalls on a boundary perturbation.
 pub fn set(uci_name: []const u8, value: types.Score) bool {
     inline for (specs) |s| {
-        if (std.mem.eql(u8, uci_name, s.uci_name)) {
+        if (std.ascii.eqlIgnoreCase(uci_name, s.uci_name)) {
             @import("startup.zig").ensure();
             @field(active, s.field) = std.math.clamp(value, s.min, s.max);
             // The LMR shape lives in a precomputed table: rebuild it whenever

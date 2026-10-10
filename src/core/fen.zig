@@ -7,6 +7,12 @@ const zobrist = @import("zobrist.zig");
 
 pub const STARTPOS_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
+/// Largest halfmove clock or fullmove number a FEN may carry. make/unmake
+/// increment both as plain u16 adds; keeping the parsed value in the lower
+/// half of the range leaves 32,768 increments of headroom, more plies than
+/// any replayed game can add.
+pub const MAX_MOVE_COUNTER: u16 = 32_767;
+
 pub const FenError = error{
     InvalidFen,
     InvalidPiecePlacement,
@@ -42,9 +48,11 @@ fn parseWithHash(fen: []const u8, comptime compute_hash: bool) FenError!position
     pos.side_to_move = try parseSideToMove(side_field);
     pos.castling_rights = try parseCastling(castling_field);
     pos.en_passant = try parseEnPassant(ep_field);
+    if (pos.en_passant) |ep| try validateEnPassant(&pos, ep);
     pos.halfmove_clock = std.fmt.parseInt(u16, halfmove_field, 10) catch return error.InvalidHalfmoveClock;
+    if (pos.halfmove_clock > MAX_MOVE_COUNTER) return error.InvalidHalfmoveClock;
     pos.fullmove_number = std.fmt.parseInt(u16, fullmove_field, 10) catch return error.InvalidFullmoveNumber;
-    if (pos.fullmove_number == 0) return error.InvalidFullmoveNumber;
+    if (pos.fullmove_number == 0 or pos.fullmove_number > MAX_MOVE_COUNTER) return error.InvalidFullmoveNumber;
 
     if (pos.countPieces(.white, .king) != 1 or pos.countPieces(.black, .king) != 1) {
         return error.InvalidKingCount;
@@ -189,6 +197,45 @@ fn parseEnPassant(field: []const u8) FenError!?square.Square {
     const rank = sq.rank();
     if (rank != 2 and rank != 5) return error.InvalidEnPassant;
     return sq;
+}
+
+/// The generators trust an en passant target: they emit the capture and remove
+/// a pawn from the square in front of it without looking. So the target must
+/// be on the rank the side to move captures onto, be empty, and have the
+/// opponent's double-pushed pawn in front of it. A capturing pawn beside it is
+/// not required; FEN records the target after every double push.
+fn validateEnPassant(pos: *const position.Position, ep: square.Square) FenError!void {
+    const white_to_move = pos.side_to_move == .white;
+    if (ep.rank() != @as(u8, if (white_to_move) 5 else 2)) return error.InvalidEnPassant;
+    if (pos.pieceAt(ep) != .none) return error.InvalidEnPassant;
+    const pushed = square.Square.fromCoords(@intCast(ep.file()), if (white_to_move) 4 else 3);
+    const expected: piece.Piece = if (white_to_move) .black_pawn else .white_pawn;
+    if (pos.pieceAt(pushed) != expected) return error.InvalidEnPassant;
+}
+
+test "fen parser rejects en passant targets the generators could not honour" {
+    // No pawn to capture.
+    try std.testing.expectError(error.InvalidEnPassant, parse("4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1"));
+    // Target on the mover's own double-push rank.
+    try std.testing.expectError(error.InvalidEnPassant, parse("4k3/8/8/8/3pP3/8/8/4K3 w - e3 0 1"));
+    // Target square occupied.
+    try std.testing.expectError(error.InvalidEnPassant, parse("4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1"));
+    // Wrong colour in front of the target.
+    try std.testing.expectError(error.InvalidEnPassant, parse("4k3/8/8/3PP3/8/8/8/4K3 w - d6 0 1"));
+    // A consistent target with no capturing pawn beside it is ordinary FEN.
+    const after_e4 = try parse("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
+    try std.testing.expectEqual(@as(?square.Square, .e3), after_e4.en_passant);
+    const black_pushed = try parse("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2");
+    try std.testing.expectEqual(@as(?square.Square, .d6), black_pushed.en_passant);
+}
+
+test "fen parser bounds the move counters" {
+    try std.testing.expectError(error.InvalidFullmoveNumber, parse("4k3/8/8/8/8/8/8/4K3 b - - 0 65535"));
+    try std.testing.expectError(error.InvalidFullmoveNumber, parse("4k3/8/8/8/8/8/8/4K3 b - - 0 32768"));
+    try std.testing.expectError(error.InvalidHalfmoveClock, parse("4k3/8/8/8/8/8/8/4K3 b - - 40000 1"));
+    const pos = try parse("4k3/8/8/8/8/8/8/4K3 b - - 32767 32767");
+    try std.testing.expectEqual(MAX_MOVE_COUNTER, pos.fullmove_number);
+    try std.testing.expectEqual(MAX_MOVE_COUNTER, pos.halfmove_clock);
 }
 
 test "startpos fen parses with correct piece counts" {

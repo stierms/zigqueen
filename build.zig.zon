@@ -8,6 +8,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "deps",
         "README.md",
         "ARCHITECTURE.md",
         "ORIGINALITY.md",

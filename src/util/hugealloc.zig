@@ -397,9 +397,10 @@ test "large allocations are usable end-to-end whatever path engages" {
     try std.testing.expectEqual(@as(u64, 0xBEEF), backed.items[n - 1]);
     try std.testing.expectEqual(@as(u64, 0), backed.items[n / 2]);
 
-    // Whichever mmap rung engaged, its base must be 2MB-aligned (hugetlb by the
-    // kernel, thp_madvise by the over-map-and-trim dance).
-    if (backed.method != .heap) {
+    // Every huge-page rung must hand back a 2MB-aligned base (hugetlb and
+    // win_large by the kernel, thp_madvise by the over-map-and-trim dance).
+    // win_virtual is a regular VirtualAlloc mapping, which promises 64KiB.
+    if (backed.method != .heap and backed.method != .win_virtual) {
         try std.testing.expectEqual(@as(usize, 0), @intFromPtr(backed.items.ptr) % HUGE_PAGE_BYTES);
     }
 }

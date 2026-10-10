@@ -50,6 +50,22 @@ pub fn makeMove(pos: *position.Position, mv: move_mod.Move, state: *StateInfo) a
     return pos.zobrist_key;
 }
 
+/// The zobrist key `makeMove(pos, mv)` would produce, for prefetch hints only.
+/// Exact for quiet moves, captures and double pushes that change no castling
+/// right; castling, en passant, promotions and right-changing moves give a
+/// near key, i.e. a wasted hint. Callers must never use it for anything but a
+/// prefetch address, so it cannot change any search result.
+pub inline fn prefetchKeyAfter(pos: *const position.Position, mv: move_mod.Move) u64 {
+    const to = mv.to.index();
+    const moving_row = zobrist.pieceSquareRow(@intFromEnum(pos.pieceAt(mv.from)));
+    // Row 12 (Piece.none) is all zeros, so a quiet move's target adds nothing.
+    const captured_row = zobrist.pieceSquareRow(@intFromEnum(pos.pieceAt(mv.to)));
+    var key = pos.zobrist_key ^ zobrist.SIDE_TO_MOVE_KEY ^ moving_row[mv.from.index()] ^ moving_row[to] ^ captured_row[to];
+    if (pos.en_passant) |ep| key ^= zobrist.EN_PASSANT_FILE_KEYS[ep.file()];
+    if (mv.flag == .double_push) key ^= zobrist.EN_PASSANT_FILE_KEYS[mv.to.file()];
+    return key;
+}
+
 pub fn makeMoveForLegality(pos: *position.Position, mv: move_mod.Move) void {
     const side = pos.side_to_move;
     const moving_piece = pos.pieceAt(mv.from);
@@ -595,4 +611,28 @@ test "deterministic legal sequence preserves hash integrity and round-trips" {
     }
 
     try std.testing.expect(position.Position.eql(&original, &pos));
+}
+
+test "prefetchKeyAfter matches makeMove on quiet moves, captures and double pushes" {
+    const fen = @import("../core/fen.zig");
+    var pos = try fen.parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+    var list = move_mod.MoveList.init();
+    @import("legal.zig").generate(&pos, &list);
+    var checked: usize = 0;
+    for (list.slice()) |mv| {
+        switch (mv.flag) {
+            .quiet, .capture, .double_push => {},
+            else => continue,
+        }
+        const moving = pos.pieceAt(mv.from);
+        if (moving == .white_king or moving == .white_rook) continue;
+        if (pos.pieceAt(mv.to) == .black_rook) continue;
+        const predicted = prefetchKeyAfter(&pos, mv);
+        var state: StateInfo = .{};
+        const actual = makeMove(&pos, mv, &state);
+        unmakeMove(&pos, mv, &state);
+        try std.testing.expectEqual(actual, predicted);
+        checked += 1;
+    }
+    try std.testing.expect(checked > 20);
 }

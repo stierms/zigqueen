@@ -15,6 +15,13 @@ archive and the method are offered free of charge, without registration or
 restrictions beyond the applicable open licenses. This offer covers the 6.3.0
 network; the 6.0.0–6.2.0 network is covered by [data-r1](../data-r1/README.md).
 
+It also covers the 6.4.0 network (SHA-256
+`1342ac4691324a632418d6e1fc8696807c364d9a8bb63fbbc9b74e771cf1ffac`). That
+network was trained on the same 42 files with the same filter, hold-out,
+quotas and targets; only the architecture and the order in which positions
+were read differ. The archive is attached unchanged to the
+[6.4.0 release](https://github.com/stierms/zigqueen/releases/tag/v6.4.0).
+
 ## Attribution and license
 
 We credit the LCZero contributors, Linmiao Xu (linrock), Joost VandeVondele

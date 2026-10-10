@@ -45,10 +45,24 @@ pub const default_nnue_scale_percent: u16 = 66;
 /// below 40). Running a ZQB9 net at the inherited 66 costs ~35 Elo — three
 /// quarters of the architecture's gain — so the scale must follow the NET, not
 /// a global constant. An explicit `NNUE Scale Percent` still overrides.
-pub const zqb9_nnue_scale_percent: u16 = 48;
+/// 2026-10-01 (BT4, A1): BT4 scores 6-10% wider than 94da on search-like positions;
+/// 44 against 48 at STC capped at 16,000 games, positive but unresolved; taken by
+/// operator ruling (artifacts/research/a1-scale-20261001/).
+pub const zqb9_nnue_scale_percent: u16 = 44;
+
+/// ZQBA (ZQB9 + pawn-pair block): 2026-10-02 (B3 candidate, net A of the pilot). Net A's
+/// eval spread on A1's tree mix is 0.979 of a637's (|eval| quantile ratios at p50/p75/p90;
+/// game parents 0.987), so matching a637 at 44 gives round(44 / 0.979) = 45
+/// (artifacts/research/b3-pawn-pairs-20260930/candidate/spread.json); v2 shipped at 45.
+/// 2026-10-09: the embedded E-final (v2 extended with full-network QAT, SB 330) measures
+/// k_tree 0.9954 by the same frozen rule, so round(44 / 0.9954) = 44
+/// (artifacts/research/v2-ext-20261008/final/spread-e-final-sb330.json); accepted at 44
+/// (VE3 STC H1 +5.75 against v2 at 45).
+pub const zqba_nnue_scale_percent: u16 = 44;
 
 /// The scale a net expects when the user has not chosen one.
 pub fn autoScalePercent(net: *const nnue768.Net) u16 {
+    if (net.pawn_inputs != 0) return zqba_nnue_scale_percent;
     return if (net.full_threats) zqb9_nnue_scale_percent else default_nnue_scale_percent;
 }
 
@@ -56,7 +70,10 @@ pub fn autoScalePercent(net: *const nnue768.Net) u16 {
 /// magic, so the UCI-advertised default can never drift from what the engine
 /// actually uses. (A GUI that echoes the advertised default back as a
 /// `setoption` must not silently downgrade the engine.)
-pub const builtin_nnue_scale_percent: u16 = if (std.mem.eql(u8, nnue768.default_net_bytes[0..4], nnue768.MAGIC9))
+/// Keyed like `autoScalePercent`: a ZQBA file always carries the pawn block.
+pub const builtin_nnue_scale_percent: u16 = if (std.mem.eql(u8, nnue768.default_net_bytes[0..4], nnue768.MAGIC_A))
+    zqba_nnue_scale_percent
+else if (std.mem.eql(u8, nnue768.default_net_bytes[0..4], nnue768.MAGIC9))
     zqb9_nnue_scale_percent
 else
     default_nnue_scale_percent;
@@ -64,6 +81,15 @@ else
 pub const Options = struct {
     nnue_scale_percent: u16 = builtin_nnue_scale_percent,
     eval_file_path: ?[]const u8 = null,
+    /// Whether `nnue_scale_percent` is an explicit choice that a loaded net must not
+    /// override. null: explicit iff it differs from the family default (the historic
+    /// inference); the CLI passes true whenever a scale was given, so a scale equal to
+    /// the default still pins a ZQBA net (B3 review finding 4).
+    scale_explicit: ?bool = null,
+
+    fn explicitScale(self: Options) bool {
+        return self.scale_explicit orelse (self.nnue_scale_percent != builtin_nnue_scale_percent);
+    }
 };
 
 /// Re-exported so callers that share one net across engines (datagen --threads)
@@ -98,9 +124,8 @@ pub const EngineState = struct {
         var state = EngineState{
             .allocator = allocator,
             .nnue_scale_percent = options.nnue_scale_percent,
-            // A caller-supplied scale that differs from the family default is an
-            // explicit choice and must survive the load-time adoption below.
-            .scale_explicit = options.nnue_scale_percent != builtin_nnue_scale_percent,
+            // An explicit caller-supplied scale must survive the load-time adoption below.
+            .scale_explicit = options.explicitScale(),
         };
         errdefer state.deinit();
         try state.loadModelFile(options.eval_file_path orelse builtin_eval_file);
@@ -115,7 +140,7 @@ pub const EngineState = struct {
         var state = EngineState{
             .allocator = allocator,
             .nnue_scale_percent = options.nnue_scale_percent,
-            .scale_explicit = options.nnue_scale_percent != builtin_nnue_scale_percent,
+            .scale_explicit = options.explicitScale(),
             .net = net,
         };
         state.adoptNetScale();
@@ -180,8 +205,8 @@ pub const EngineState = struct {
 
     /// Recompute both perspective accumulators at the search root, and invalidate
     /// the finny (accumulator-refresh) cache so this search starts cold. For v6
-    /// full-threat (ZQB9) nets, also re-anchor the shared full-threat bitset state
-    /// at the root (full enumeration, empty path stack, cold flip cache).
+    /// full-threat (ZQB9) nets, also reset the full-threat state at the root
+    /// (empty path, cold flip cache).
     pub fn prepareRoot(self: *const EngineState, stack: *search_stack.SearchStack, pos: *const position.Position, finny: *nnue768.FinnyTable, ft: *nnue768.FullThreatState) void {
         finny.reset();
         stack.clean_depth = 0;
@@ -262,32 +287,11 @@ pub const EngineState = struct {
             }
         }
 
-        // v6 full threats (ZQB9): bring the SHARED bitset pair to this line's
-        // state at `top` before the walk — it may sit deeper, or on an already-
-        // unmade sibling branch whose per-ply records still describe its actual
-        // path. The fused walk below then re-advances it move by move, so after
-        // every materialization the bitsets' path == the stack's contiguous
-        // clean prefix (which is why `top` is always a valid unwind target and
-        // ft.depth >= top always holds). Plain-delta history unwinds exactly
-        // (XOR toggles are self-inverse); a barrier in the unwound span (flip
-        // refresh / delta overflow — not undoable in place) instead resets the
-        // bitsets by full re-enumeration at the `top` board, reconstructed with
-        // one extra unmake off the deepest scratch/live board (always possible:
-        // `top` is on the live line). Records at or below `top` stay valid
-        // either way (the re-enumerated bitsets are bit-identical to the
-        // delta-maintained ones).
-        if (net.full_threats and ft.depth > top) {
-            if (ft.unwindNeedsReset(top)) {
-                var base: position.Position = if (top + 1 < ply) scratch else pos.*;
-                if (stack.entry(top + 1).acc_state == .dirty_null)
-                    make_unmake.unmakeNullMove(&base, &stack.entry(top).state)
-                else
-                    make_unmake.unmakeMove(&base, stack.entry(top + 1).pending_mv, &stack.entry(top).state);
-                ft.resetAt(&base, top);
-            } else {
-                ft.unwindTo(top);
-            }
-        }
+        // v6 full threats (ZQB9): the threat state stores nothing board-derived
+        // on the path (each move's delta comes from the board and the change
+        // list alone: fullthreats.emitMoveDelta), so re-anchoring at `top` is
+        // depth bookkeeping only.
+        if (net.full_threats) ft.unwindTo(top);
         if (net.full_threats) std.debug.assert(ft.depth == top);
 
         var k = top + 1;
@@ -430,8 +434,7 @@ test "nnue scale percent rescales the evaluation magnitude" {
 /// Every checked node asserts incremental == evaluateFull9 refresh (via
 /// nnue768.evaluate's full_threats dispatch). `eval_every=false` evaluates only
 /// a sparse subset of nodes, so materializations regularly start several plies
-/// up and after sibling-branch bitset excursions — the path-stack unwind (and
-/// its barrier-reset fallback) is exactly what that stresses.
+/// up after sibling-branch excursions (multi-ply lazy chains, flip crossings).
 const Zqb9Walker = struct {
     state: *const EngineState,
     stack: *search_stack.SearchStack,
@@ -482,6 +485,10 @@ const Zqb9Fixture = struct {
     fn init(allocator: std.mem.Allocator) !Zqb9Fixture {
         const blob = try nnue768.buildZqb9TestBlob(allocator);
         defer allocator.free(blob);
+        return initWith(allocator, blob);
+    }
+
+    fn initWith(allocator: std.mem.Allocator, blob: []const u8) !Zqb9Fixture {
         const net = try nnue768.loadFromBytes(allocator, blob);
         errdefer net.destroy(allocator);
         const stack = try allocator.create(search_stack.SearchStack);
@@ -543,14 +550,210 @@ test "backend ZQB9 full-threats incremental matches refresh over game trees" {
 test "backend ZQB9 full-threats lazy materialization matches refresh" {
     // Sparse-eval mirror of the lean path's lazy guard (engine.zig's real-search
     // test): only ~1/4 of nodes evaluate, so ensureMaterialized routinely starts
-    // multi-ply dirty chains and must first unwind the shared bitsets off
-    // already-abandoned sibling branches — including THROUGH flip barriers
-    // (the re-enumeration reset path).
+    // multi-ply dirty chains after already-abandoned sibling branches,
+    // including across d/e flip crossings (the flip-cache rebuild path).
     var fx = try Zqb9Fixture.init(std.testing.allocator);
     defer fx.deinit();
     try fx.run("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 3, false);
     try fx.run("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3, false);
     try fx.run("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 3, false);
+}
+
+const zqba_walk_fens = [_][]const u8{
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    // Kxd4 removes a pawn while the white king crosses e -> d (flip barrier).
+    "8/8/2pp4/8/3p4/4K3/4P3/k7 w - - 0 1",
+    // En passant with neighbours on both sides, and a pawn race.
+    "4k3/8/8/2pP1p2/8/8/5P2/4K3 w - c6 0 2",
+    "2k5/pp3p2/2p1p1p1/3pP2p/3P1P1P/2P3P1/PP6/2K5 b - - 0 30",
+};
+
+test "backend ZQBA pawn pairs: incremental matches refresh over game trees" {
+    // B3 gate: the ZQB9 walker with a random pawn-pair block. Every node checks
+    // incremental (threat halves + pawn rows via the move delta, flip-cache
+    // diffs at barriers) against the evaluateFull9 reference, including null
+    // moves, en passant, promotions and a king capturing a pawn across d/e.
+    const allocator = std.testing.allocator;
+    const blob = try nnue768.buildZqbaTestBlob(allocator);
+    defer allocator.free(blob);
+    var fx = try Zqb9Fixture.initWith(allocator, blob);
+    defer fx.deinit();
+    try std.testing.expect(fx.state.net.?.pawn_inputs != 0);
+    for (zqba_walk_fens) |f| try fx.run(f, 3, true);
+}
+
+test "backend ZQBA pawn pairs: lazy materialization matches refresh" {
+    const allocator = std.testing.allocator;
+    const blob = try nnue768.buildZqbaTestBlob(allocator);
+    defer allocator.free(blob);
+    var fx = try Zqb9Fixture.initWith(allocator, blob);
+    defer fx.deinit();
+    for (zqba_walk_fens) |f| try fx.run(f, 3, false);
+}
+
+test "backend ZQBA with 16 king buckets (v2 shape): incremental and lazy match refresh over game trees" {
+    // v2 = ZQBA + 16 king buckets: the walker on a 16-bucket split of the synthetic
+    // ZQB9 (halves perturbed so they differ) with a random pawn block; king moves
+    // across the new bucket boundaries exercise the finny refresh at 16 buckets.
+    const allocator = std.testing.allocator;
+    const base = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(base);
+    const split = try nnue768.zqb9SplitKingBuckets16(allocator, base, 0x0016_cafe);
+    defer allocator.free(split);
+    const blob = try nnue768.zqb9ToZqba(allocator, split, 0x0bad_5eed);
+    defer allocator.free(blob);
+    var fx = try Zqb9Fixture.initWith(allocator, blob);
+    defer fx.deinit();
+    try std.testing.expectEqual(@as(usize, 16), fx.state.net.?.king_buckets);
+    try std.testing.expect(fx.state.net.?.pawn_inputs != 0);
+    for (zqba_walk_fens) |f| try fx.run(f, 3, true);
+    for (zqba_walk_fens) |f| try fx.run(f, 3, false);
+}
+
+/// Random-game fuzz through the real backend plumbing (lane 2 #4, direct threat
+/// delta): random legal moves with occasional second branches (so lazy chains
+/// start from abandoned siblings), random null moves, sparse evals; every
+/// checked node asserts incremental == evaluateFull9 refresh.
+const FuzzWalker = struct {
+    state: *const EngineState,
+    stack: *search_stack.SearchStack,
+    finny: *nnue768.FinnyTable,
+    ft: *nnue768.FullThreatState,
+    rng: u64,
+    checks: u32 = 0,
+    /// Scratch for the accumulator-level check (threat halves + PSQT vs refresh).
+    fresh: *nnue768.Accumulator,
+
+    fn next(self: *FuzzWalker) u64 {
+        self.rng = self.rng *% 6364136223846793005 +% 1442695040888963407;
+        return self.rng >> 33;
+    }
+
+    fn walk(self: *FuzzWalker, pos: *position.Position, ply: usize, depth: u8) !void {
+        const legal = @import("../movegen/legal.zig");
+        if (depth == 0 or self.next() % 3 == 0) {
+            const net = self.state.net.?;
+            const inc = self.state.evaluate(self.stack, ply, pos, self.finny, self.ft);
+            try std.testing.expectEqual(nnue768.evaluate(net, pos, self.state.nnue_scale_percent), inc);
+            // Stricter than the eval: the maintained threat halves and threat
+            // PSQT scalars (both perspectives, incl. flip-cache rebuilds after a
+            // d/e king crossing) equal a full refresh lane for lane.
+            const acc = &self.stack.entry(ply).acc;
+            self.fresh.refresh(net, pos);
+            const h = net.hidden;
+            try std.testing.expectEqualSlices(i16, self.fresh.ftw[0..h], acc.ftw[0..h]);
+            try std.testing.expectEqualSlices(i16, self.fresh.ftb[0..h], acc.ftb[0..h]);
+            try std.testing.expectEqualSlices(i64, self.fresh.psqt_tw[0..net.psqt_buckets], acc.psqt_tw[0..net.psqt_buckets]);
+            try std.testing.expectEqualSlices(i64, self.fresh.psqt_tb[0..net.psqt_buckets], acc.psqt_tb[0..net.psqt_buckets]);
+            self.checks += 1;
+        }
+        if (depth == 0) return;
+        if (ply > 0 and self.next() % 8 == 0 and !legal.isInCheck(pos, pos.side_to_move)) {
+            make_unmake.makeNullMove(pos, &self.stack.entry(ply).state);
+            self.state.onMakeNullMove(self.stack, ply);
+            try self.walk(pos, ply + 1, depth - 1);
+            make_unmake.unmakeNullMove(pos, &self.stack.entry(ply).state);
+        }
+        var moves = move_mod.MoveList.init();
+        legal.generate(pos, &moves);
+        const n = moves.slice().len;
+        if (n == 0) return;
+        const branches: usize = if (self.next() % 4 == 0) 2 else 1;
+        for (0..branches) |_| {
+            const mv = moves.slice()[@intCast(self.next() % n)];
+            _ = make_unmake.makeMove(pos, mv, &self.stack.entry(ply).state);
+            self.state.onMakeMove(self.stack, mv, ply);
+            try self.walk(pos, ply + 1, depth - 1);
+            make_unmake.unmakeMove(pos, mv, &self.stack.entry(ply).state);
+        }
+    }
+};
+
+fn fuzzNet(allocator: std.mem.Allocator, blob: []const u8, games: usize, depth: u8) !u32 {
+    const fen = @import("../core/fen.zig");
+    var fx = try Zqb9Fixture.initWith(allocator, blob);
+    defer fx.deinit();
+    const fresh = try allocator.create(nnue768.Accumulator);
+    defer allocator.destroy(fresh);
+    var checks: u32 = 0;
+    for (0..games) |g| {
+        var pos = try fen.parse(zqba_walk_fens[g % zqba_walk_fens.len]);
+        fx.stack.* = .{};
+        fx.state.prepareRoot(fx.stack, &pos, fx.finny, fx.ft);
+        var w = FuzzWalker{ .state = &fx.state, .stack = fx.stack, .finny = fx.finny, .ft = fx.ft, .rng = 0x5eed_0000 + g, .fresh = fresh };
+        try w.walk(&pos, 0, depth);
+        checks += w.checks;
+    }
+    return checks;
+}
+
+test "backend direct threat delta: random-game fuzz matches refresh (embedded E-final, ZQB9 and its v2 shape, optional EvalFile)" {
+    // The embedded net (the E-final ZQBA, v2 shape), a synthetic ZQB9 and its v2 shape
+    // (16 king buckets + a random pawn-pair block), and, when ZQ_FUZZ_EVALFILE
+    // names a ZQB9/ZQBA file (e.g. a637), that net: random games with captures,
+    // promotions, en passant, castling, king bucket and d/e flip crossings and null moves.
+    const allocator = std.testing.allocator;
+    const games: usize = if (builtin.mode == .Debug) 7 else 28;
+    const depth: u8 = if (builtin.mode == .Debug) 14 else 22;
+    try std.testing.expect(try fuzzNet(allocator, nnue768.default_net_bytes, games, depth) > 0);
+    const zqb9 = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(zqb9);
+    try std.testing.expect(try fuzzNet(allocator, zqb9, games, depth) > 0);
+    const split = try nnue768.zqb9SplitKingBuckets16(allocator, zqb9, null);
+    defer allocator.free(split);
+    const v2shape = try nnue768.zqb9ToZqba(allocator, split, 0x0bad_5eed);
+    defer allocator.free(v2shape);
+    try std.testing.expect(try fuzzNet(allocator, v2shape, games, depth) > 0);
+    const path = std.process.getEnvVarOwned(allocator, "ZQ_FUZZ_EVALFILE") catch return;
+    defer allocator.free(path);
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 28);
+    defer allocator.free(bytes);
+    try std.testing.expect(try fuzzNet(allocator, bytes, games, depth) > 0);
+}
+
+test "the embedded ZQBA net starts at its own scale; loaded nets adopt their family's; an explicit scale wins" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings(nnue768.MAGIC_A, nnue768.default_net_bytes[0..4]);
+    try std.testing.expectEqual(zqba_nnue_scale_percent, builtin_nnue_scale_percent);
+    // With E-final the ZQBA scale equals ZQB9's (44), so adoption is observed against the
+    // ZQB1 family (66): every load below changes the scale unless it is pinned.
+    try std.testing.expect(default_nnue_scale_percent != builtin_nnue_scale_percent);
+    const zqb9 = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(zqb9);
+    const zqb1 = try nnue768.buildZqb1TestBlob(allocator);
+    defer allocator.free(zqb1);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.zqb9", .data = zqb9 });
+    try tmp.dir.writeFile(.{ .sub_path = "t.zqb1", .data = zqb1 });
+    const path9 = try tmp.dir.realpathAlloc(allocator, "t.zqb9");
+    defer allocator.free(path9);
+    const path = try tmp.dir.realpathAlloc(allocator, "t.zqb1");
+    defer allocator.free(path);
+    var state = try EngineState.init(allocator, .{});
+    defer state.deinit();
+    try std.testing.expectEqual(zqba_nnue_scale_percent, state.nnueScalePercent());
+    try state.loadModelFile(path);
+    try std.testing.expectEqual(default_nnue_scale_percent, state.nnueScalePercent());
+    try state.loadModelFile(path9);
+    try std.testing.expectEqual(zqb9_nnue_scale_percent, state.nnueScalePercent());
+    try state.loadModelFile(path);
+    try std.testing.expectEqual(default_nnue_scale_percent, state.nnueScalePercent());
+    try state.loadModelFile(builtin_eval_file);
+    try std.testing.expectEqual(zqba_nnue_scale_percent, state.nnueScalePercent());
+    state.setNnueScalePercent(50);
+    try state.loadModelFile(path);
+    try std.testing.expectEqual(@as(u16, 50), state.nnueScalePercent());
+    // Options: a scale equal to the builtin default pins a loaded net only when explicit.
+    var pinned = try EngineState.init(allocator, .{ .eval_file_path = path, .nnue_scale_percent = builtin_nnue_scale_percent, .scale_explicit = true });
+    defer pinned.deinit();
+    try std.testing.expectEqual(builtin_nnue_scale_percent, pinned.nnueScalePercent());
+    var inferred = try EngineState.init(allocator, .{ .eval_file_path = path, .nnue_scale_percent = builtin_nnue_scale_percent });
+    defer inferred.deinit();
+    try std.testing.expectEqual(default_nnue_scale_percent, inferred.nnueScalePercent());
 }
 
 test "net ownership accepts const borrowers and separates destruction handles" {

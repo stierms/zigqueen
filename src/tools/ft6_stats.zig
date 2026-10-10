@@ -3,13 +3,12 @@
 //! counts are deterministic and contention-immune; wall-clock belongs to the
 //! dummy-net speed rehearsal on a quiet box.
 //!
-//! Walks legal-move trees over a mixed-phase FEN set maintaining the full-
-//! threats bitsets via applyMoveDelta (flip crossings -> refresh, counted
-//! separately), and per move records:
-//!   full  : toggled full-threat features (both perspectives, = row add/subs)
+//! Walks legal-move trees over a mixed-phase FEN set, generating each move's
+//! full-threats delta with fullthreats.emitMoveDelta (flip crossings ->
+//! refresh, counted separately), and per move records:
+//!   full  : changed full-threat features (both perspectives, = row add/subs)
 //!   lean  : lean-threats churn on the same move (XOR of fresh enumerations)
 //!           -- the shipped v5.8.x cost anchor
-//!   groups: affected (square, colored-type) groups recomputed
 //! Usage: zigqueen ft6_stats [depth]
 
 const std = @import("std");
@@ -38,20 +37,27 @@ const FENS = [_][]const u8{
 const MAX_SAMPLES = 400_000;
 var g_full: [MAX_SAMPLES]u32 = undefined;
 var g_lean: [MAX_SAMPLES]u32 = undefined;
-var g_groups: [MAX_SAMPLES]u32 = undefined;
 
 const Ctx = struct {
     n: usize = 0,
     refreshes: u32 = 0,
-    overflow_max: u32 = 0,
 
-    fn record(self: *Ctx, full_toggles: u32, lean_toggles: u32, groups: u32) void {
+    fn record(self: *Ctx, full_toggles: u32, lean_toggles: u32) void {
         if (self.n >= MAX_SAMPLES) return;
         g_full[self.n] = full_toggles;
         g_lean[self.n] = lean_toggles;
-        g_groups[self.n] = groups;
         self.n += 1;
-        if (full_toggles > self.overflow_max) self.overflow_max = full_toggles;
+    }
+};
+
+/// emitMoveDelta sink that only counts the changed features.
+const CountSink = struct {
+    n: u32 = 0,
+    pub fn emit(self: *CountSink, comptime black: bool, comptime add: bool, idx: usize) void {
+        _ = black;
+        _ = add;
+        _ = idx;
+        self.n += 1;
     }
 };
 
@@ -63,8 +69,6 @@ fn xorPop(a: *const threats.PerspBits, b: *const threats.PerspBits) u32 {
 
 fn walk(
     pos: *position.Position,
-    wbits: *fullthreats.PerspBits,
-    bbits: *fullthreats.PerspBits,
     lw: *const threats.PerspBits,
     lb: *const threats.PerspBits,
     depth: u8,
@@ -89,12 +93,7 @@ fn walk(
         const post_flips = fullthreats.kingFlips(pos);
         if (post_flips.w != pre_flips.w or post_flips.b != pre_flips.b) {
             ctx.refreshes += 1;
-            const save_w = wbits.*;
-            const save_b = bbits.*;
-            fullthreats.enumerateColors(pos, wbits, bbits);
-            walk(pos, wbits, bbits, &clw, &clb, depth - 1, ctx);
-            wbits.* = save_w;
-            bbits.* = save_b;
+            walk(pos, &clw, &clb, depth - 1, ctx);
         } else {
             var changes: [4]fullthreats.SquareChange = undefined;
             var nc: usize = 0;
@@ -104,12 +103,10 @@ fn walk(
                     nc += 1;
                 }
             }
-            var d = fullthreats.Delta{};
-            const ok = fullthreats.applyMoveDelta(pos, changes[0..nc], wbits, bbits, &d);
-            std.debug.assert(ok);
-            ctx.record(d.n, lean_toggles, d.groups);
-            walk(pos, wbits, bbits, &clw, &clb, depth - 1, ctx);
-            fullthreats.undoDelta(wbits, bbits, &d);
+            var sink = CountSink{};
+            fullthreats.emitMoveDelta(pos, changes[0..nc], &sink);
+            ctx.record(sink.n, lean_toggles);
+            walk(pos, &clw, &clb, depth - 1, ctx);
         }
         make_unmake.unmakeMove(pos, mv, &st);
     }
@@ -121,43 +118,36 @@ fn pct(sorted: []const u32, p: usize) u32 {
 }
 
 pub fn run(stdout: anytype, depth: u8) !void {
+    // Depth 0 walks no move, and the statistics below need at least one sample.
+    if (depth == 0) return error.InvalidDepth;
     var ctx = Ctx{};
     for (FENS) |f| {
         var pos = fen.parse(f) catch continue;
-        var wbits: fullthreats.PerspBits = undefined;
-        var bbits: fullthreats.PerspBits = undefined;
-        fullthreats.enumerateColors(&pos, &wbits, &bbits);
         var lw: threats.PerspBits = undefined;
         var lb: threats.PerspBits = undefined;
         threats.enumerateColors(&pos, &lw, &lb);
         const before = ctx.n;
-        walk(&pos, &wbits, &bbits, &lw, &lb, depth, &ctx);
+        walk(&pos, &lw, &lb, depth, &ctx);
         try stdout.print("fen[{d} moves] {s}\n", .{ ctx.n - before, f });
     }
 
     const n = ctx.n;
     var sum_full: u64 = 0;
     var sum_lean: u64 = 0;
-    var sum_groups: u64 = 0;
     for (0..n) |i| {
         sum_full += g_full[i];
         sum_lean += g_lean[i];
-        sum_groups += g_groups[i];
     }
     std.mem.sort(u32, g_full[0..n], {}, std.sort.asc(u32));
     std.mem.sort(u32, g_lean[0..n], {}, std.sort.asc(u32));
-    std.mem.sort(u32, g_groups[0..n], {}, std.sort.asc(u32));
 
     const mf = @as(f64, @floatFromInt(sum_full)) / @as(f64, @floatFromInt(n));
     const ml = @as(f64, @floatFromInt(sum_lean)) / @as(f64, @floatFromInt(n));
-    const mg = @as(f64, @floatFromInt(sum_groups)) / @as(f64, @floatFromInt(n));
     try stdout.print(
         "\nmoves sampled: {d}   flip-refreshes: {d}\n" ++
             "full toggles/move : mean {d:.2}  p50 {d}  p95 {d}  p99 {d}  max {d}\n" ++
             "lean toggles/move : mean {d:.2}  p50 {d}  p95 {d}  p99 {d}  max {d}\n" ++
-            "churn ratio (full/lean means): {d:.2}\n" ++
-            "groups recomputed : mean {d:.2}  p50 {d}  p95 {d}  max {d}\n" ++
-            "undo-log headroom : observed max {d} of {d} cap\n",
+            "churn ratio (full/lean means): {d:.2}\n",
         .{
             n,                             ctx.refreshes,
             mf,                            pct(g_full[0..n], 50),
@@ -165,10 +155,7 @@ pub fn run(stdout: anytype, depth: u8) !void {
             g_full[n - 1],                 ml,
             pct(g_lean[0..n], 50),         pct(g_lean[0..n], 95),
             pct(g_lean[0..n], 99),         g_lean[n - 1],
-            mf / ml,                       mg,
-            pct(g_groups[0..n], 50),       pct(g_groups[0..n], 95),
-            g_groups[n - 1],               ctx.overflow_max,
-            fullthreats.Delta.MAX_TOGGLES,
+            mf / ml,
         },
     );
 }

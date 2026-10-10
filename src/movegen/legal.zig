@@ -57,8 +57,22 @@ pub fn generate(pos: *const position.Position, list: *move_mod.MoveList) void {
 /// `isInCheck(pos, pos.side_to_move)` when non-null — the context then skips
 /// recomputing the same attack query. Behavior-identical either way.
 pub fn generateHinted(pos: *const position.Position, list: *move_mod.MoveList, known_in_check: ?bool) void {
-    // FUSED fast path (perf-r8). When there is no en-passant square and no
-    // castling rights left, the legality context alone decides everything, and
+    // IN-CHECK path (perf push 2026-10-08): with the side to move known to be
+    // in check (a true hint implies a king on the board), generate only the
+    // candidates that can resolve the check (pseudo.generateEvasionCandidates)
+    // and run the same full filter over them. The masked-out moves are exactly
+    // moves that filter rejects, so the list is identical; the full per-move
+    // attack query of the ~30 rejected moves and their generation disappear.
+    if (known_in_check orelse false) {
+        var ctx: LegalityContext = undefined;
+        initLegalityContext(pos, true, &ctx);
+        pseudo.generateEvasionCandidates(pos, list, evasionTargets(&ctx));
+        filterGeneral(pos, list, &ctx, false);
+        return;
+    }
+    // FUSED fast path (perf-r8). When no mover pawn can capture en passant and
+    // the mover has no castling right left (canFuseLegality), the legality
+    // context alone decides everything, and
     // if additionally nothing is pinned and we are not in check the only
     // illegal pseudo-legal moves are king steps onto attacked squares. Handing
     // the two masks to the generator deletes those at the source, so the whole
@@ -88,13 +102,66 @@ pub fn generateHinted(pos: *const position.Position, list: *move_mod.MoveList, k
     filterGeneral(pos, list, &ctx, false);
 }
 
+/// The squares a NON-KING, non-en-passant move must land on to possibly
+/// resolve a check against `ctx.king_square`: with exactly one checker C, C
+/// itself plus the squares strictly between C and the king (empty for a pawn,
+/// knight or adjacent checker); with two or more checkers, none. Exact as a
+/// rejection mask: a move landing elsewhere does not capture C (en passant is
+/// excluded by the caller), does not fill a square of C's open line to the
+/// king, and vacating its origin can only open lines, so C still attacks the
+/// king and the legality filter rejects the move; under double check one
+/// arrival square can neither capture nor block both checkers (two lines
+/// through the king meet only at the king). The opponent king is counted as a
+/// checker so that an illegal adjacent-kings input keeps a non-empty set, and
+/// no checker at all (impossible with a correct hint) masks nothing.
+fn evasionTargets(ctx: *const LegalityContext) bitboard.Bitboard {
+    const king = ctx.king_square;
+    const king_index = king.index();
+    const occupied = ctx.occupied;
+    const checkers = (attacks.pawnAttacksFromDirect(ctx.side, king) & ctx.opponent_pawns) |
+        (attacks.knightAttacksDirect(king) & ctx.opponent_knights) |
+        (attacks.kingAttacksDirect(king) & ctx.opponent_king) |
+        (attacks.bishopAttacksDirect(king, occupied) & (ctx.opponent_bishops | ctx.opponent_queens)) |
+        (attacks.rookAttacksDirect(king, occupied) & (ctx.opponent_rooks | ctx.opponent_queens));
+    if (checkers == 0) return ~@as(bitboard.Bitboard, 0);
+    if ((checkers & (checkers - 1)) != 0) return 0;
+    const checker_index = @as(usize, @ctz(checkers));
+    // The ray from the king that contains the checker, cut after the checker:
+    // the between squares plus the checker (no ray contains a knight checker).
+    var line: bitboard.Bitboard = 0;
+    inline for (0..8) |direction| {
+        const ray = PIN_RAYS[king_index][direction];
+        if ((ray & checkers) != 0) line = ray & ~PIN_RAYS[checker_index][direction];
+    }
+    return checkers | line;
+}
+
 /// True when `initLegalityContext` may be built BEFORE generating: it needs a
 /// king on the board (it unwraps `kingSquare`), and the fused generator only
-/// covers positions with no en-passant square and no castling rights.
+/// covers positions in which no en passant and no castling move can be
+/// generated. That depends on the MOVER alone (perf push 2026-10-08; the
+/// test was "no en-passant square and no castling right at all"): the castling
+/// generator needs one of the mover's own rights, and the en passant clause
+/// needs a mover pawn attacking the square. The opponent's rights and an
+/// en-passant square no mover pawn attacks emit nothing, so for those
+/// positions the fused list equals generate-then-filter exactly as before.
 inline fn canFuseLegality(pos: *const position.Position) bool {
-    return pos.en_passant == null and
-        !pos.castling_rights.hasAny() and
-        pos.kingSquare(pos.side_to_move) != null;
+    const side = pos.side_to_move;
+    const rights: u4 = @bitCast(pos.castling_rights);
+    const mover_rights: u4 = if (side == .white) 0b0011 else 0b1100;
+    return (rights & mover_rights) == 0 and
+        !enPassantCapturable(pos) and
+        pos.kingSquare(side) != null;
+}
+
+/// True when the en-passant square exists AND a pawn of the side to move
+/// attacks it, i.e. exactly when the generators emit an en passant move (the
+/// squares from which a mover pawn attacks `ep` are the squares an opponent
+/// pawn on `ep` would attack).
+inline fn enPassantCapturable(pos: *const position.Position) bool {
+    const ep = pos.en_passant orelse return false;
+    const side = pos.side_to_move;
+    return (attacks.pawnAttacksFrom(side.other(), ep) & pos.pieceBitboard(side, .pawn)) != 0;
 }
 
 /// The fully general legality filter: in check, or pinned pieces present, or
@@ -149,7 +216,9 @@ pub fn generateCapturesAndPromotionsHinted(pos: *const position.Position, list: 
     var ctx: LegalityContext = undefined;
     initLegalityContext(pos, known_in_check, &ctx);
     if (!ctx.in_check and ctx.pinned == 0) {
-        if (pos.en_passant == null) {
+        // An en-passant square no mover pawn attacks yields no en passant
+        // move, so the no-special filter is exact for it too.
+        if (!enPassantCapturable(pos)) {
             filterGeneratedNoPinsNoSpecial(pos, list, &ctx, true);
         } else {
             filterGeneratedNoPins(pos, list, &ctx, true);
@@ -159,7 +228,8 @@ pub fn generateCapturesAndPromotionsHinted(pos: *const position.Position, list: 
     filterGeneral(pos, list, &ctx, true);
 }
 
-/// No ep, no castling, no pins, not in check: the ONLY moves that can be
+/// No mover-capturable en passant, no mover castling right, no pins, not in
+/// check (canFuseLegality and the caller): the ONLY moves that can be
 /// illegal are king steps into an attacked square. Batch those: build the
 /// opponent's attack map (with our king removed from occupancy, once, LAZILY)
 /// and test each king destination with one AND. Exact: occupancy AT a
@@ -351,11 +421,11 @@ pub const CheckInfo = struct {
     ready: bool = false,
     has_king: bool = false,
     enemy_king: square.Square = .a1,
-    pawn: bitboard.Bitboard = 0,
-    knight: bitboard.Bitboard = 0,
-    bishop: bitboard.Bitboard = 0,
-    rook: bitboard.Bitboard = 0,
-    queen: bitboard.Bitboard = 0,
+    /// Squares from which a mover of each piece type gives direct check, indexed
+    /// by `piece.PieceType` (pawn, knight, bishop, rook, queen, then 0 for the
+    /// king and the unused codes): one load instead of a type switch, whose
+    /// jump table mispredicted 61% of the time (IBS, Zen 3).
+    direct: [8]bitboard.Bitboard = [_]bitboard.Bitboard{0} ** 8,
     blockers: bitboard.Bitboard = 0,
 
     pub fn init(pos: *const position.Position) CheckInfo {
@@ -368,13 +438,18 @@ pub const CheckInfo = struct {
             .ready = true,
             .has_king = true,
             .enemy_king = enemy_king,
-            // Squares from which a MOVER pawn attacks the king = the squares an
-            // opponent-coloured pawn standing on the king square would attack.
-            .pawn = attacks.pawnAttacksFrom(side.other(), enemy_king),
-            .knight = attacks.knightAttacksFrom(enemy_king),
-            .bishop = bishop_attacks,
-            .rook = rook_attacks,
-            .queen = bishop_attacks | rook_attacks,
+            .direct = .{
+                // Squares from which a MOVER pawn attacks the king = the squares an
+                // opponent-coloured pawn standing on the king square would attack.
+                attacks.pawnAttacksFrom(side.other(), enemy_king),
+                attacks.knightAttacksFrom(enemy_king),
+                bishop_attacks,
+                rook_attacks,
+                bishop_attacks | rook_attacks,
+                0, // king
+                0, // none
+                0,
+            },
             .blockers = computePinnedPieces(
                 occupied,
                 pos.occupancyFor(side),
@@ -387,7 +462,7 @@ pub const CheckInfo = struct {
 
     /// Lazily builds the context on first use, then answers from it. (A
     /// variant that deferred the two slider lookups behind an empty-board ray
-    /// test measured −0.2% on oldrig against this eager form's +1.5%: the
+    /// test measured −0.2% on Zen 3 against this eager form's +1.5%: the
     /// extra per-query branches cost more than the lookups they skipped.)
     pub inline fn ensure(self: *CheckInfo, pos: *const position.Position) void {
         if (!self.ready) self.* = init(pos);
@@ -397,15 +472,9 @@ pub const CheckInfo = struct {
         switch (mv.flag) {
             .quiet, .double_push, .capture => {
                 if (!self.has_king) return false;
-                const direct_squares = switch (pos.pieceAt(mv.from).pieceType()) {
-                    .pawn => self.pawn,
-                    .knight => self.knight,
-                    .bishop => self.bishop,
-                    .rook => self.rook,
-                    .queen => self.queen,
-                    .king => 0,
-                    .none => unreachable,
-                };
+                const moving_type = pos.pieceAt(mv.from).pieceType();
+                std.debug.assert(moving_type != .none);
+                const direct_squares = self.direct[@intFromEnum(moving_type)];
                 if ((direct_squares & bitboard.bit(mv.to)) != 0) return true;
                 if ((self.blockers & bitboard.bit(mv.from)) == 0) return false;
                 return !isCollinear(self.enemy_king, mv.from, mv.to);
@@ -1374,5 +1443,145 @@ test "fast legality matches the generators across a 2-ply walk of rich positions
     for (fens) |fen_text| {
         var pos = try fen.parse(fen_text);
         try walkFastLegality(&pos, 2);
+    }
+}
+
+/// The in-check path of `generateHinted` (true hint) against the
+/// make/isInCheck reference generator and the unhinted generator: identical
+/// content AND order at every in-check node.
+fn expectEvasionGenerationMatches(pos: *position.Position) !void {
+    if (!isInCheck(pos, pos.side_to_move)) return;
+    var hinted = move_mod.MoveList.init();
+    generateHinted(pos, &hinted, true);
+    var reference = move_mod.MoveList.init();
+    generateReference(pos, &reference);
+    var unhinted = move_mod.MoveList.init();
+    generate(pos, &unhinted);
+    try std.testing.expectEqual(reference.count, hinted.count);
+    try std.testing.expectEqual(reference.count, unhinted.count);
+    for (reference.slice(), 0..) |mv, idx| {
+        try std.testing.expectEqual(mv, hinted.slice()[idx]);
+        try std.testing.expectEqual(mv, unhinted.slice()[idx]);
+    }
+}
+
+fn walkEvasionGeneration(pos: *position.Position, depth: usize, checked: *usize) !void {
+    if (isInCheck(pos, pos.side_to_move)) {
+        try expectEvasionGenerationMatches(pos);
+        checked.* += 1;
+    }
+    if (depth == 0) return;
+    var list = move_mod.MoveList.init();
+    generate(pos, &list);
+    for (list.slice()) |mv| {
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(pos, mv, &state);
+        try walkEvasionGeneration(pos, depth - 1, checked);
+        make_unmake.unmakeMove(pos, mv, &state);
+    }
+}
+
+test "in-check hinted generation matches the reference generator in content and order" {
+    const fen = @import("../core/fen.zig");
+    // Direct in-check cases: en passant capturing the checking pawn, block by a
+    // single and a double push, block and capture by promotion, double check,
+    // knight and pawn checkers, a pinned would-be blocker.
+    const direct = [_][]const u8{
+        "8/8/8/2k5/3Pp3/8/8/4K3 b - d3 0 1",
+        "4k3/8/8/b7/8/8/1PP5/4K3 w - - 0 1",
+        "K1r4k/1P6/8/8/8/8/8/8 w - - 0 1",
+        "3k4/8/5B2/8/8/8/8/3RK3 b - - 0 1",
+        "k7/8/1N6/8/8/8/8/K7 b - - 0 1",
+        "8/8/8/4k3/3P4/8/8/4K3 b - - 0 1",
+        "4k3/8/8/8/1b6/8/3N4/4K2r w - - 0 1",
+        "4r1k1/8/8/8/8/8/3B4/4K3 w - - 0 1",
+        "4k3/8/8/8/7b/8/8/4K3 w - - 0 1",
+    };
+    var checked: usize = 0;
+    for (direct) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        try std.testing.expect(isInCheck(&pos, pos.side_to_move));
+        try expectEvasionGenerationMatches(&pos);
+        checked += 1;
+    }
+    const walks = [_][]const u8{
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    };
+    for (walks) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        try walkEvasionGeneration(&pos, 3, &checked);
+    }
+    try std.testing.expect(checked > 1000);
+}
+
+fn expectGenerationMatchesReference(pos: *position.Position) !void {
+    var reference = move_mod.MoveList.init();
+    generateReference(pos, &reference);
+    var unhinted = move_mod.MoveList.init();
+    generate(pos, &unhinted);
+    var hinted = move_mod.MoveList.init();
+    generateHinted(pos, &hinted, isInCheck(pos, pos.side_to_move));
+    try std.testing.expectEqual(reference.count, unhinted.count);
+    try std.testing.expectEqual(reference.count, hinted.count);
+    for (reference.slice(), 0..) |mv, idx| {
+        try std.testing.expectEqual(mv, unhinted.slice()[idx]);
+        try std.testing.expectEqual(mv, hinted.slice()[idx]);
+    }
+    // The tactical generator against the filtered full legal list.
+    var tactical = move_mod.MoveList.init();
+    generateCapturesAndPromotionsHinted(pos, &tactical, isInCheck(pos, pos.side_to_move));
+    if (!isInCheck(pos, pos.side_to_move)) {
+        var expected = move_mod.MoveList.init();
+        for (reference.slice()) |mv| {
+            if (mv.isCapture() or mv.isPromotion()) expected.add(mv);
+        }
+        try std.testing.expectEqual(expected.count, tactical.count);
+        for (expected.slice(), 0..) |mv, idx| try std.testing.expectEqual(mv, tactical.slice()[idx]);
+    }
+}
+
+fn walkGenerationReference(pos: *position.Position, depth: usize) !void {
+    try expectGenerationMatchesReference(pos);
+    if (depth == 0) return;
+    var list = move_mod.MoveList.init();
+    generate(pos, &list);
+    for (list.slice()) |mv| {
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(pos, mv, &state);
+        try walkGenerationReference(pos, depth - 1);
+        make_unmake.unmakeMove(pos, mv, &state);
+    }
+}
+
+test "fused generation with opponent-only castling rights or an uncapturable en-passant square matches the reference" {
+    const fen = @import("../core/fen.zig");
+    const fens = [_][]const u8{
+        // Mover without rights, opponent with rights (both colours).
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R4RK1 w kq - 0 1",
+        "r4rk1/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQ - 0 1",
+        // En-passant square no mover pawn attacks, and one that is attacked.
+        "4k3/8/8/3p4/8/8/8/4K3 w - d6 0 1",
+        "4k3/8/8/2Pp4/8/8/8/4K3 w - d6 0 1",
+        "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
+        // Pins with opponent-only rights (fused context, general filter).
+        "r3k2r/8/8/8/1b6/8/3N4/4K3 w kq - 0 1",
+    };
+    for (fens) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        try expectGenerationMatchesReference(&pos);
+    }
+    const walks = [_][]const u8{
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    };
+    for (walks) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        try walkGenerationReference(&pos, 3);
     }
 }

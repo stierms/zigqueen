@@ -27,9 +27,12 @@
 //!     nonzero clock -- so probing the position as-is silently answers "unknown"
 //!     for almost everything. The probe is therefore issued on a clock-zeroed
 //!     copy, which is what WDL tables actually model.
-//!   * That makes the verdict rule-50-blind, so positions with halfmove_clock
-//!     >= `hmc_cutoff` (default 90) are NOT used as evidence: near the 50-move
-//!     boundary a WDL "win" may genuinely be a draw. A game whose only
+//!   * That makes the verdict rule-50-blind: the label written is the
+//!     reset-clock tablebase value, not the value under the game's real clock.
+//!     Positions with halfmove_clock >= `hmc_cutoff` (default 90) are NOT used
+//!     as evidence, which drops the slice nearest the 50-move boundary; it does
+//!     not certify the rest, where a WDL "win" is still a draw whenever the
+//!     zeroing move is further away than the plies left. A game whose only
 //!     tablebase-decided positions sit above the cutoff keeps its original
 //!     result. The skipped fraction is reported.
 //!
@@ -201,8 +204,11 @@ const Ctx = struct {
                 self.had_above = true;
             } else {
                 // WDL tables model a fresh rule-50 counter; probeWdl refuses a
-                // nonzero clock, so probe a clock-zeroed copy. The cutoff above
-                // is what keeps that sound.
+                // nonzero clock, so probe a clock-zeroed copy. The verdict is
+                // the reset-clock value: the cutoff above only drops the clocks
+                // nearest the boundary and does not make it rule-50 exact.
+                // 8/8/8/4k3/8/8/8/K6Q w - - 89 80 is a WDL win with DTZ 17,
+                // and 89 + 17 > 100.
                 var p = info.pos;
                 p.halfmove_clock = 0;
                 if (syzygy.probeWdl(&p)) |wdl| {
@@ -317,6 +323,7 @@ pub fn run(
     threads: u32,
 ) !void {
     @import("../search/startup.zig").ensure();
+    if (threads == 0) return error.InvalidThreadCount;
     const allocator = std.heap.page_allocator;
     const tb_pathz = try allocator.dupeZ(u8, opts.tb_path);
     defer allocator.free(tb_pathz);
@@ -339,11 +346,16 @@ pub fn run(
     const handles = try allocator.alloc(std.Thread, threads);
     defer allocator.free(handles);
     var spawned: usize = 0;
+    var spawn_err: ?anyerror = null;
     for (handles) |*h| {
-        h.* = std.Thread.spawn(.{}, worker, .{&shared}) catch break;
+        h.* = std.Thread.spawn(.{}, worker, .{&shared}) catch |err| {
+            spawn_err = err;
+            break;
+        };
         spawned += 1;
     }
     for (handles[0..spawned]) |h| h.join();
+    if (spawn_err) |err| return err;
     if (shared.failed.load(.acquire)) return error.BackfillWorkerFailed;
 
     const st = shared.stats;

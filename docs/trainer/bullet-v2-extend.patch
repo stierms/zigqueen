@@ -1,0 +1,423 @@
+diff --git a/examples/zq_v2.rs b/examples/zq_v2.rs
+index d774c0ebad1faef2bcbd2863660d0d73c3b9107b..d81e51fe78f152a9219837758e4c42bfefd52042 100644
+--- a/examples/zq_v2.rs
++++ b/examples/zq_v2.rs
+@@ -1151,6 +1151,409 @@ fn features(args: &BTreeMap<String, String>) {
+     println!("v2_features\t{VARIANT}\t{}", fens.lines().count());
+ }
+ 
++// ---------------------------------------------------------------- lane E (2026-10-08): continuation
++//
++// `extend --config E.tsv --output NEW [--resume CP] [--max-sb N]`: continue a sealed v2 checkpoint
++// (its weights and Adam moments; float or split layout) with B1's deployed-arithmetic graph
++// (`graph qat`) or the float graph, for `total_sb` superbatches at a cosine LR from `lr_start` to
++// `lr_end`. Data: passes over a lane-index stream prefix; pass p (0-based) covers local SB
++// p*pass_sb+1 .. (p+1)*pass_sb and reads stream records from 0 with seed seeds[p], so a cache
++// holding only the prefix windows suffices. `master_range` (qat only): AdamW clamp of the i8 threat
++// and pawn masters to +-r (r*255 < 126.5), so no deployed weight sits on the +-127 clamp where the
++// straight-through derivative is zero. Raw endpoint only (no averaging). Every SB is a fresh
++// local number 1..total_sb; checkpoints are this mode's own (schema zq_v2_ext_checkpoint_v1).
++// `heldout --named W.bin --graph float|qat --records R.bin --label L --output NEW`: held-out MSE
++// of any masters (float or split layout) under either graph on any 32-byte record file.
++
++const EXT_SCHEMA: &str = "zq_v2_ext_v1";
++const EXT_CHECKPOINT_SCHEMA: &str = "zq_v2_ext_checkpoint_v1";
++const EXT_KEYS: [&str; 21] = [
++    "schema", "from", "from_checksums_sha256", "source_index", "source_index_sha256", "seeds", "pass_sb", "total_sb",
++    "lr_start", "lr_end", "graph", "master_range", "batches_per_sb", "shuffle_records", "threads",
++    "checkpoint_every_sb", "keep_every_sb", "validation_records", "validation_records_sha256", "runtime_cap_seconds",
++    "min_free_disk_bytes",
++];
++
++fn fnum(cfg: &BTreeMap<String, String>, k: &str) -> f64 {
++    key(cfg, k).parse().unwrap_or_else(|_| panic!("config {k} not a number"))
++}
++
++fn ext_seeds(cfg: &BTreeMap<String, String>) -> Vec<u64> {
++    key(cfg, "seeds").split(',').map(|s| s.parse().expect("seed")).collect()
++}
++
++fn ext_validate(cfg: &BTreeMap<String, String>) {
++    let mut want = EXT_KEYS.to_vec();
++    want.sort();
++    let keys: Vec<&str> = cfg.keys().map(String::as_str).collect();
++    assert_eq!(keys, want, "extend config keys");
++    assert_eq!(key(cfg, "schema"), EXT_SCHEMA);
++    let graph = key(cfg, "graph");
++    assert!(["qat", "float"].contains(&graph), "graph");
++    let (total, pass, bps) = (num(cfg, "total_sb"), num(cfg, "pass_sb"), num(cfg, "batches_per_sb"));
++    assert!(total >= 1 && pass >= 1 && bps >= 1);
++    assert_eq!(ext_seeds(cfg).len(), total.div_ceil(pass), "one seed per pass");
++    assert!((1..=8).contains(&num(cfg, "threads")));
++    assert!(num(cfg, "checkpoint_every_sb") >= 1 && num(cfg, "keep_every_sb") >= 1);
++    let (a, b) = (fnum(cfg, "lr_start"), fnum(cfg, "lr_end"));
++    assert!(a > 0.0 && b > 0.0 && a <= 1e-3 && b <= a, "lr range");
++    let r = key(cfg, "master_range");
++    if r != "none" {
++        assert_eq!(graph, "qat", "master_range needs the split graph");
++        let r: f64 = r.parse().unwrap();
++        assert!(r > 0.0 && r * 255.0 < 126.5, "master_range must keep the deployed value below 127");
++    }
++    for name in ["source_index", "validation_records"] {
++        check_hash(cfg, name);
++    }
++    lane_index_check(key(cfg, "source_index"), FROZEN_INDEX);
++}
++
++fn ext_lr(cfg: &BTreeMap<String, String>, sb: usize) -> f32 {
++    let (a, b, n) = (fnum(cfg, "lr_start"), fnum(cfg, "lr_end"), num(cfg, "total_sb"));
++    assert!(sb >= 1 && sb <= n);
++    if n == 1 {
++        return b as f32;
++    }
++    let p = (sb - 1) as f64 / (n - 1) as f64;
++    (b + (a - b) * 0.5 * (1.0 + (std::f64::consts::PI * p).cos())) as f32
++}
++
++/// The lane stream of one pass: global record position `base` is stream record 0 of `seed`.
++#[derive(Clone)]
++struct ExtStream {
++    manifest: String,
++    paths: Vec<String>,
++    seed: u64,
++    shuffle: usize,
++    batch: usize,
++    sb_records: usize,
++    base: usize,
++    end_position: usize,
++    digest_log: PathBuf,
++}
++impl bullet_lib::value::loader::DataLoader<bulletformat::ChessBoard> for ExtStream {
++    fn data_file_paths(&self) -> &[String] {
++        &self.paths
++    }
++    fn map_chunks<F: FnMut(&[bulletformat::ChessBoard]) -> bool>(&self, start_position: usize, mut f: F) {
++        assert!(start_position % self.sb_records == 0 && start_position >= self.base && start_position < self.end_position);
++        let local = start_position - self.base;
++        let mut stream = PrefetchStream::open(&self.manifest, self.seed, self.shuffle, local as u64).unwrap();
++        assert_eq!(stream.decode_workers(), DECODE_WORKERS, "frozen source decoder concurrency changed");
++        let mut log = OpenOptions::new().append(true).open(&self.digest_log).unwrap();
++        let mut hasher = Sha256::new();
++        let mut buffer = Vec::with_capacity(self.batch * 32);
++        let mut position = start_position;
++        loop {
++            let rows = stream.next_batch(self.batch).expect("BT4 source loader failed");
++            assert_eq!(rows.len(), self.batch, "incomplete batch");
++            buffer.clear();
++            for row in &rows {
++                canonical(row, &mut buffer);
++            }
++            hasher.update(&buffer);
++            position += rows.len();
++            if position % self.sb_records == 0 {
++                let sb = position / self.sb_records;
++                let start = position - self.sb_records - self.base;
++                let digest = format!("{:x}", hasher.finalize_reset());
++                writeln!(log, "{sb}\t{}\t{start}\t{digest}", self.seed).unwrap();
++                log.sync_data().unwrap();
++            }
++            let stop = f(&rows);
++            assert_eq!(stop, position == self.end_position, "unexpected data stop");
++            if stop {
++                break;
++            }
++        }
++    }
++}
++
++fn ext_build(cfg: &BTreeMap<String, String>) -> (Trainer, Graph) {
++    let graph = if key(cfg, "graph") == "qat" { Graph::Split { qat: true } } else { Graph::Float };
++    let mut t = build(graph);
++    let r = key(cfg, "master_range");
++    if r != "none" {
++        let r: f32 = r.parse().unwrap();
++        let range = AdamWParams { max_weight: r, min_weight: -r, ..Default::default() };
++        t.optimiser.set_params_for_weight("threat", range);
++        t.optimiser.set_params_for_weight("pawn", range);
++    }
++    (t, graph)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn ext_segment(
++    cfg: &BTreeMap<String, String>,
++    config_sha: &str,
++    output: &Path,
++    trainer: &mut Trainer,
++    graph: Graph,
++    pass: usize,
++    first: usize,
++    last: usize,
++    progress: &mut File,
++    published: &mut Vec<PathBuf>,
++    started: Instant,
++    prior_runtime: f64,
++) {
++    let bps = num(cfg, "batches_per_sb");
++    let sb_records = BATCH * bps;
++    let pass_sb = num(cfg, "pass_sb");
++    let seed = ext_seeds(cfg)[pass];
++    let base = pass * pass_sb * sb_records;
++    let shapes = model_shapes(trainer);
++    let cap = fnum(cfg, "runtime_cap_seconds");
++    let min_free = key(cfg, "min_free_disk_bytes").parse::<u64>().unwrap();
++    let every = num(cfg, "checkpoint_every_sb");
++    let keep_every = num(cfg, "keep_every_sb");
++    let digest_log = output.join("stream-digests.tsv");
++    let steps = bullet_trainer::run::schedule::TrainingSteps {
++        batch_size: BATCH,
++        batches_per_superbatch: bps,
++        start_superbatch: first,
++        end_superbatch: last,
++    };
++    let stream = ExtStream {
++        manifest: key(cfg, "source_index").to_string(),
++        paths: vec![key(cfg, "source_index").to_string()],
++        seed,
++        shuffle: num(cfg, "shuffle_records"),
++        batch: BATCH,
++        sb_records,
++        base,
++        end_position: last * sb_records,
++        digest_log: digest_log.clone(),
++    };
++    let data = trainer.state.make_dataloader(stream, TARGET_DIVISOR);
++    let data = ValueDataLoader {
++        steps,
++        threads: num(cfg, "threads"),
++        dataloader: data,
++        wdl: bullet_lib::trainer::schedule::wdl::ConstantWDL { value: 0.1 },
++    };
++    let lr_cfg = cfg.clone();
++    let log_cfg = cfg.clone();
++    let train_start = Instant::now();
++    let mut updates = 0usize;
++    println!("v2ext_segment\tpass={pass}\tseed={seed}\tsb={first}..{last}\tgraph={}", graph.name());
++    trainer
++        .train_custom(
++            bullet_trainer::run::schedule::TrainingSchedule {
++                steps,
++                log_rate: 256,
++                lr_schedule: Box::new(move |_, sb| ext_lr(&lr_cfg, sb)),
++            },
++            data,
++            |_, sb, b, loss| {
++                assert!(loss.is_finite(), "KILL: nonfinite loss at sb {sb} batch {b}");
++                updates += 1;
++                if b % 32 == 0 || b == 1 || b == bps {
++                    let bad = nonfinite_updates();
++                    assert!(bad == 0.0, "KILL: {bad} nonfinite AdamW element updates at sb {sb} batch {b}");
++                    let n = ((sb - 1) * bps + b) * BATCH;
++                    let e = train_start.elapsed().as_secs_f64();
++                    writeln!(
++                        progress,
++                        "{sb}\t{b}\t{n}\t{loss:.9e}\t{e:.6}\t{:e}\t{:.3}\t{}",
++                        ext_lr(&log_cfg, sb),
++                        prior_runtime + started.elapsed().as_secs_f64(),
++                        graph.name()
++                    )
++                    .unwrap();
++                    progress.flush().unwrap();
++                }
++            },
++            |t, sb| {
++                let runtime = prior_runtime + started.elapsed().as_secs_f64();
++                let over_cap = runtime > cap;
++                let low_disk = free_disk(output) < min_free;
++                if !(sb % every == 0 || sb == last || over_cap || low_disk) {
++                    return;
++                }
++                let bad = nonfinite_updates();
++                assert!(bad == 0.0, "KILL: {bad} nonfinite AdamW element updates by sb {sb}");
++                let pending = output.join(format!("sb{sb:06}.pending"));
++                std::fs::create_dir(&pending).unwrap();
++                let opt = pending.join("optimiser_state");
++                std::fs::create_dir(&opt).unwrap();
++                t.optimiser.write_to_checkpoint(opt.to_str().unwrap()).unwrap();
++                st::validate_optimizer(&opt, &shapes);
++                bounds(&st::read_tensors(&opt.join("weights.bin")));
++                let local_consumed = sb * sb_records - base;
++                std::fs::write(
++                    pending.join("data-cursor.json"),
++                    PrefetchStream::snapshot_for(key(cfg, "source_index"), seed, num(cfg, "shuffle_records"), local_consumed as u64)
++                        .unwrap(),
++                )
++                .unwrap();
++                let lines: Vec<String> = std::fs::read_to_string(&digest_log)
++                    .unwrap()
++                    .lines()
++                    .filter(|l| l.split('\t').next().unwrap().parse::<usize>().unwrap() <= sb)
++                    .map(str::to_string)
++                    .collect();
++                assert_eq!(lines.len(), sb, "stream digest log incomplete at checkpoint");
++                std::fs::write(pending.join("stream-digests.tsv"), lines.join("\n") + "\n").unwrap();
++                std::fs::copy(output.join("config.tsv"), pending.join("config.tsv")).unwrap();
++                let mut meta = BTreeMap::new();
++                meta.insert("schema".into(), EXT_CHECKPOINT_SCHEMA.into());
++                meta.insert("variant".into(), VARIANT.into());
++                meta.insert("config_sha256".into(), config_sha.to_string());
++                meta.insert("graph".into(), graph.name().into());
++                meta.insert("layout".into(), graph.layout().into());
++                meta.insert("completed_sb".into(), sb.to_string());
++                meta.insert("pass".into(), pass.to_string());
++                meta.insert("pass_seed".into(), seed.to_string());
++                meta.insert("pass_consumed_position".into(), local_consumed.to_string());
++                meta.insert("lr_at_sb".into(), format!("{:e}", ext_lr(cfg, sb)));
++                meta.insert("cumulative_runtime_seconds".into(), format!("{runtime:.3}"));
++                meta.insert("nonfinite_updates".into(), format!("{bad}"));
++                st::write_metadata(&pending.join("state.tsv"), &meta);
++                let finalp = output.join(format!("sb{sb:06}"));
++                st::seal_and_publish(&pending, &finalp);
++                published.push(finalp.clone());
++                // Keep the newest two and every keep_every-th checkpoint (the held-out curve).
++                let len = published.len();
++                for old in published.iter().take(len.saturating_sub(2)) {
++                    let n: usize = old.file_name().unwrap().to_str().unwrap()[2..].parse().unwrap();
++                    if old.exists() && n % keep_every != 0 {
++                        std::fs::remove_dir_all(old).unwrap();
++                    }
++                }
++                println!("v2ext_checkpoint\t{sb}\t{pass}\t{local_consumed}\t{runtime:.1}\t{}", finalp.display());
++                assert!(!over_cap, "STOP: cumulative runtime cap {cap}s reached at sb {sb}; recoverable checkpoint written");
++                assert!(!low_disk, "STOP: free disk below {min_free} at sb {sb}; recoverable checkpoint written");
++            },
++        )
++        .unwrap();
++    assert_eq!(updates, (last + 1 - first) * bps, "early loader termination");
++}
++
++fn extend(args: &BTreeMap<String, String>) {
++    let config_path = key(args, "--config").to_string();
++    let cfg = read_tsv(&config_path);
++    ext_validate(&cfg);
++    let config_sha = st::sha256(Path::new(&config_path));
++    let output = PathBuf::from(key(args, "--output"));
++    std::fs::create_dir(&output).expect("output must be new; use a new directory for every resume");
++    std::fs::copy(&config_path, output.join("config.tsv")).unwrap();
++    let started = Instant::now();
++    let total = num(&cfg, "total_sb");
++    let pass_sb = num(&cfg, "pass_sb");
++    let digest_log = output.join("stream-digests.tsv");
++    File::create(&digest_log).unwrap();
++
++    let (cp, start_sb, prior_runtime, resumed) = if let Some(r) = args.get("--resume").map(PathBuf::from) {
++        st::verify_checkpoint(&r);
++        let state = read_tsv(r.join("state.tsv"));
++        assert_eq!(state["schema"], EXT_CHECKPOINT_SCHEMA);
++        assert_eq!(state["nonfinite_updates"], "0");
++        assert_eq!(state["config_sha256"], config_sha, "resume only this exact extension config");
++        assert_eq!(st::sha256(&r.join("config.tsv")), config_sha, "checkpoint config copy");
++        let done: usize = state["completed_sb"].parse().unwrap();
++        std::fs::copy(r.join("stream-digests.tsv"), &digest_log).unwrap();
++        let runtime: f64 = state["cumulative_runtime_seconds"].parse().unwrap();
++        (r, done + 1, runtime, true)
++    } else {
++        let from = PathBuf::from(key(&cfg, "from"));
++        st::verify_checkpoint(&from);
++        assert_eq!(st::sha256(&from.join("CHECKSUMS.tsv")), key(&cfg, "from_checksums_sha256"), "start checkpoint identity");
++        let state = read_tsv(from.join("state.tsv"));
++        assert_eq!(state["schema"], CHECKPOINT_SCHEMA);
++        assert_eq!(state["variant"], VARIANT);
++        assert_eq!(state["nonfinite_updates"], "0");
++        (from, 1, 0.0, false)
++    };
++    assert!(start_sb <= total, "nothing left to train");
++    let stop_sb = args.get("--max-sb").map_or(total, |x| x.parse().unwrap());
++    assert!(stop_sb >= start_sb && stop_sb <= total);
++    let mut identity = cfg.clone();
++    identity.insert("config_sha256".into(), config_sha.clone());
++    identity.insert("runtime_binary_sha256".into(), st::sha256(&std::env::current_exe().unwrap()));
++    identity.insert("variant".into(), VARIANT.into());
++    identity.insert("start_sb".into(), start_sb.to_string());
++    identity.insert("stop_sb".into(), stop_sb.to_string());
++    identity.insert("resumed_from".into(), cp.display().to_string());
++    st::write_metadata(&output.join("run.tsv"), &identity);
++    let mut progress = OpenOptions::new().create_new(true).write(true).open(output.join("presentations.tsv")).unwrap();
++    writeln!(progress, "sb\tbatch\tconsumed_presentations\tloss\telapsed_seconds\tlr\tcumulative_runtime_seconds\tgraph").unwrap();
++
++    let mut published: Vec<PathBuf> = Vec::new();
++    let mut trainer: Option<Trainer> = None;
++    let mut graph = Graph::Float;
++    let mut sb = start_sb;
++    while sb <= stop_sb {
++        let pass = (sb - 1) / pass_sb;
++        let last = ((pass + 1) * pass_sb).min(stop_sb);
++        drop(trainer.take()); // every segment loads the newest checkpoint into a fresh graph
++        let (mut t, g) = ext_build(&cfg);
++        graph = g;
++        let shapes = model_shapes(&t);
++        let load_from = if sb == start_sb { cp.clone() } else { output.join(format!("sb{:06}", sb - 1)) };
++        load_state(&mut t, &load_from, &shapes, graph.layout(), &output);
++        if sb == 1 && !resumed {
++            evaluate_holdout(&mut t, &cfg, &output, "before");
++        }
++        ext_segment(&cfg, &config_sha, &output, &mut t, graph, pass, sb, last, &mut progress, &mut published, started, prior_runtime);
++        trainer = Some(t);
++        sb = last + 1;
++    }
++    let mut trainer = trainer.expect("at least one segment");
++    progress.sync_all().unwrap();
++    let label = if stop_sb == total { "after".to_string() } else { format!("sb{stop_sb}") };
++    evaluate_holdout(&mut trainer, &cfg, &output, &label);
++    if stop_sb == total {
++        let final_dir = output.join("final.pending");
++        std::fs::create_dir(&final_dir).unwrap();
++        let raw = to_layout(current_values(&trainer, &output), "float");
++        bounds(&raw);
++        st::write_tensors(&final_dir.join("raw-endpoint.weights.bin"), &raw);
++        drop(raw);
++        drop(trainer);
++        let mut exporter = build(Graph::Float);
++        exporter.optimiser.load_weights_from_file(final_dir.join("raw-endpoint.weights.bin").to_str().unwrap()).unwrap();
++        save::save_quantised(&exporter, final_dir.join("quantised.bin").to_str().unwrap()).unwrap();
++        evaluate_holdout(&mut exporter, &cfg, &output, "after-floatgraph");
++        let mut meta = identity.clone();
++        meta.insert("schema".into(), EXT_SCHEMA.into());
++        meta.insert("role".into(), "raw-endpoint.weights.bin: extension endpoint masters (float layout); quantised.bin: its standard export".into());
++        meta.insert("completed_sb".into(), total.to_string());
++        meta.insert("graph".into(), graph.name().into());
++        meta.insert("stream_digests_sha256".into(), st::sha256(&digest_log));
++        meta.insert("cumulative_runtime_seconds".into(), format!("{:.3}", prior_runtime + started.elapsed().as_secs_f64()));
++        st::write_metadata(&final_dir.join("state.tsv"), &meta);
++        st::seal_and_publish(&final_dir, &output.join("final"));
++    }
++    println!("v2ext_complete\t{VARIANT}\t{stop_sb}\t{total}");
++}
++
++fn heldout(args: &BTreeMap<String, String>) {
++    let output = PathBuf::from(key(args, "--output"));
++    std::fs::create_dir(&output).unwrap();
++    let named = key(args, "--named");
++    let qat = match key(args, "--graph") {
++        "float" => false,
++        "qat" => true,
++        g => panic!("graph {g}"),
++    };
++    let mut trainer = if qat { split_trainer(true, false) } else { float_trainer(false) };
++    let values = to_layout(st::read_tensors(Path::new(named)), if qat { "split" } else { "float" });
++    assert_eq!(st::shapes(&values), model_shapes(&trainer));
++    bounds(&values);
++    let file = output.join("masters.weights.bin");
++    st::write_tensors(&file, &values);
++    drop(values);
++    trainer.optimiser.load_weights_from_file(file.to_str().unwrap()).unwrap();
++    std::fs::remove_file(&file).unwrap();
++    let mut cfg = BTreeMap::new();
++    cfg.insert("validation_records".to_string(), key(args, "--records").to_string());
++    cfg.insert("threads".to_string(), "4".to_string());
++    let mse = evaluate_holdout(&mut trainer, &cfg, &output, key(args, "--label"));
++    println!("v2ext_heldout\t{}\t{}\t{}\t{mse:.12e}", key(args, "--label"), key(args, "--graph"), st::sha256(Path::new(named)));
++}
++
+ fn main() {
+     let mut argv = std::env::args().skip(1);
+     let mode = argv.next().expect("mode");
+@@ -1166,6 +1569,8 @@ fn main() {
+         "init" => init(&args),
+         "features" => features(&args),
+         "stream-scan" => stream_scan(&args),
++        "extend" => extend(&args),
++        "heldout" => heldout(&args),
+         "constants" => {
+             println!("variant\t{VARIANT}\nrows\t{ROWS}\ndeployed\t{DEPLOYED}\nhalfka\t{HALFKA}\npawn0\t{PAWN0}");
+             println!("bucket_layout\t{}", BUCKET_LAYOUT.iter().map(usize::to_string).collect::<Vec<_>>().join(","));
