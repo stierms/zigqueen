@@ -1,4 +1,3 @@
-const piece_values = @import("../core/piece_values.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const context_mod = @import("context.zig");
@@ -93,6 +92,10 @@ pub const IterationResult = struct {
     depth: u16 = 0,
     root_hints: RootMoveHints = .{},
     root_order: RootOrderTrace = .{},
+    /// The caller's incumbent (previous iteration's best move) finished its
+    /// search in this pass. Lets an interrupted pass prove a challenger
+    /// against it (TM v2 C1); false when no incumbent was given.
+    incumbent_completed: bool = false,
 };
 
 // Checks extend only at shallow depth (0 = never). Unconditional extension made
@@ -106,9 +109,10 @@ const SINGULAR_CAPTURE_SEE_THRESHOLD: i32 = 96;
 // value concentrates at depth/long TC, and the revival measured exactly that:
 // 0.00 +/- 11.1 @20+0.2, +13.2 +/- 10.3 @60+0.6 (LOS 99.4) vs v4.9.0, with
 // -10.5% nodes at fixed depth; 200-game field veto-check clean (52.0%/3577 vs
-// ref 53.2%/3587, all tiers within noise). Multicut stays enabled but fires at
-// noise level under the narrow singular eligibility (~445/1.5M nodes); widening
-// that eligibility was tested and washed (see the singular-family closure).
+// ref 53.2%/3587, all tiers within noise). Multicut stays enabled; the release
+// build reaches it only from the rule-50 gate clock on (trySingularPlan explains
+// why); widening the singular eligibility was tested and washed (see the
+// singular-family closure).
 const PROBCUT_ENABLED = true;
 const MULTICUT_ENABLED = true;
 const PROBCUT_MIN_DEPTH: u16 = 5;
@@ -158,7 +162,7 @@ pub fn searchDepth(
     pos: *position.Position,
     depth: u16,
 ) IterationResult {
-    return searchDepthWindow(ctx, resources, pos, depth, -qsearch.INF, qsearch.INF, null, null);
+    return searchDepthWindow(ctx, resources, pos, depth, -qsearch.INF, qsearch.INF, null, null, null);
 }
 
 pub fn searchDepthWindow(
@@ -170,6 +174,7 @@ pub fn searchDepthWindow(
     beta_in: types.Score,
     previous_root_hints: ?*const RootMoveHints,
     allowed_root_moves: ?*const move_mod.MoveList,
+    incumbent: ?move_mod.Move,
 ) IterationResult {
     if (pos.halfmove_clock >= 100 or ctx.repetition.isClaimableCurrentRepetition(pos.halfmove_clock)) {
         return .{
@@ -221,6 +226,7 @@ pub fn searchDepthWindow(
     var root_hints = RootMoveHints{};
     const child_entry = ctx.stack.entry(1);
     var root_searched_quiets: usize = 0;
+    var incumbent_completed = false;
 
     var root_picker = ordering.MovePicker.init(&moves, &scores, null);
     for (0..moves.count) |index| {
@@ -287,6 +293,10 @@ pub fn searchDepthWindow(
                 if (!ctx.stopped) ctx.noteLmrVerificationOutcome(index, reduction, score, alpha, beta, root_history_score, true, false);
             }
             if (!ctx.stopped and score > alpha and score < beta) {
+                // TM v2: a full-depth scout already proved this move beats the
+                // finished incumbent; do not let the soft deadline discard its
+                // re-search (no-op outside TM v2).
+                if (incumbent_completed and mv != incumbent) ctx.control.disarmSoft();
                 ctx.notePvsResearch();
                 shallow_arms.setParentLmrReduction(child_entry, reduction);
                 score = -negamax(ctx, resources, pos, depth - 1, -beta, -alpha, 1, true, node_context.NodeContext.fromWindow(-beta, -alpha, false), null, null);
@@ -300,11 +310,20 @@ pub fn searchDepthWindow(
         recordRootOrderSearch(&root_order, mv, score, subtree_nodes);
 
         if (ctx.stopped) break;
+        if (incumbent) |incumbent_move| {
+            if (mv == incumbent_move) {
+                incumbent_completed = true;
+                // TM v2: a failed-low incumbent is unresolved trouble; keep
+                // searching past the soft target (no-op outside TM v2).
+                if (score <= alpha_orig) ctx.control.disarmSoft();
+            }
+        }
         if (score > best_score or (score == 0 and score == best_score and repeats_cycle and !best_repeats_cycle)) {
             best_score = score;
             best_move = mv;
             best_repeats_cycle = repeats_cycle;
         }
+        if (incumbent_completed and best_score > alpha_orig and best_move != incumbent) ctx.control.disarmSoft();
         if (score > alpha) alpha = score;
         if (alpha >= beta) break;
     }
@@ -315,7 +334,7 @@ pub fn searchDepthWindow(
     // the same position with a different (or absent) `searchmoves` set.
     if (!ctx.stopped and allowed_root_moves == null) {
         const score = if (best_move == null) 0 else best_score;
-        tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, @intCast(depth), alpha_orig, beta_in, score, best_move, tt_mod.STATIC_EVAL_NONE, true);
+        tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, @intCast(depth), alpha_orig, beta_in, score, best_move, tt_mod.STATIC_EVAL_NONE, true, 0);
     }
 
     return .{
@@ -324,6 +343,7 @@ pub fn searchDepthWindow(
         .depth = depth,
         .root_hints = root_hints,
         .root_order = root_order,
+        .incumbent_completed = incumbent_completed,
     };
 }
 
@@ -499,6 +519,7 @@ fn negamax(
         node_ctx.pv_node,
         node_ctx.cut_node,
         pos.halfmove_clock,
+        ply,
     );
 
     // Syzygy WDL probe (no-op unless SyzygyPath is set): a table hit is ground
@@ -530,10 +551,13 @@ fn negamax(
     // start its child's TT, RFP-hint and eval-cache misses now, so they overlap this
     // node's static eval and pruning instead of only the make that precedes
     // the child. The key is a prefetch hint only (prefetchKeyAfter).
+    // The hint cluster only when the child can read it: a negamax child (not
+    // the depth-0 qsearch below a depth-1 node, short of a check extension)
+    // searched at a zero window (rfp_hint.zig, pruning.isRfpHintApplicable).
     if (tt_move) |hash_move| {
         const hinted_key = make_unmake.prefetchKeyAfter(pos, hash_move);
         resources.tt.prefetch(hinted_key);
-        resources.rfp_hint.prefetch(hinted_key);
+        if (depth >= 2 and beta - alpha == 1) resources.rfp_hint.prefetch(hinted_key);
         resources.eval_cache.prefetch(hinted_key);
     }
     var outcome_flags = context_mod.StaticSearchOutcomeFlags{};
@@ -658,8 +682,9 @@ fn negamax(
             outcome_flags.rfp_cutoff = true;
             if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, beta, alpha_orig, beta, outcome_flags);
             // The RFP hint keeps beta: a later lookup may raise alpha to the
-            // stored value, so it memoises only what the cutoff claimed.
-            if (excluded_move == null) resources.rfp_hint.store(pos.zobrist_key, @intCast(search_depth), beta);
+            // stored value, so it memoises only what the cutoff claimed. Only
+            // depths the lookup serves are stored (pruning.rfpHintMaxDepth).
+            if (excluded_move == null and search_depth <= pruning.rfpHintMaxDepth()) resources.rfp_hint.store(pos.zobrist_key, @intCast(search_depth), beta);
             const rfp_softness = if (comptime build_options.tuning) basin_config.params.rfp_softness else basin.defaults.rfp_softness;
             return fail_soft.evalCutoff(beta, evaluated, rfp_softness);
         }
@@ -691,6 +716,9 @@ fn negamax(
             reductions.nullMoveReduction(search_depth);
         ctx.noteNullTry();
         make_unmake.makeNullMove(pos, &stack_entry.state);
+        // The pass child and its subtree may only repeat positions reached
+        // after the pass (repetition.History.floor).
+        const saved_repetition_floor = ctx.repetition.pushNullBoundary(pos.zobrist_key);
         // The null child probes the same three tables as a move child; start
         // its misses now, as the move loop does after makeMove.
         resources.tt.prefetch(pos.zobrist_key);
@@ -707,6 +735,7 @@ fn negamax(
         else
             (if (search_depth > reduction + 1) search_depth - 1 - reduction else 0);
         const null_score = -negamax(ctx, resources, pos, null_depth, -beta, -beta + 1, ply + 1, false, null_child_ctx, null, false);
+        ctx.repetition.popNullBoundary(saved_repetition_floor);
         make_unmake.unmakeNullMove(pos, &stack_entry.state);
 
         if (ctx.stopped) return 0;
@@ -735,7 +764,7 @@ fn negamax(
                         if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, beta, alpha_orig, beta, outcome_flags);
                     }
                     const null_value = fail_soft.nullCutoff(beta, null_score);
-                    if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), null_value, null, tt_store.evalToTt(raw_static_eval), node_ttpv);
+                    if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), null_value, null, tt_store.evalToTt(raw_static_eval), node_ttpv, ply);
                     return null_value;
                 }
             } else {
@@ -745,7 +774,7 @@ fn negamax(
                     if (ctx.recordStaticOutcomes()) ctx.noteStaticSearchOutcome(evaluated, beta, alpha_orig, beta, outcome_flags);
                 }
                 const null_value = fail_soft.nullCutoff(beta, null_score);
-                if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), null_value, null, tt_store.evalToTt(raw_static_eval), node_ttpv);
+                if (excluded_move == null) tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), null_value, null, tt_store.evalToTt(raw_static_eval), node_ttpv, ply);
                 return null_value;
             }
         }
@@ -818,7 +847,7 @@ fn negamax(
         if (singular_plan) |plan| {
             if (plan.multicut) |mc_bound| {
                 if (excluded_move == null) {
-                    tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(singularVerificationDepth(search_depth)), mc_bound, tt_move, tt_store.evalToTt(raw_static_eval), node_ttpv);
+                    tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(singularVerificationDepth(search_depth)), mc_bound, tt_move, tt_store.evalToTt(raw_static_eval), node_ttpv, ply);
                 }
                 return mc_bound;
             }
@@ -841,6 +870,8 @@ fn negamax(
     // Per-node gives-check context, built lazily on the first move that asks
     // (legal.CheckInfo): O(1) per move afterwards, exact.
     var check_info = legal.CheckInfo{};
+    // The node's pins for quiet-move SEE, taken on first use.
+    var see_pins: ?see.Pins = null;
     var move_picker = ordering.MovePicker.init(&moves, &scores, &capture_see_scores);
     var index: usize = 0;
     var tt_stage = tt_first_move != null;
@@ -900,13 +931,13 @@ fn negamax(
             // pointer materialises a 128-byte stack copy of the row first (the
             // store-to-load-forwarding defect class HistoryTable.score documents).
             const quiet_row: *const [64]i16 = &resources.history.quietPlane(pos.side_to_move)[history_bucket][@intFromEnum(cont_piece)];
-            break :blk @as(i32, quiet_row[mv.to.index()]) +
+            break :blk @as(i32, quiet_row[@intFromEnum(mv.to)]) +
                 cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
         } else 0;
         const basin_history_score: i32 = if (comptime build_options.tuning or basin.defaults.lmr_noisy_history_coeff != 423) blk: {
             if (is_quiet) break :blk quiet_history_score;
             const noisy_row: *const [64]i16 = &resources.history.quietPlane(pos.side_to_move)[history_bucket][@intFromEnum(cont_piece)];
-            break :blk @as(i32, noisy_row[mv.to.index()]) +
+            break :blk @as(i32, noisy_row[@intFromEnum(mv.to)]) +
                 cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
         } else quiet_history_score;
         const move_order_sample: ?stats_mod.MoveOrderSample = if (ctx.recordMoveOrder()) .{
@@ -1006,8 +1037,10 @@ fn negamax(
             const legacy_see_gate = pruning.seeQuietPruneGate(search_depth, move_index, alpha, beta, in_check);
             if (basin_see_gate or legacy_see_gate) {
                 // The outer SEE fold is max(0, mover_value - reply), so a
-                // quiet move cannot score below minus its material value.
-                const floor = -piece_values.value(cont_piece);
+                // quiet move cannot score below minus its material value, or
+                // minus that and the promotion gain when an enemy pawn can
+                // recapture onto its last rank (see.quietFloor).
+                const floor = see.quietFloor(pos, mv);
                 const basin_threshold = if (basin_see_gate)
                     (if (comptime build_options.tuning) basin_config.params.seePruneThresholdQuiet(basin_lmr_depth) else basin.seePruneThresholdQuiet(basin_lmr_depth))
                 else
@@ -1015,13 +1048,13 @@ fn negamax(
                 const legacy_threshold = if (legacy_see_gate) pruning.seeQuietPruneMargin(search_depth) else floor;
                 if (basin_threshold > floor or legacy_threshold > floor) {
                     const union_threshold = @max(basin_threshold, legacy_threshold);
-                    if (see.quietBelow(pos, mv, union_threshold)) {
+                    if (see.quietBelowWith(pos, mv, union_threshold, see.lazyPins(&see_pins, pos))) {
                         const gives_check = gives_check_hint orelse nodeGivesCheck(&check_info, pos, mv);
                         gives_check_hint = gives_check;
                         if (!gives_check) {
                             if (comptime context_mod.stats_enabled) {
                                 const basin_see_prune = basin_see_gate and
-                                    (basin_threshold >= legacy_threshold or see.quietBelow(pos, mv, basin_threshold));
+                                    (basin_threshold >= legacy_threshold or see.quietBelowWith(pos, mv, basin_threshold, see.lazyPins(&see_pins, pos)));
                                 if (basin_see_prune) {
                                     ctx.noteQuietFutilityPrune();
                                 } else {
@@ -1060,13 +1093,18 @@ fn negamax(
             lookahead_ready = true;
             const hinted_key = make_unmake.prefetchKeyAfter(pos, upcoming);
             resources.tt.prefetch(hinted_key);
-            resources.rfp_hint.prefetch(hinted_key);
+            // A later move's child is a zero-window scout; below depth 2 it is
+            // a qsearch node unless the move checks.
+            if (search_depth >= 2) resources.rfp_hint.prefetch(hinted_key);
             resources.eval_cache.prefetch(hinted_key);
         }
         const child_key = make_unmake.makeMove(pos, mv, &stack_entry.state);
         resources.tt.prefetch(child_key); // overlap the child's TT miss with the work below
-        resources.rfp_hint.prefetch(child_key); // and the RFP-hint cluster (probed per negamax node)
-        resources.eval_cache.prefetch(child_key); // and the eval-cache set (probed on a TT eval miss)
+        // The RFP-hint cluster only for a child that can probe it (a negamax
+        // node at a zero window), the eval-cache set only for a child not in
+        // check (an in-check node takes no static eval). Hints only.
+        if ((search_depth >= 2 or gives_check) and (moves_searched != 0 or beta - alpha == 1)) resources.rfp_hint.prefetch(child_key);
+        if (!gives_check) resources.eval_cache.prefetch(child_key);
         ctx.repetition.push(child_key);
         child_entry.prev_move = mv;
         child_entry.prev_piece_type = moved_piece_type;
@@ -1181,18 +1219,18 @@ fn negamax(
                 shallow_arms.setParentLmrReduction(child_entry, reduction);
                 score = -negamax(ctx, resources, pos, reduced, -alpha - 1, -alpha, ply + 1, true, if (negative_extension) negative_child_ctx else node_ctx.reducedChild(reduction), null, gives_check);
                 if (!ctx.stopped and reduction > 0 and score > alpha) {
-                    var research_depth: i32 = child_base_depth;
-                    const deeper_threshold = if (comptime build_options.tuning) basin_config.params.deeperThreshold(child_base_depth) else basin.deeperThreshold(child_base_depth);
-                    // The re-search depth rule keeps the inputs it was tuned on: under
-                    // fail-hard returns a reduced fail high scored alpha + 1 and the
-                    // best score sat at alpha. Fed fail-soft magnitudes it would stop
-                    // shortening re-searches (cold depth 13: +16.8% nodes; clamped
-                    // -4.9%, A3b exploration).
-                    const score_hard = if (comptime fail_soft.ENABLED) @min(score, alpha + 1) else score;
-                    const best_hard = if (comptime fail_soft.ENABLED) @max(best_score, alpha) else best_score;
-                    if (score_hard > best_hard + deeper_threshold) research_depth += 1;
-                    if (score_hard < best_hard + child_base_depth) research_depth -= 1;
-                    const verified_depth: u16 = @intCast(std.math.clamp(research_depth, 1, @as(i32, child_base_depth) + 1));
+                    // A reduction implies child_base_depth >= 2 (`reduced` is at least 1).
+                    std.debug.assert(child_base_depth >= 2);
+                    const verified_depth: u16 = if (comptime fail_soft.ENABLED) verified: {
+                        // One ply short of the full depth, always: see lmrVerificationDepthFailHard.
+                        std.debug.assert(best_score <= alpha);
+                        break :verified child_base_depth - 1;
+                    } else lmrVerificationDepthFailHard(
+                        score,
+                        best_score,
+                        child_base_depth,
+                        if (comptime build_options.tuning) basin_config.params.deeperThreshold(child_base_depth) else basin.deeperThreshold(child_base_depth),
+                    );
                     ctx.noteLmrResearch(move_index, reduction, score, alpha, quiet_history_score, node_ctx.pv_node, node_ctx.cut_node);
                     if (move_order_sample) |sample| ctx.noteMoveOrderLmrResearch(sample);
                     outcome_flags.lmr_research = true;
@@ -1307,7 +1345,7 @@ fn negamax(
                 }
             }
         }
-        tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), alpha_orig, beta_in, best_score, best_move, tt_store.evalToTt(raw_static_eval), node_ttpv);
+        tt_store.storeWindowResult(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth), alpha_orig, beta_in, best_score, best_move, tt_store.evalToTt(raw_static_eval), node_ttpv, ply);
     }
     return best_score;
 }
@@ -1349,7 +1387,7 @@ fn scoreGeneratedMoves(
     );
 }
 
-fn nodeGivesCheck(info: *legal.CheckInfo, pos: *const position.Position, mv: move_mod.Move) align(64) bool { // align(64): pins hot entry placement (layout stability, not call speed)
+inline fn nodeGivesCheck(info: *legal.CheckInfo, pos: *const position.Position, mv: move_mod.Move) bool {
     // Replaces the per-move predicate / make-unmake round trip (R7's density
     // dispatch): one lazily built per-node context, exact (see legal.CheckInfo).
     info.ensure(pos);
@@ -1374,6 +1412,52 @@ fn containsMove(moves: *const move_mod.MoveList, needle: ?move_mod.Move) bool {
         if (mv == target) return true;
     }
     return false;
+}
+
+/// LMR verification depth after a reduced scout failed high, as tuned under
+/// fail-hard returns: one ply deeper when the scout beat the best score by
+/// `deeper_threshold`, one ply shallower when it beat it by less than the
+/// depth. Only the fail-hard flavour (`-Dfail-soft=false`) still runs it.
+///
+/// The fail-soft build kept the rule but fed it the clamped values it was
+/// tuned on (A3b: raw fail-soft magnitudes stopped the shortening, cold depth
+/// 13 +16.8% nodes). Those values are fixed there: the scout failed high, so
+/// min(score, alpha + 1) is alpha + 1, and max(best_score, alpha) is alpha,
+/// because a searched score above alpha raises alpha and a fail-soft
+/// futility value is at most alpha. "Deeper" then needs deeper_threshold < 1,
+/// but the threshold is at least 2 even at the tuning minimums (13 or more at
+/// the defaults); "shallower" needs child_base_depth > 1, which every
+/// reduction implies. So the fail-soft verification depth is always
+/// child_base_depth - 1, and negamax uses that directly (audit A finding 7;
+/// judge A, item A10). The research_base and research_per_depth tunables
+/// only act in the fail-hard flavour.
+fn lmrVerificationDepthFailHard(score: types.Score, best_score: types.Score, child_base_depth: u16, deeper_threshold: i32) u16 {
+    var research_depth: i32 = child_base_depth;
+    if (score > best_score + deeper_threshold) research_depth += 1;
+    if (score < best_score + child_base_depth) research_depth -= 1;
+    return @intCast(std.math.clamp(research_depth, 1, @as(i32, child_base_depth) + 1));
+}
+
+test "the fail-soft LMR verification depth is the clamped rule's only outcome" {
+    // Every reachable input of the clamped rule (scout alpha + 1 against best
+    // alpha) over the depths and thresholds the release and tuning builds can
+    // produce gives child_base_depth - 1.
+    var child_base_depth: u16 = 2;
+    while (child_base_depth <= 128) : (child_base_depth += 1) {
+        try std.testing.expect(basin.deeperThreshold(child_base_depth) >= 2);
+        var threshold: i32 = 2;
+        while (threshold <= 64) : (threshold += 1) {
+            for ([_]types.Score{ -27_000, -100, 0, 35, 2_000 }) |alpha| {
+                try std.testing.expectEqual(child_base_depth - 1, lmrVerificationDepthFailHard(alpha + 1, alpha, child_base_depth, threshold));
+            }
+        }
+    }
+    // The tuning ranges' smallest threshold, at the smallest reduced depth.
+    var smallest = basin.defaults;
+    smallest.research_base = 22;
+    smallest.research_per_depth = 2;
+    smallest.unit_percent = 10;
+    try std.testing.expect(smallest.deeperThreshold(2) >= 2);
 }
 
 fn canTrySingular(
@@ -1460,7 +1544,7 @@ fn tryProbCut(
         make_unmake.unmakeMove(pos, mv, &entry.state);
         if (ctx.stopped) return null;
         if (score >= probcut_beta) {
-            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth - PROBCUT_DEPTH_REDUCTION + 1), score, mv, tt_store.evalToTt(raw_static_eval), false);
+            tt_store.storeLowerBound(ctx, resources.tt, pos.zobrist_key, @intCast(search_depth - PROBCUT_DEPTH_REDUCTION + 1), score, mv, tt_store.evalToTt(raw_static_eval), false, ply);
             return score;
         }
     }
@@ -1538,6 +1622,23 @@ fn trySingularPlan(
     // Verification failed high WITHOUT the TT move: a second refutation exists. If the
     // verification bound already clears beta, cut the node (multicut). Mate-band scores
     // are excluded — bounds near mate don't compose across the reduced-depth verify.
+    //
+    // In the release build this branch is reached only from the rule-50 gate
+    // clock on (audit A, S-MULTICUT; review round, judge A F7). A singular
+    // candidate is a lower bound at least as deep as this node
+    // (singularTtDepthSlack() is 0; IIR, which lowers the depth, needs a missing
+    // TT move) with a non-mate score. Below halfmove clock 90 the main TT probe
+    // has already cut on any such bound >= beta, so entry.score < beta here and
+    // singular_beta = entry.score - singularMargin(d) < beta. From clock 90 on
+    // (shallow_arms.rule50TrustsTtScore) the probe takes no cutoff and does not
+    // narrow the window, but keeps the entry for ordering: the candidate can
+    // arrive with entry.score >= beta + margin, and the node cuts on
+    // singular_beta, which the reduced-depth verification search (TT move
+    // excluded) has just reached at the current clock (review round: 74 fires
+    // at clock 90, 0 at clock 0, normal21 at depth 16). Tuning builds also
+    // reach it with a positive singular depth slack (as in the X1 lane) or a
+    // TT cutoff gate (tt_cutoff_node_role, or tt_cutoff_halfmove_max below its
+    // default 90).
     if (MULTICUT_ENABLED and singular_beta >= beta and !score_mod.isMateLike(singular_beta)) {
         return .{ .applied = true, .plan = .{ .mv = candidate, .extension = 0, .multicut = singular_beta } };
     }
@@ -1924,6 +2025,43 @@ test "reverse futility hint reuses on second probe without evaluating" {
     if (context_mod.stats_enabled) try std.testing.expect(ctx.stats.rfp_hint_cutoffs >= 1);
 }
 
+test "reverse futility hints are stored only up to the depth the lookup serves" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hints = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hints.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+    const cap = pruning.rfpHintMaxDepth();
+    for ([_]u16{ cap, cap + 1, @min(basin.RFP_MAX_DEPTH, cap + 4) }) |depth| {
+        var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+        var stop_flag = std.atomic.Value(bool).init(false);
+        var ctx = context_mod.SearchContext{
+            .repetition = .{},
+            .control = time.Controller.init(&stop_flag, .{}),
+            .basin_config = if (build_options.tuning) &test_basin_config else {},
+        };
+        var history = history_mod.HistoryTable{};
+        table.clear();
+        hints.clear();
+        // Queen up against a hopeless zero window: RFP fires at every depth.
+        var pos = try fen.parse("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1");
+        ctx.repetition.push(pos.zobrist_key);
+        evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+        _ = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, depth, -3001, -3000, 0, true, node_context.NodeContext.fromWindow(-3001, -3000, false), null, null);
+        if (context_mod.stats_enabled) try std.testing.expectEqual(@as(u64, 1), ctx.stats.reverse_futility_prunes);
+        const stored = hints.lookup(pos.zobrist_key, 0) != null;
+        try std.testing.expectEqual(depth <= cap, stored);
+    }
+}
+
 const SeededSearchResult = struct {
     score: types.Score,
     nodes: u64,
@@ -1976,6 +2114,43 @@ const HintSeed = struct {
 };
 
 const SEEDED_TEST_FEN = "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+
+const ExactTtSeed = struct {
+    score: types.Score,
+    fn apply(self: ExactTtSeed, table: *tt_mod.TranspositionTable, _: anytype, key: u64) void {
+        table.store(key, 10, self.score, .exact, null);
+    }
+};
+
+test "a TT score stored far from the 50-move boundary does not cut at clock 99" {
+    // Judge A repro (S-RULE50-TT) one ply down: after Qg5 at clock 98 Black's
+    // only move Kh7 reaches clock 100, a draw. A deep exact entry for the
+    // same board, stored at a low clock, used to answer instead (warm 165
+    // against cold 0 at the root).
+    const low_clock = try searchSeededForTest("7k/8/5K2/6Q1/8/8/8/8 b - - 0 1", 1, -qsearch.INF, qsearch.INF, ExactTtSeed{ .score = -165 });
+    try std.testing.expectEqual(@as(types.Score, -165), low_clock.score);
+    const high_clock = try searchSeededForTest("7k/8/5K2/6Q1/8/8/8/8 b - - 99 1", 1, -qsearch.INF, qsearch.INF, ExactTtSeed{ .score = -165 });
+    try std.testing.expectEqual(@as(types.Score, 0), high_clock.score);
+}
+
+const UpperTtSeed = struct {
+    score: types.Score,
+    fn apply(self: UpperTtSeed, table: *tt_mod.TranspositionTable, _: anytype, key: u64) void {
+        table.store(key, 1, self.score, .upper, null);
+    }
+};
+
+test "a TT upper bound stored far from the 50-move boundary does not narrow the window at clock 99" {
+    // Review-round witness (S-RULE50-TT): -136 is the depth-1 result at
+    // clock 0. As an upper bound it turned the window [-137, INF] into a
+    // scout window at clock 99 without closing it, and razoring returned
+    // -660; Kh7, the only move, reaches clock 100, a draw.
+    const fen_text = "7k/8/5K2/6Q1/8/8/8/8 b - - 99 1";
+    const cold = try searchSeededForTest(fen_text, 1, -137, qsearch.INF, NoSeed{});
+    try std.testing.expectEqual(@as(types.Score, 0), cold.score);
+    const seeded = try searchSeededForTest(fen_text, 1, -137, qsearch.INF, UpperTtSeed{ .score = -136 });
+    try std.testing.expectEqual(@as(types.Score, 0), seeded.score);
+}
 
 test "a PV window neither cuts on nor raises alpha from the reverse-futility hint" {
     const alpha: types.Score = -400;
@@ -2188,6 +2363,177 @@ test "null move is not tried inside a singular verification search" {
         _ = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, 20, -201, -200, 0, true, node_context.NodeContext.fromWindow(-201, -200, false), excluded_move, false);
         try std.testing.expectEqual(@as(u64, if (excluded_move == null) 1 else 0), ctx.stats.null_tries);
     }
+}
+
+test "null-move boundary: the pass child searches as if history began at the pass" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hints = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hints.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+
+    // Judge A repro: Black's king walks a 3-cycle, White's a 2-cycle, so after
+    // the pass the board and side to move equal the start position.
+    const Mode = enum { no_boundary, boundary, fresh_history };
+    var results: [3]types.Score = undefined;
+    for ([_]Mode{ .no_boundary, .boundary, .fresh_history }, 0..) |mode, slot| {
+        var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+        var stop_flag = std.atomic.Value(bool).init(false);
+        var ctx = context_mod.SearchContext{
+            .repetition = .{},
+            .control = time.Controller.init(&stop_flag, .{}),
+            .basin_config = if (build_options.tuning) &test_basin_config else {},
+        };
+        var history = history_mod.HistoryTable{};
+        table.clear();
+        ecache.clear();
+        var pos = try fen.parse("q6k/8/8/8/8/8/8/R3K3 b - - 0 1");
+        ctx.repetition.push(pos.zobrist_key);
+        for ([_][]const u8{ "h8g8", "e1f1", "g8g7", "f1e1", "g7h8" }) |text| {
+            var moves = move_mod.MoveList.init();
+            legal.generate(&pos, &moves);
+            var found: ?move_mod.Move = null;
+            for (moves.slice()) |mv| {
+                var buffer: [5]u8 = undefined;
+                if (std.mem.eql(u8, mv.toUci(&buffer), text)) found = mv;
+            }
+            var state = make_unmake.StateInfo{};
+            ctx.repetition.push(make_unmake.makeMove(&pos, found.?, &state));
+        }
+        var null_state = make_unmake.StateInfo{};
+        make_unmake.makeNullMove(&pos, &null_state);
+        switch (mode) {
+            .no_boundary => {},
+            .boundary => _ = ctx.repetition.pushNullBoundary(pos.zobrist_key),
+            .fresh_history => {
+                ctx.repetition.clear();
+                ctx.repetition.push(pos.zobrist_key);
+            },
+        }
+        evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+        results[slot] = qsearch.search(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, -qsearch.INF, qsearch.INF, 0, null);
+    }
+    // Without the boundary the pass child is a false repetition draw.
+    try std.testing.expectEqual(@as(types.Score, 0), results[0]);
+    try std.testing.expect(results[1] != 0);
+    try std.testing.expectEqual(results[2], results[1]);
+}
+
+test "null-move boundary is restored on normal returns and on stops" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hints = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hints.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+    // Queen up with beta far below the eval: the node tries null move first,
+    // and node limits from 1 up stop the search at every stage of the pass
+    // subtree (including nested passes) as well as after normal returns.
+    var limit: u64 = 1;
+    while (limit <= 3000) : (limit = limit * 3 / 2 + 1) {
+        var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+        var stop_flag = std.atomic.Value(bool).init(false);
+        var ctx = context_mod.SearchContext{
+            .repetition = .{},
+            .control = time.Controller.init(&stop_flag, .{ .node_limit = limit }),
+            .basin_config = if (build_options.tuning) &test_basin_config else {},
+        };
+        var history = history_mod.HistoryTable{};
+        table.clear();
+        var pos = try fen.parse("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1");
+        const root_key = pos.zobrist_key;
+        ctx.repetition.push(root_key);
+        evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+        _ = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, 12, -201, -200, 0, true, node_context.NodeContext.fromWindow(-201, -200, false), null, null);
+        try std.testing.expectEqual(@as(usize, 1), ctx.repetition.count);
+        try std.testing.expectEqual(@as(usize, 0), ctx.repetition.floor);
+        try std.testing.expectEqual(root_key, pos.zobrist_key);
+    }
+}
+
+test "null-move boundary in negamax: an odd cycle before the node does not reach the pass child" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+    const rfp_hint_mod = @import("rfp_hint.zig");
+    const time = @import("time.zig");
+
+    var evaluator = try @import("../eval/backend.zig").EngineState.init(std.testing.allocator, .{});
+    defer evaluator.deinit();
+    var table = try tt_mod.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+    var hints = try rfp_hint_mod.HintTable.init(std.testing.allocator, rfp_hint_mod.MIN_HINT_MB);
+    defer hints.deinit();
+    var ecache = try eval_cache_mod.EvalCache.init(std.testing.allocator, eval_cache_mod.MIN_CACHE_MB);
+    defer ecache.deinit();
+
+    // The real null branch (review round, judges A F10 / finding 10): Black's
+    // king walks a 3-cycle and White's a 2-cycle, so White's pass at the node
+    // recreates the start position with Black to move. Without the boundary
+    // that pass child is a repetition draw, the null move fails low and the
+    // node searches its moves. With it, the node searches exactly as with no
+    // earlier history: the queen side's null move cuts at once.
+    const Mode = enum { cycle_history, fresh_history };
+    var results: [2]SeededSearchResult = undefined;
+    for ([_]Mode{ .cycle_history, .fresh_history }, 0..) |mode, slot| {
+        var test_basin_config = if (build_options.tuning) basin.Config.init(.{}) else {};
+        var stop_flag = std.atomic.Value(bool).init(false);
+        var ctx = context_mod.SearchContext{
+            .repetition = .{},
+            .control = time.Controller.init(&stop_flag, .{}),
+            .basin_config = if (build_options.tuning) &test_basin_config else {},
+        };
+        var history = history_mod.HistoryTable{};
+        table.clear();
+        hints.clear();
+        ecache.clear();
+        var pos = try fen.parse("r6k/8/8/8/8/8/8/1Q2K3 b - - 0 1");
+        ctx.repetition.push(pos.zobrist_key);
+        for ([_][]const u8{ "h8g8", "e1f1", "g8g7", "f1e1", "g7h8" }) |text| {
+            var moves = move_mod.MoveList.init();
+            legal.generate(&pos, &moves);
+            var found: ?move_mod.Move = null;
+            for (moves.slice()) |mv| {
+                var buffer: [5]u8 = undefined;
+                if (std.mem.eql(u8, mv.toUci(&buffer), text)) found = mv;
+            }
+            var state = make_unmake.StateInfo{};
+            ctx.repetition.push(make_unmake.makeMove(&pos, found.?, &state));
+        }
+        if (mode == .fresh_history) {
+            ctx.repetition.clear();
+            ctx.repetition.push(pos.zobrist_key);
+        }
+        const node_key = pos.zobrist_key;
+        evaluator.prepareRoot(&ctx.stack, &pos, &ctx.finny, &ctx.ft);
+        // Zero window above the draw, depth above the reverse-futility range
+        // and below null-move verification.
+        const score = negamax(&ctx, .{ .tt = &table, .rfp_hint = &hints, .eval_cache = &ecache, .history = &history, .evaluator = &evaluator }, &pos, 13, 0, 1, 0, true, node_context.NodeContext.fromWindow(0, 1, false), null, null);
+        try std.testing.expect(!ctx.stopped);
+        results[slot] = .{ .score = score, .nodes = ctx.nodes };
+        // The node took the null-move cut: a lower bound without a move.
+        const entry = table.lookup(node_key).?;
+        try std.testing.expectEqual(tt_mod.Bound.lower, entry.bound);
+        try std.testing.expect(tt_mod.moveFromEntry(entry) == null);
+        if (context_mod.stats_enabled) try std.testing.expectEqual(@as(u64, 1), ctx.stats.null_cutoffs);
+    }
+    try std.testing.expect(results[0].score >= 1);
+    try std.testing.expectEqual(results[1].score, results[0].score);
+    try std.testing.expectEqual(results[1].nodes, results[0].nodes);
 }
 
 test "root LMR starts with the third quiet move and preserves tactical guards" {

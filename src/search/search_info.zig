@@ -31,6 +31,9 @@ pub const CurrMoveInfo = struct {
 pub const InfoMessage = union(enum) {
     iteration: IterationInfo,
     currmove: CurrMoveInfo,
+    /// Diagnostic `info string ...` text (TM trace); not part of the score
+    /// stream.
+    text: []const u8,
 };
 
 /// A type-erased sink the search layer calls to stream UCI info lines. The UCI

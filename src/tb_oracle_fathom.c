@@ -1,6 +1,7 @@
-/* Original ZigQueen ABI glue. Fathom remains the vendored MIT dependency.
- * Only the process-wide Zig service calls these functions. Use public APIs;
- * no search/tool binds private Fathom _impl symbols or its mutable globals. */
+/* Original ZigQueen ABI glue for the test-only Syzygy oracle (src/tb_oracle.zig).
+ * Fathom remains the vendored MIT dependency and is linked into the oracle only,
+ * never into the engine. Public APIs only; nothing binds Fathom's private _impl
+ * symbols or its mutable globals. Fathom is not thread-safe: one thread. */
 #include "tbprobe.h"
 bool zq_tb_init(const char *path) { return tb_init(path); }
 void zq_tb_free(void) { tb_free(); }

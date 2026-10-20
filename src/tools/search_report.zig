@@ -143,6 +143,8 @@ pub fn write(writer: anytype, result: *const search_engine.SearchResult, elapsed
     try writer.print("hard_stops_external {d}\n", .{stats.hard_stops_external});
     try writer.print("hard_stops_node_limit {d}\n", .{stats.hard_stops_node_limit});
     try writer.print("hard_stops_maximum_budget {d}\n", .{stats.hard_stops_maximum_budget});
+    try writer.print("hard_stops_soft_budget {d}\n", .{stats.hard_stops_soft_budget});
+    try writer.print("interrupted_challengers {d}\n", .{stats.interrupted_challengers});
     try writer.print("iteration_stop_maximum_elapsed {d}\n", .{stats.iteration_stop_maximum_elapsed});
     try writer.print("iteration_stop_maximum_projected {d}\n", .{stats.iteration_stop_maximum_projected});
     try writer.print("iteration_stop_optimum_elapsed {d}\n", .{stats.iteration_stop_optimum_elapsed});

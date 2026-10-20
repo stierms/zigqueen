@@ -46,9 +46,15 @@ fn parseWithHash(fen: []const u8, comptime compute_hash: bool) FenError!position
     var pos = position.Position.empty();
     try parsePiecePlacement(piece_field, &pos);
     pos.side_to_move = try parseSideToMove(side_field);
-    pos.castling_rights = try parseCastling(castling_field);
+    pos.castling_rights = supportedCastling(&pos, try parseCastling(castling_field));
     pos.en_passant = try parseEnPassant(ep_field);
-    if (pos.en_passant) |ep| try validateEnPassant(&pos, ep);
+    if (pos.en_passant) |ep| {
+        try validateEnPassant(&pos, ep);
+        // Same rule as a double push in make_unmake: keep (and hash) the
+        // target only when a pawn of the side to move can take on it, so the
+        // FEN and the same position reached by moves get one key.
+        if (!enPassantTargetUsable(&pos, ep)) pos.en_passant = null;
+    }
     pos.halfmove_clock = std.fmt.parseInt(u16, halfmove_field, 10) catch return error.InvalidHalfmoveClock;
     if (pos.halfmove_clock > MAX_MOVE_COUNTER) return error.InvalidHalfmoveClock;
     pos.fullmove_number = std.fmt.parseInt(u16, fullmove_field, 10) catch return error.InvalidFullmoveNumber;
@@ -191,6 +197,24 @@ fn parseCastling(field: []const u8) FenError!position.CastlingRights {
     return rights;
 }
 
+/// Castling rights the board cannot support are dropped: each right needs its
+/// king and its rook on their home squares. Make/unmake only ever clears
+/// rights, so an unsupported one would otherwise come back to life once a rook
+/// reached the corner: after `4k3/8/8/8/8/8/8/R3K3 w K - 0 1` and the rook's
+/// walk a1-a2-h2-h1, e1g1 was generated as legal (audit C, C-FEN-CASTLE).
+/// Clearing, not rejecting, keeps the parser accepting what GUIs send; the
+/// key is computed afterwards, so it covers the rights actually kept.
+fn supportedCastling(pos: *const position.Position, rights: position.CastlingRights) position.CastlingRights {
+    const white_king = pos.pieceAt(.e1) == .white_king;
+    const black_king = pos.pieceAt(.e8) == .black_king;
+    return .{
+        .white_king_side = rights.white_king_side and white_king and pos.pieceAt(.h1) == .white_rook,
+        .white_queen_side = rights.white_queen_side and white_king and pos.pieceAt(.a1) == .white_rook,
+        .black_king_side = rights.black_king_side and black_king and pos.pieceAt(.h8) == .black_rook,
+        .black_queen_side = rights.black_queen_side and black_king and pos.pieceAt(.a8) == .black_rook,
+    };
+}
+
 fn parseEnPassant(field: []const u8) FenError!?square.Square {
     if (std.mem.eql(u8, field, "-")) return null;
     const sq = square.Square.parse(field) catch return error.InvalidEnPassant;
@@ -203,7 +227,8 @@ fn parseEnPassant(field: []const u8) FenError!?square.Square {
 /// a pawn from the square in front of it without looking. So the target must
 /// be on the rank the side to move captures onto, be empty, and have the
 /// opponent's double-pushed pawn in front of it. A capturing pawn beside it is
-/// not required; FEN records the target after every double push.
+/// not required (FEN records the target after every double push); without one
+/// the parser drops the target (`enPassantTargetUsable`).
 fn validateEnPassant(pos: *const position.Position, ep: square.Square) FenError!void {
     const white_to_move = pos.side_to_move == .white;
     if (ep.rank() != @as(u8, if (white_to_move) 5 else 2)) return error.InvalidEnPassant;
@@ -211,6 +236,33 @@ fn validateEnPassant(pos: *const position.Position, ep: square.Square) FenError!
     const pushed = square.Square.fromCoords(@intCast(ep.file()), if (white_to_move) 4 else 3);
     const expected: piece.Piece = if (white_to_move) .black_pawn else .white_pawn;
     if (pos.pieceAt(pushed) != expected) return error.InvalidEnPassant;
+}
+
+/// Whether a pawn of the side to move attacks the (validated) target. The
+/// squares it would capture from are the squares an opponent pawn standing on
+/// the target attacks. Pseudo-legal, like the rule in make_unmake.
+fn enPassantTargetUsable(pos: *const position.Position, ep: square.Square) bool {
+    const side = pos.side_to_move;
+    const pawn: piece.Piece = if (side == .white) .white_pawn else .black_pawn;
+    const capture_from = pawnCaptureSources(side, ep);
+    for (capture_from) |maybe_sq| {
+        const sq = maybe_sq orelse continue;
+        if (pos.pieceAt(sq) == pawn) return true;
+    }
+    return false;
+}
+
+/// The (at most two) squares from which a `side` pawn captures onto `target`.
+fn pawnCaptureSources(side: types.Color, target: square.Square) [2]?square.Square {
+    const rank: i8 = @as(i8, target.rank()) + @as(i8, if (side == .white) -1 else 1);
+    var sources = [2]?square.Square{ null, null };
+    if (rank < 0 or rank > 7) return sources;
+    const file: i8 = target.file();
+    for ([_]i8{ -1, 1 }, 0..) |delta, slot| {
+        const f = file + delta;
+        if (f >= 0 and f <= 7) sources[slot] = square.Square.fromCoords(@intCast(f), @intCast(rank));
+    }
+    return sources;
 }
 
 test "fen parser rejects en passant targets the generators could not honour" {
@@ -222,11 +274,58 @@ test "fen parser rejects en passant targets the generators could not honour" {
     try std.testing.expectError(error.InvalidEnPassant, parse("4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1"));
     // Wrong colour in front of the target.
     try std.testing.expectError(error.InvalidEnPassant, parse("4k3/8/8/3PP3/8/8/8/4K3 w - d6 0 1"));
-    // A consistent target with no capturing pawn beside it is ordinary FEN.
+    // A consistent target with no capturing pawn beside it is ordinary FEN:
+    // accepted, but dropped (it is not part of the position).
     const after_e4 = try parse("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
-    try std.testing.expectEqual(@as(?square.Square, .e3), after_e4.en_passant);
+    try std.testing.expectEqual(@as(?square.Square, null), after_e4.en_passant);
     const black_pushed = try parse("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2");
     try std.testing.expectEqual(@as(?square.Square, .d6), black_pushed.en_passant);
+}
+
+test "fen parser drops castling rights the board cannot support" {
+    const Rights = position.CastlingRights;
+    // Rook missing from its corner: the audit C witness.
+    try std.testing.expectEqual(Rights{}, (try parse("4k3/8/8/8/8/8/8/R3K3 w K - 0 1")).castling_rights);
+    // Every right kept when kings and rooks are home.
+    const all = Rights{ .white_king_side = true, .white_queen_side = true, .black_king_side = true, .black_queen_side = true };
+    try std.testing.expectEqual(all, (try parse("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")).castling_rights);
+    // A displaced king loses both of its side's rights, and only those.
+    try std.testing.expectEqual(Rights{ .black_king_side = true, .black_queen_side = true }, (try parse("r3k2r/8/8/8/8/8/8/R2K3R w KQkq - 0 1")).castling_rights);
+    try std.testing.expectEqual(Rights{ .white_king_side = true, .white_queen_side = true }, (try parse("r2k3r/8/8/8/8/8/8/R3K2R b KQkq - 0 1")).castling_rights);
+    // One missing rook (a8), one wrong-colour rook (h1): only those rights go.
+    try std.testing.expectEqual(Rights{ .white_queen_side = true, .black_king_side = true }, (try parse("4k2r/8/8/8/8/8/8/R3K2r w KQkq - 0 1")).castling_rights);
+    // The key covers the rights actually kept, so equal boards hash equally.
+    try std.testing.expectEqual((try parse("4k3/8/8/8/8/8/8/R3K3 w Q - 0 1")).zobrist_key, (try parse("4k3/8/8/8/8/8/8/R3K3 w KQkq - 0 1")).zobrist_key);
+    // The legal generator never sees the stale right: after the rook walks to
+    // h1 the king may not castle.
+    var pos = try parse("4k3/8/8/8/8/8/8/R3K3 w K - 0 1");
+    const make_unmake = @import("../movegen/make_unmake.zig");
+    const move_mod = @import("move.zig");
+    var states: [6]make_unmake.StateInfo = undefined;
+    for ([_]move_mod.Move{
+        move_mod.Move.init(.a1, .a2, .quiet), move_mod.Move.init(.e8, .d8, .quiet),
+        move_mod.Move.init(.a2, .h2, .quiet), move_mod.Move.init(.d8, .e8, .quiet),
+        move_mod.Move.init(.h2, .h1, .quiet), move_mod.Move.init(.e8, .d8, .quiet),
+    }, &states) |mv, *state| _ = make_unmake.makeMove(&pos, mv, state);
+    var moves = move_mod.MoveList.init();
+    @import("../movegen/legal.zig").generate(&pos, &moves);
+    for (moves.slice()) |mv| try std.testing.expect(!(mv.from == .e1 and mv.to == .g1));
+}
+
+test "fen keeps an en passant target only when the side to move can capture" {
+    // Capturing pawn on either side, both colours.
+    try std.testing.expectEqual(@as(?square.Square, .d6), (try parse("4k3/8/8/2Pp4/8/8/8/4K3 w - d6 0 2")).en_passant);
+    try std.testing.expectEqual(@as(?square.Square, .a3), (try parse("4k3/8/8/8/Pp6/8/8/4K3 b - a3 0 1")).en_passant);
+    try std.testing.expectEqual(@as(?square.Square, .h3), (try parse("4k3/8/8/8/6pP/8/8/4K3 b - h3 0 1")).en_passant);
+    // Own pawn or a piece beside the pushed pawn: no capture, no target.
+    try std.testing.expectEqual(@as(?square.Square, null), (try parse("4k3/8/8/2pp4/8/8/8/4K3 w - d6 0 2")).en_passant);
+    try std.testing.expectEqual(@as(?square.Square, null), (try parse("4k3/8/8/3pN3/8/8/8/4K3 w - d6 0 2")).en_passant);
+    // A pinned capturer still keeps it (pseudo-legal rule).
+    try std.testing.expectEqual(@as(?square.Square, .e6), (try parse("k2r4/8/8/3Pp3/8/8/8/3K4 w - e6 0 2")).en_passant);
+    // The dropped target hashes like "-".
+    const with_target = try parse("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
+    const without = try parse("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+    try std.testing.expectEqual(without.zobrist_key, with_target.zobrist_key);
 }
 
 test "fen parser bounds the move counters" {

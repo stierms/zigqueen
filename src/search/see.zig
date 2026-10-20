@@ -1,5 +1,6 @@
 const attacks = @import("../movegen/attacks.zig");
 const bitboard = @import("../core/bitboard.zig");
+const legality = @import("../movegen/legal.zig");
 const move_mod = @import("../core/move.zig");
 const piece = @import("../core/piece.zig");
 const piece_values = @import("../core/piece_values.zig");
@@ -44,13 +45,129 @@ const Attacker = struct {
 // sees is legal, so a moving king never lands on an attacked square and the
 // first exchange step never happens.
 
+// Promotions. A pawn that captures onto rank 1 or 8 promotes (always to a
+// queen here): that exchange step gains the captured piece plus queen - pawn,
+// and the next capture on the square takes a queen. A white pawn can only
+// capture onto rank 8 and a black one onto rank 1, so the rank alone decides.
+// The mover's own promotion is credited the same way (promoted piece - pawn).
+// Search callers do not pass promotions today (ordering, the bad-capture
+// prune and qsearch exempt them); the initial credit keeps the API honest.
+
+const PROMOTION_GAIN: i32 = piece_values.value(.queen) - piece_values.value(.pawn);
+const LAST_RANKS: bitboard.Bitboard = 0xFF00_0000_0000_00FF;
+
+inline fn onLastRank(target: square.Square) bool {
+    return (LAST_RANKS & bitboard.bit(target)) != 0;
+}
+
+inline fn initialPromotionGain(mv: move_mod.Move) i32 {
+    const promotion = mv.promotionPieceType() orelse return 0;
+    return piece_values.value(promotion) - piece_values.value(.pawn);
+}
+
+/// Whether the opponent of the side to move can answer a move to `target` with
+/// a promoting pawn capture: only then can a quiet move lose more than its own
+/// piece. Pawn attackers are fixed squares, so no exchange can add one later.
+pub inline fn promotingRecapturePossible(pos: *const position.Position, target: square.Square) bool {
+    if (!onLastRank(target)) return false;
+    const opponent = pos.side_to_move.other();
+    return (pos.pieceBitboard(opponent, .pawn) & pawnAttackers(opponent, target)) != 0;
+}
+
+/// Whether a pawn of either colour can capture onto `target` with promotion.
+/// The rank fixes the side: only a white pawn captures onto rank 8, only a
+/// black one onto rank 1. The mover's own pawn matters to `quietBelow` (its
+/// recapture gains the victim plus the promotion), not to `quietFloor`.
+inline fn anyPromotingCapture(pos: *const position.Position, target: square.Square) bool {
+    if (!onLastRank(target)) return false;
+    const promoter: types.Color = if (target.rank() == 7) .white else .black;
+    return (pos.pieceBitboard(promoter, .pawn) & pawnAttackers(promoter, target)) != 0;
+}
+
+/// Lower bound of `quietScore` for a non-promoting quiet move: minus the
+/// moving piece's value, and minus the promotion gain on top when an enemy
+/// pawn can recapture onto its last rank.
+pub inline fn quietFloor(pos: *const position.Position, mv: move_mod.Move) i32 {
+    const mover_value = piece_values.value(pos.pieceAt(mv.from).pieceType());
+    return -mover_value - (if (promotingRecapturePossible(pos, mv.to)) PROMOTION_GAIN else 0);
+}
+
+// Pins (C-SEE-PIN). A piece pinned to its own king may not recapture off
+// its pin line while the pinner still stands: the swap skips it then and
+// takes the next attacker. In R2nkb2/3pppp1/8/7Q/2B5/8/8/6K1 w the d8 knight
+// is pinned by Ra8, so Qxf7 is mate and scores +100, not -800 (which made
+// qsearch drop it). The pinned set is taken once per node (`Pins.init`) and
+// shared by every SEE call there; the per-step test only runs for pinned
+// pieces still on the board, so a pin-free position costs one AND per step.
+// A pinned piece still covers squares for the king rule (kingMayCapture uses
+// the unfiltered attackers): a pinned piece gives check all the same. Pins
+// that only arise during the exchange are not modelled.
+
+/// Pieces of each colour pinned to their own king at the node.
+pub const Pins = struct {
+    pinned: [2]bitboard.Bitboard = .{ 0, 0 },
+
+    /// No pins: the geometric swap (test reference, cold callers that
+    /// prefer it).
+    pub const none: Pins = .{};
+
+    pub fn init(pos: *const position.Position) Pins {
+        return .{ .pinned = .{ legality.pinnedPieces(pos, .white), legality.pinnedPieces(pos, .black) } };
+    }
+};
+
+/// The pinned pieces of `side` that may not capture on `target` now: still on
+/// the board, moving off the line through their king, with an enemy slider
+/// (other than whatever stands on `target`, which is about to be taken) still
+/// lined up on the king once the piece leaves.
+fn pinnedAway(pos: *const position.Position, occupied: bitboard.Bitboard, side: types.Color, target: square.Square, pinned: bitboard.Bitboard) bitboard.Bitboard {
+    const king = pos.kingSquare(side) orelse return 0;
+    const enemy = side.other();
+    const enemy_queens = pos.pieceBitboard(enemy, .queen);
+    const live = occupied & ~bitboard.bit(target);
+    const rook_like = (pos.pieceBitboard(enemy, .rook) | enemy_queens) & live;
+    const bishop_like = (pos.pieceBitboard(enemy, .bishop) | enemy_queens) & live;
+    var remaining = pinned & occupied;
+    var blocked: bitboard.Bitboard = 0;
+    while (remaining != 0) {
+        const sq = bitboard.popLsbUnchecked(&remaining);
+        if (legality.isCollinear(king, sq, target)) continue;
+        const without = occupied & ~bitboard.bit(sq);
+        if ((attacks.rookAttacksOnTheFly(king, without) & rook_like) != 0 or
+            (attacks.bishopAttacksOnTheFly(king, without) & bishop_like) != 0)
+        {
+            blocked |= bitboard.bit(sq);
+        }
+    }
+    return blocked;
+}
+
+/// A node's pins, taken on first use: callers keep one `?Pins` per node.
+pub inline fn lazyPins(slot: *?Pins, pos: *const position.Position) *const Pins {
+    if (slot.* == null) slot.* = Pins.init(pos);
+    return &slot.*.?;
+}
+
+/// Pieces of `side` that may capture on `target` in this exchange step.
+inline fn available(pos: *const position.Position, occupied: bitboard.Bitboard, side: types.Color, target: square.Square, pins: *const Pins) bitboard.Bitboard {
+    const pinned = pins.pinned[@intFromEnum(side)];
+    if ((pinned & occupied) == 0) return occupied;
+    return occupied & ~pinnedAway(pos, occupied, side, target, pinned);
+}
+
 /// Whether a king of `side` that has just been removed from `occupied` may
 /// capture on `target`: true when the opponent has no attacker left there.
 inline fn kingMayCapture(pos: *const position.Position, occupied: bitboard.Bitboard, side: types.Color, target: square.Square) bool {
-    return leastValuableAttacker(pos, occupied, side.other(), target) == null;
+    return leastValuableAttacker(pos, occupied, occupied, side.other(), target) == null;
 }
 
+/// `captureScoreWith` with the node's pins taken here (tests, cold callers).
 pub fn captureScore(pos: *const position.Position, mv: move_mod.Move) i32 {
+    const pins = Pins.init(pos);
+    return captureScoreWith(pos, mv, &pins);
+}
+
+pub inline fn captureScoreWith(pos: *const position.Position, mv: move_mod.Move, pins: *const Pins) i32 {
     if (!mv.isCapture()) return 0;
     if (mv.flag == .en_passant) return 0;
 
@@ -61,14 +178,21 @@ pub fn captureScore(pos: *const position.Position, mv: move_mod.Move) i32 {
     const occupied = (pos.occupied & ~bitboard.bit(mv.from)) | bitboard.bit(mv.to);
 
     const mover_after_type = if (mv.promotionPieceType()) |promotion| promotion else moving_piece.pieceType();
-    return piece_values.value(captured_piece.pieceType()) - seeGain(pos, occupied, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
+    return piece_values.value(captured_piece.pieceType()) + initialPromotionGain(mv) - seeGain(pos, occupied, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type), pins);
+}
+
+/// `quietScoreWith` with the node's pins taken here (tests, cold callers).
+pub fn quietScore(pos: *const position.Position, mv: move_mod.Move) i32 {
+    const pins = Pins.init(pos);
+    return quietScoreWith(pos, mv, &pins);
 }
 
 /// SEE of a QUIET (non-capture) move from the mover's point of view: 0 if the
 /// destination is safe, negative if the piece walks into a losing exchange there.
 /// Mirrors `captureScore` but with no captured victim -- the opponent initiates
 /// the exchange on `mv.to`. Used for SEE-based quiet pruning of late moves.
-pub fn quietScore(pos: *const position.Position, mv: move_mod.Move) i32 {
+/// Only a quiet promotion can score above 0 (its promotion gain).
+pub fn quietScoreWith(pos: *const position.Position, mv: move_mod.Move, pins: *const Pins) i32 {
     if (mv.isCapture()) return 0;
     const moving_piece = pos.pieceAt(mv.from);
     if (moving_piece == .none) return 0;
@@ -76,14 +200,24 @@ pub fn quietScore(pos: *const position.Position, mv: move_mod.Move) i32 {
     const occupied = (pos.occupied & ~bitboard.bit(mv.from)) | bitboard.bit(mv.to);
 
     const mover_after_type = if (mv.promotionPieceType()) |promotion| promotion else moving_piece.pieceType();
-    return -seeGain(pos, occupied, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
+    return initialPromotionGain(mv) - seeGain(pos, occupied, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type), pins);
+}
+
+/// `quietBelowWith` with the node's pins taken here (tests, cold callers).
+pub fn quietBelow(pos: *const position.Position, mv: move_mod.Move, threshold: i32) bool {
+    const pins = Pins.init(pos);
+    return quietBelowWith(pos, mv, threshold, &pins);
 }
 
 /// Exact threshold predicate for quietScore, using the same attacker sequence.
 /// For G=max(0,V-reply), G>K is equivalent to !(reply>V-K-1) when
 /// 0<=K<V. Carry that inversion until a material bound or empty tail decides it.
-pub fn quietBelow(pos: *const position.Position, mv: move_mod.Move, threshold: i32) bool {
-    // quietScore is nonpositive, including its capture/empty-source sentinels.
+pub fn quietBelowWith(pos: *const position.Position, mv: move_mod.Move, threshold: i32, pins: *const Pins) bool {
+    // Promotion geometry breaks the material bounds below (a promoting pawn
+    // of either side gains more than the piece it takes; a quiet promotion
+    // scores above 0): answer those rare moves from the exact score.
+    if (mv.isPromotion() or anyPromotingCapture(pos, mv.to)) return quietScoreWith(pos, mv, pins) < threshold;
+    // quietScore is nonpositive here, including its capture/empty-source sentinels.
     if (threshold > 0) return true;
     if (mv.isCapture()) return false;
     const moving_piece = pos.pieceAt(mv.from);
@@ -99,7 +233,7 @@ pub fn quietBelow(pos: *const position.Position, mv: move_mod.Move, threshold: i
     var side = pos.side_to_move.other();
     while (true) {
         if (bound >= victim_value) return inverted;
-        const attacker = leastValuableAttacker(pos, occupied, side, mv.to) orelse return inverted;
+        const attacker = leastValuableAttacker(pos, occupied, available(pos, occupied, side, mv.to, pins), side, mv.to) orelse return inverted;
         occupied &= ~bitboard.bit(attacker.from);
         // A king that may not capture is the same as no attacker. One that may
         // ends the exchange: the next pass finds no reply and returns.
@@ -111,15 +245,16 @@ pub fn quietBelow(pos: *const position.Position, mv: move_mod.Move, threshold: i
     }
 }
 
-fn seeGain(pos: *const position.Position, start_occupied: bitboard.Bitboard, side: types.Color, target: square.Square, victim_value: i32) i32 {
+fn seeGain(pos: *const position.Position, start_occupied: bitboard.Bitboard, side: types.Color, target: square.Square, victim_value: i32, pins: *const Pins) i32 {
     var gains: [32]i32 = undefined;
     var ply: usize = 0;
     var attacker_side = side;
     var next_victim_value = victim_value;
     var occupied = start_occupied;
+    const promotion_square = onLastRank(target);
 
     while (true) {
-        const attacker = leastValuableAttacker(pos, occupied, attacker_side, target) orelse break;
+        const attacker = leastValuableAttacker(pos, occupied, available(pos, occupied, attacker_side, target, pins), attacker_side, target) orelse break;
         occupied &= ~bitboard.bit(attacker.from);
         if (attacker.piece_type == .king) {
             // Last possible step either way: the king captures only onto an
@@ -130,9 +265,10 @@ fn seeGain(pos: *const position.Position, start_occupied: bitboard.Bitboard, sid
             }
             break;
         }
-        gains[ply] = next_victim_value;
+        const promotes = promotion_square and attacker.piece_type == .pawn;
+        gains[ply] = next_victim_value + (if (promotes) PROMOTION_GAIN else 0);
         ply += 1;
-        next_victim_value = piece_values.value(attacker.piece_type);
+        next_victim_value = piece_values.value(if (promotes) .queen else attacker.piece_type);
         attacker_side = attacker_side.other();
     }
 
@@ -144,27 +280,29 @@ fn seeGain(pos: *const position.Position, start_occupied: bitboard.Bitboard, sid
     return gain;
 }
 
-inline fn leastValuableAttacker(pos: *const position.Position, occupied: bitboard.Bitboard, side: types.Color, target: square.Square) ?Attacker {
+/// `occupied` shapes the slider lines (a pinned piece still blocks them);
+/// `movable` (a subset of it) is who may capture this step.
+inline fn leastValuableAttacker(pos: *const position.Position, occupied: bitboard.Bitboard, movable: bitboard.Bitboard, side: types.Color, target: square.Square) ?Attacker {
     const row = pos.pieceRow(side);
 
-    var candidates = row[pieceTypeIndex(.pawn)] & occupied & pawnAttackers(side, target);
+    var candidates = row[pieceTypeIndex(.pawn)] & movable & pawnAttackers(side, target);
     if (bitboard.lsb(candidates)) |sq| return .{ .from = sq, .piece_type = .pawn };
 
-    candidates = row[pieceTypeIndex(.knight)] & occupied & attacks.knightAttacksFrom(target);
+    candidates = row[pieceTypeIndex(.knight)] & movable & attacks.knightAttacksFrom(target);
     if (bitboard.lsb(candidates)) |sq| return .{ .from = sq, .piece_type = .knight };
 
     const bishop_attacks = attacks.bishopAttacksOnTheFly(target, occupied);
-    candidates = row[pieceTypeIndex(.bishop)] & occupied & bishop_attacks;
+    candidates = row[pieceTypeIndex(.bishop)] & movable & bishop_attacks;
     if (bitboard.lsb(candidates)) |sq| return .{ .from = sq, .piece_type = .bishop };
 
     const rook_attacks = attacks.rookAttacksOnTheFly(target, occupied);
-    candidates = row[pieceTypeIndex(.rook)] & occupied & rook_attacks;
+    candidates = row[pieceTypeIndex(.rook)] & movable & rook_attacks;
     if (bitboard.lsb(candidates)) |sq| return .{ .from = sq, .piece_type = .rook };
 
-    candidates = row[pieceTypeIndex(.queen)] & occupied & (bishop_attacks | rook_attacks);
+    candidates = row[pieceTypeIndex(.queen)] & movable & (bishop_attacks | rook_attacks);
     if (bitboard.lsb(candidates)) |sq| return .{ .from = sq, .piece_type = .queen };
 
-    candidates = row[pieceTypeIndex(.king)] & occupied & attacks.kingAttacksFrom(target);
+    candidates = row[pieceTypeIndex(.king)] & movable & attacks.kingAttacksFrom(target);
     if (bitboard.lsb(candidates)) |sq| return .{ .from = sq, .piece_type = .king };
 
     return null;
@@ -172,8 +310,8 @@ inline fn leastValuableAttacker(pos: *const position.Position, occupied: bitboar
 
 fn pawnAttackers(side: types.Color, target: square.Square) bitboard.Bitboard {
     return switch (side) {
-        .white => attacks.BLACK_PAWN_ATTACKS[target.index()],
-        .black => attacks.WHITE_PAWN_ATTACKS[target.index()],
+        .white => attacks.BLACK_PAWN_ATTACKS[@intFromEnum(target)],
+        .black => attacks.WHITE_PAWN_ATTACKS[@intFromEnum(target)],
     };
 }
 
@@ -264,7 +402,7 @@ fn captureScoreReference(pos: *const position.Position, mv: move_mod.Move) i32 {
     state.occupied |= bitboard.bit(mv.to);
 
     const mover_after_type = if (mv.promotionPieceType()) |promotion| promotion else moving_piece.pieceType();
-    return piece_values.value(captured_piece.pieceType()) - seeGainReference(state, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
+    return piece_values.value(captured_piece.pieceType()) + initialPromotionGain(mv) - seeGainReference(state, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
 }
 
 fn quietScoreReference(pos: *const position.Position, mv: move_mod.Move) i32 {
@@ -277,7 +415,7 @@ fn quietScoreReference(pos: *const position.Position, mv: move_mod.Move) i32 {
     state.occupied |= bitboard.bit(mv.to);
 
     const mover_after_type = if (mv.promotionPieceType()) |promotion| promotion else moving_piece.pieceType();
-    return -seeGainReference(state, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
+    return initialPromotionGain(mv) - seeGainReference(state, pos.side_to_move.other(), mv.to, piece_values.value(mover_after_type));
 }
 
 /// Whether `by` attacks `target` in `state`, worked out forwards from every
@@ -287,7 +425,8 @@ fn squareAttackedReference(state: *const RefState, by: types.Color, target: squa
     const ci = @intFromEnum(by);
     for ([_]piece.PieceType{ .pawn, .knight, .bishop, .rook, .queen, .king }) |piece_type| {
         var remaining = state.pieces[ci][pieceTypeIndex(piece_type)];
-        while (bitboard.popLsb(&remaining)) |from| {
+        while (remaining != 0) {
+            const from = bitboard.popLsbUnchecked(&remaining);
             const reach = switch (piece_type) {
                 .pawn => attacks.pawnAttacksFrom(by, from),
                 .knight => attacks.knightAttacksFrom(from),
@@ -311,7 +450,12 @@ fn seeGainReference(state: RefState, side: types.Color, target: square.Square, v
     // An illegal king capture is no capture: this side stands pat.
     if (attacker.piece_type == .king and squareAttackedReference(&next, side.other(), target)) return 0;
 
-    const gain = victim_value - seeGainReference(next, side.other(), target, piece_values.value(attacker.piece_type));
+    // A pawn taking on a last-rank square promotes: it also gains queen - pawn
+    // and leaves a queen to be taken.
+    const promotes = attacker.piece_type == .pawn and (target.rank() == 0 or target.rank() == 7);
+    const taken = victim_value + (if (promotes) piece_values.value(.queen) - piece_values.value(.pawn) else 0);
+    const left_on_target = piece_values.value(if (promotes) .queen else attacker.piece_type);
+    const gain = taken - seeGainReference(next, side.other(), target, left_on_target);
     return @max(@as(i32, 0), gain);
 }
 
@@ -336,29 +480,40 @@ const DIFFERENTIAL_FENS = [_][]const u8{
     "8/8/3rk3/3p4/3RK3/3R4/8/8 w - - 0 1",
 };
 
+/// The reference is geometric (no pins), so it checks the swap with
+/// `Pins.none`; pinned recaptures have their own absolute cases below. The
+/// pin-aware threshold walk is checked against the pin-aware full score.
 fn expectSeeMatchesReference(pos: *position.Position) !usize {
-    const legal = @import("../movegen/legal.zig");
+    const legal_mod = @import("../movegen/legal.zig");
+    const none = Pins.none;
+    const pins = Pins.init(pos);
     var moves = move_mod.MoveList.init();
-    legal.generate(pos, &moves);
+    legal_mod.generate(pos, &moves);
     for (moves.slice()) |mv| {
-        try @import("std").testing.expectEqual(captureScoreReference(pos, mv), captureScore(pos, mv));
-        try @import("std").testing.expectEqual(quietScoreReference(pos, mv), quietScore(pos, mv));
+        try @import("std").testing.expectEqual(captureScoreReference(pos, mv), captureScoreWith(pos, mv, &none));
+        try @import("std").testing.expectEqual(quietScoreReference(pos, mv), quietScoreWith(pos, mv, &none));
         if (!mv.isCapture() and !mv.isPromotion()) {
-            const floor = -piece_values.value(pos.pieceAt(mv.from).pieceType());
+            const floor = quietFloor(pos, mv);
             const reference = quietScoreReference(pos, mv);
             try @import("std").testing.expect(reference >= floor);
+            try @import("std").testing.expect(quietScoreWith(pos, mv, &pins) >= floor);
             for ([_]i32{ floor - 1, floor, floor + 1, 0 }) |threshold| {
-                try @import("std").testing.expectEqual(reference < threshold, threshold > floor and quietScore(pos, mv) < threshold);
+                try @import("std").testing.expectEqual(reference < threshold, threshold > floor and quietScoreWith(pos, mv, &none) < threshold);
             }
         }
         const reference_quiet = quietScoreReference(pos, mv);
+        const pinned_quiet = quietScoreWith(pos, mv, &pins);
         for ([_]i32{
             @import("std").math.minInt(i32), -901,                -900,                            -501, -500,
             -331,                            -330,                -321,                            -320, -101,
             -100,                            -1,                  0,                               1,    reference_quiet - 1,
             reference_quiet,                 reference_quiet + 1, @import("std").math.maxInt(i32),
         }) |threshold| {
-            try @import("std").testing.expectEqual(reference_quiet < threshold, quietBelow(pos, mv, threshold));
+            try @import("std").testing.expectEqual(reference_quiet < threshold, quietBelowWith(pos, mv, threshold, &none));
+            try @import("std").testing.expectEqual(pinned_quiet < threshold, quietBelowWith(pos, mv, threshold, &pins));
+        }
+        for ([_]i32{ pinned_quiet - 1, pinned_quiet, pinned_quiet + 1 }) |threshold| {
+            try @import("std").testing.expectEqual(pinned_quiet < threshold, quietBelowWith(pos, mv, threshold, &pins));
         }
     }
     return moves.count;
@@ -381,8 +536,9 @@ test "iterative see matches recursive reference on legal captures AND quiets" {
             checked += try expectSeeMatchesReference(&child);
         }
     }
-    // The king-legality positions below, in both colours, one ply deep too.
-    for (KING_RULE_CASES) |case| {
+    // The king-legality, promotion, pin and pinned-promotion positions
+    // below, in both colours, one ply deep too.
+    for (KING_RULE_CASES ++ PROMOTION_CASES ++ PIN_CASES ++ PIN_PROMOTION_CASES) |case| {
         var buffer: [128]u8 = undefined;
         for ([_][]const u8{ case.fen, try mirrorFen(case.fen, &buffer) }) |fen_text| {
             var root = try fen.parse(fen_text);
@@ -447,8 +603,150 @@ const KING_RULE_CASES = [_]KingRuleCase{
     .{ .name = "Nxe5, opposing king covers, x-ray behind king", .fen = "8/8/2n1k3/4P3/4K3/4R3/8/8 b - - 0 1", .from = .c6, .to = .e5, .flag = .capture, .expected = 100 },
 };
 
+// Promotions inside the exchange (judges A and C, both directions) and the
+// mover's own promotion. Values on the same 100/320/330/500/900 scale.
+const PROMOTION_CASES = [_]KingRuleCase{
+    // a2xb1=Q answers: the rook is lost and the pawn becomes a queen. Was 0.
+    .{ .name = "Rxb1, pawn retakes and promotes", .fen = "7k/8/8/8/8/7K/pR6/1r6 w - - 0 1", .from = .b2, .to = .b1, .flag = .capture, .expected = -800 },
+    // Quiet form: below minus the rook's value. Was -500.
+    .{ .name = "quiet Rb1, pawn takes and promotes", .fen = "7k/8/8/8/8/7K/pR6/8 w - - 0 1", .from = .b2, .to = .b1, .flag = .quiet, .expected = -1300 },
+    // Rc1 takes the new queen back: the promotion gain cancels.
+    .{ .name = "Rxb1, Rc1 retakes the new queen", .fen = "7k/8/8/8/8/7K/pR6/1rR5 w - - 0 1", .from = .b2, .to = .b1, .flag = .capture, .expected = 100 },
+    // A losing capture that used to look winning. Was +180.
+    .{ .name = "Nxc1, pawn retakes and promotes", .fen = "7k/8/8/8/8/1N4K1/1p6/2r5 w - - 0 1", .from = .b3, .to = .c1, .flag = .capture, .expected = -620 },
+    // The mover's own pawn retakes with promotion, so Rxb8 is not played.
+    // Was -80 (qsearch skipped a winning capture).
+    .{ .name = "Qxb8, own pawn would retake and promote", .fen = "1nr4k/P7/8/8/8/8/8/1Q4K1 w - - 0 1", .from = .b1, .to = .b8, .flag = .capture, .expected = 320 },
+    // The mover's own promotion is credited. Were -400 and -900.
+    .{ .name = "bxa8=Q, king retakes", .fen = "rk6/1P6/8/8/8/8/8/4K3 w - - 0 1", .from = .b7, .to = .a8, .flag = .promo_queen_capture, .expected = 400 },
+    .{ .name = "a8=Q, rook retakes", .fen = "1r5k/P7/8/8/8/8/8/4K3 w - - 0 1", .from = .a7, .to = .a8, .flag = .promo_queen, .expected = -100 },
+    // Quiet moves onto the mover's own promotion square: the opponent declines
+    // the exchange, since the mover's pawn would retake and promote. The
+    // threshold walk (quietBelow) used to value that pawn as a pawn and
+    // answered "below" for thresholds from 0 down to -100 or further
+    // (review round, judges A F2 / C F1).
+    .{ .name = "quiet Qb8, own pawn would retake and promote", .fen = "2r4k/P7/8/8/8/8/8/1Q4K1 w - - 0 1", .from = .b1, .to = .b8, .flag = .quiet, .expected = 0 },
+    .{ .name = "quiet Rb8+, own pawn would retake and promote", .fen = "7k/P2n4/8/8/8/8/1R6/6K1 w - - 0 1", .from = .b2, .to = .b8, .flag = .quiet, .expected = 0 },
+    .{ .name = "quiet Qb8+ from g3, own pawn would retake and promote", .fen = "7k/P7/1r6/8/8/6Q1/8/6K1 w - - 0 1", .from = .g3, .to = .b8, .flag = .quiet, .expected = 0 },
+    .{ .name = "quiet Qb8+, knight takes, own pawn would retake and promote", .fen = "3k4/P7/n7/8/8/8/8/1Q4K1 w - - 0 1", .from = .b1, .to = .b8, .flag = .quiet, .expected = 0 },
+};
+
+test "see promotions inside the exchange and of the mover, absolute values" {
+    for (PROMOTION_CASES) |case| {
+        errdefer @import("std").debug.print("promotion case failed: {s}\n", .{case.name});
+        try expectKingRuleCase(case.fen, move_mod.Move.init(case.from, case.to, case.flag), case.expected);
+
+        var buffer: [128]u8 = undefined;
+        const mirrored = try mirrorFen(case.fen, &buffer);
+        try expectKingRuleCase(mirrored, move_mod.Move.init(mirrorSquare(case.from), mirrorSquare(case.to), case.flag), case.expected);
+    }
+}
+
+test "see quiet floor bounds every quiet move, promoting recaptures included" {
+    const fen = @import("../core/fen.zig");
+    const legal = @import("../movegen/legal.zig");
+    for (PROMOTION_CASES) |case| {
+        var buffer: [128]u8 = undefined;
+        for ([_][]const u8{ case.fen, try mirrorFen(case.fen, &buffer) }) |fen_text| {
+            const pos = try fen.parse(fen_text);
+            var moves = move_mod.MoveList.init();
+            legal.generate(&pos, &moves);
+            for (moves.slice()) |mv| {
+                if (mv.isCapture() or mv.isPromotion()) continue;
+                try @import("std").testing.expect(quietScore(&pos, mv) >= quietFloor(&pos, mv));
+            }
+        }
+    }
+    // Rb1 can lose rook and promotion: the floor must reach -1300.
+    const pos = try fen.parse("7k/8/8/8/8/7K/pR6/8 w - - 0 1");
+    try @import("std").testing.expectEqual(@as(i32, -1300), quietFloor(&pos, move_mod.Move.init(.b2, .b1, .quiet)));
+    try @import("std").testing.expectEqual(@as(i32, -500), quietFloor(&pos, move_mod.Move.init(.b2, .c2, .quiet)));
+}
+
+// Pinned recapturers (C-SEE-PIN), checked as written and colour-mirrored.
+const PIN_CASES = [_]KingRuleCase{
+    // Judge C repro: Nd8 is pinned by Ra8 and may not take on f7, and Ke8
+    // may not either (Bc4), so Qxf7 is mate. Was -800.
+    .{ .name = "Qxf7, recapturing knight pinned", .fen = "R2nkb2/3pppp1/8/7Q/2B5/8/8/6K1 w - - 0 1", .from = .h5, .to = .f7, .flag = .capture, .expected = 100 },
+    // Control without the pinning rook: Nxf7 Bxf7+ Kxf7 stays -800.
+    .{ .name = "Qxf7, knight free", .fen = "3nkb2/3pppp1/8/7Q/2B5/8/8/6K1 w - - 0 1", .from = .h5, .to = .f7, .flag = .capture, .expected = -800 },
+    // A pinned piece may take along its pin line: dxc6 keeps the d7 pawn on
+    // the a4-e8 diagonal, then Bxc6. Without that exception this was 0.
+    .{ .name = "quiet Nc6, pinned pawn takes along its line", .fen = "4k3/3p4/8/8/B2N4/8/8/4K3 w - - 0 1", .from = .d4, .to = .c6, .flag = .quiet, .expected = -220 },
+    // The same pawn may not take off its line: e6 leaves the diagonal.
+    .{ .name = "quiet Ne6, pinned pawn may not take", .fen = "4k3/3p4/8/8/B4N2/8/8/4K3 w - - 0 1", .from = .f4, .to = .e6, .flag = .quiet, .expected = 0 },
+};
+
+test "see skips recaptures by pinned pieces, absolute values" {
+    for (PIN_CASES) |case| {
+        errdefer @import("std").debug.print("pin case failed: {s}\n", .{case.name});
+        try expectPinCase(case.fen, move_mod.Move.init(case.from, case.to, case.flag), case.expected);
+
+        var buffer: [128]u8 = undefined;
+        const mirrored = try mirrorFen(case.fen, &buffer);
+        try expectPinCase(mirrored, move_mod.Move.init(mirrorSquare(case.from), mirrorSquare(case.to), case.flag), case.expected);
+    }
+}
+
+fn expectPinCase(fen_text: []const u8, mv: move_mod.Move, expected: i32) !void {
+    const std = @import("std");
+    const fen = @import("../core/fen.zig");
+    const legal_mod = @import("../movegen/legal.zig");
+
+    const pos = try fen.parse(fen_text);
+    var moves = move_mod.MoveList.init();
+    legal_mod.generate(&pos, &moves);
+    var found = false;
+    for (moves.slice()) |candidate| found = found or candidate == mv;
+    try std.testing.expect(found);
+
+    if (mv.isCapture()) {
+        try std.testing.expectEqual(expected, captureScore(&pos, mv));
+    } else {
+        try std.testing.expectEqual(expected, quietScore(&pos, mv));
+        for ([_]i32{ std.math.minInt(i32), expected - 1, expected, expected + 1, -321, -320, -221, -220, -219, -1, 0, 1 }) |threshold| {
+            try std.testing.expectEqual(expected < threshold, quietBelow(&pos, mv, threshold));
+        }
+    }
+}
+
+// A pinned recapturer that would also promote (C-SEE-PIN meets the
+// promotion-aware SEE). Rd2 pins b2 to Ka2 along rank 2, so b2xc1=Q would
+// leave the pin line and nothing recaptures on c1. The geometric swap lets
+// the pawn retake and promote: -620 for Nxc1, -1120 for the quiet Nc1.
+const PIN_PROMOTION_CASES = [_]KingRuleCase{
+    .{ .name = "Nxc1, promoting recapturer pinned", .fen = "8/8/8/8/8/1N4K1/kp1R4/2r5 w - - 0 1", .from = .b3, .to = .c1, .flag = .capture, .expected = 500 },
+    .{ .name = "quiet Nc1, promoting recapturer pinned", .fen = "8/8/8/8/8/1N4K1/kp1R4/8 w - - 0 1", .from = .b3, .to = .c1, .flag = .quiet, .expected = 0 },
+};
+
+test "see skips a pinned promoting recapture, and the threshold walk uses the caller's pins" {
+    const std = @import("std");
+    const fen = @import("../core/fen.zig");
+    for (PIN_PROMOTION_CASES) |case| {
+        errdefer std.debug.print("pinned promotion case failed: {s}\n", .{case.name});
+        try expectPinCase(case.fen, move_mod.Move.init(case.from, case.to, case.flag), case.expected);
+
+        var buffer: [128]u8 = undefined;
+        const mirrored = try mirrorFen(case.fen, &buffer);
+        try expectPinCase(mirrored, move_mod.Move.init(mirrorSquare(case.from), mirrorSquare(case.to), case.flag), case.expected);
+    }
+    // quietBelow answers a move onto a promoting recapture from the exact
+    // score, with the pins it was given: none gives the geometric -1120.
+    const none = Pins.none;
+    const capture_pos = try fen.parse(PIN_PROMOTION_CASES[0].fen);
+    try std.testing.expectEqual(@as(i32, -620), captureScoreWith(&capture_pos, move_mod.Move.init(.b3, .c1, .capture), &none));
+    const pos = try fen.parse(PIN_PROMOTION_CASES[1].fen);
+    const mv = move_mod.Move.init(.b3, .c1, .quiet);
+    const pins = Pins.init(&pos);
+    try std.testing.expectEqual(@as(i32, -1120), quietScoreWith(&pos, mv, &none));
+    for ([_]i32{ -1121, -1120, -1119, -1, 0, 1 }) |threshold| {
+        try std.testing.expectEqual(-1120 < threshold, quietBelowWith(&pos, mv, threshold, &none));
+        try std.testing.expectEqual(0 < threshold, quietBelowWith(&pos, mv, threshold, &pins));
+    }
+}
+
 fn mirrorSquare(sq: square.Square) square.Square {
-    return square.Square.fromIndex(sq.index() ^ 56);
+    return square.Square.fromIndex(@intFromEnum(sq) ^ 56);
 }
 
 fn swapCase(byte: u8) u8 {
@@ -532,7 +830,7 @@ fn expectKingRuleCase(fen_text: []const u8, mv: move_mod.Move, expected: i32) !v
     } else {
         try std.testing.expectEqual(expected, quietScore(&pos, mv));
         try std.testing.expectEqual(expected, quietScoreReference(&pos, mv));
-        for ([_]i32{ std.math.minInt(i32), expected - 1, expected, expected + 1, -901, -900, -899, -491, -490, -489, -1, 0, 1 }) |threshold| {
+        for ([_]i32{ std.math.minInt(i32), expected - 1, expected, expected + 1, -901, -900, -899, -700, -491, -490, -489, -300, -200, -100, -1, 0, 1 }) |threshold| {
             try std.testing.expectEqual(expected < threshold, quietBelow(&pos, mv, threshold));
         }
     }

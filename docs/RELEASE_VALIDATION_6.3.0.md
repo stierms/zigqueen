@@ -5,7 +5,7 @@ packaging metadata and two developer-tool defaults. The engine source is
 unchanged from the build that played the gauntlet and the self-play tests
 (`2d7193418` in our private history). No search or evaluation change was
 made after those tests. Build names such as "pre-multicore" and "6.3 base"
-are explained at the top of [STRENGTH.md](STRENGTH.md).
+are explained at the top of [STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/STRENGTH.md).
 
 ## Checks
 
@@ -127,4 +127,4 @@ the cause inside the search has not been found.
   copy from the published file. These are samples, not a full-corpus replay.
 
 `SHA256SUMS` covers the six zips, two APKs and the data archive. Match
-results and the self-play tests are in [STRENGTH.md](STRENGTH.md).
+results and the self-play tests are in [STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/STRENGTH.md).

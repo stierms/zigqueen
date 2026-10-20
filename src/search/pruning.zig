@@ -53,12 +53,21 @@ pub fn shouldReverseFutilityPrune(
     return eval_score - reverseFutilityMargin(depth, improving) >= beta;
 }
 
+/// Deepest node whose reverse-futility cutoff the hint table serves. Reads
+/// stop here, and the store side uses the same cap: deeper hints (basin RFP
+/// fires up to depth 12) were written but read only by a shallower revisit,
+/// while the depth-preferred two-slot clusters kept them over the shallow
+/// hints that are read.
+pub inline fn rfpHintMaxDepth() u16 {
+    return @intCast(tunables.active.rfp_max_depth);
+}
+
 /// The hint table memoises reverse-futility cutoffs, which fire only at zero
 /// windows, so the hint is read only there too. At a PV window it would cut
 /// the node on a heuristic its own RFP may not apply, or raise alpha so that a
 /// later fail low against the hint is returned and stored as an exact score.
 pub fn isRfpHintApplicable(depth: u16, alpha: types.Score, beta: types.Score) bool {
-    if (depth == 0 or depth > @as(u16, @intCast(tunables.active.rfp_max_depth))) return false;
+    if (depth == 0 or depth > rfpHintMaxDepth()) return false;
     if (isPvWindow(alpha, beta)) return false;
     if (score_mod.isMateLike(alpha) or score_mod.isMateLike(beta)) return false;
     return true;

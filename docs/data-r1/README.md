@@ -14,7 +14,7 @@ beyond the applicable open licenses.
 ## Attribution and license
 
 The underlying published collections and their providers are identified in
-[NETWORK.md](../NETWORK.md). Parts are made available by the Stockfish
+[NETWORK.md as of 6.2.0](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md). Parts are made available by the Stockfish
 project and LCZero under [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/),
 with LCZero contents under [DBCL 1.0](https://opendatacommons.org/licenses/dbcl/1-0/).
 Our database alterations are offered under ODbL-1.0; our individual added

@@ -183,6 +183,10 @@ pub const SearchStats = struct {
     hard_stops_external: u64 = 0,
     hard_stops_node_limit: u64 = 0,
     hard_stops_maximum_budget: u64 = 0,
+    /// TM v2: armed soft deadline reached inside an iteration.
+    hard_stops_soft_budget: u64 = 0,
+    /// TM v2 C1: interrupted iterations that supplied the played move.
+    interrupted_challengers: u64 = 0,
     lmr_reductions: u64 = 0,
     lmr_total_reduction: u64 = 0,
     lmr_pv_reductions: u64 = 0,

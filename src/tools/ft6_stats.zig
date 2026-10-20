@@ -53,11 +53,11 @@ const Ctx = struct {
 /// emitMoveDelta sink that only counts the changed features.
 const CountSink = struct {
     n: u32 = 0,
-    pub fn emit(self: *CountSink, comptime black: bool, comptime add: bool, idx: usize) void {
-        _ = black;
+    pub fn emitPair(self: *CountSink, comptime add: bool, iw: usize, ib: usize) void {
         _ = add;
-        _ = idx;
-        self.n += 1;
+        _ = iw;
+        _ = ib;
+        self.n += 2;
     }
 };
 
@@ -149,12 +149,12 @@ pub fn run(stdout: anytype, depth: u8) !void {
             "lean toggles/move : mean {d:.2}  p50 {d}  p95 {d}  p99 {d}  max {d}\n" ++
             "churn ratio (full/lean means): {d:.2}\n",
         .{
-            n,                             ctx.refreshes,
-            mf,                            pct(g_full[0..n], 50),
-            pct(g_full[0..n], 95),         pct(g_full[0..n], 99),
-            g_full[n - 1],                 ml,
-            pct(g_lean[0..n], 50),         pct(g_lean[0..n], 95),
-            pct(g_lean[0..n], 99),         g_lean[n - 1],
+            n,                     ctx.refreshes,
+            mf,                    pct(g_full[0..n], 50),
+            pct(g_full[0..n], 95), pct(g_full[0..n], 99),
+            g_full[n - 1],         ml,
+            pct(g_lean[0..n], 50), pct(g_lean[0..n], 95),
+            pct(g_lean[0..n], 99), g_lean[n - 1],
             mf / ml,
         },
     );

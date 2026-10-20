@@ -21,6 +21,9 @@ network was trained on the same 42 files with the same filter, hold-out,
 quotas and targets; only the architecture and the order in which positions
 were read differ. The archive is attached unchanged to the
 [6.4.0 release](https://github.com/stierms/zigqueen/releases/tag/v6.4.0).
+6.5.0 ships the same 6.4.0 network, byte for byte, and the archive is attached
+unchanged to the [6.5.0 release](https://github.com/stierms/zigqueen/releases/tag/v6.5.0)
+as well.
 
 ## Attribution and license
 

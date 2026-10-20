@@ -181,8 +181,7 @@ outputs (`raw-endpoint.weights.bin` `2afb6618…`, `quantised.bin` `cfe65137…`
   byte-identical to the embedded net;
 - `check` passes, with threat and pawn weights within ±126.
 
-[NETWORK.md](../NETWORK.md) explains why the recipe is built this way and
-gives the measured results.
+[NETWORK.md](../NETWORK.md) explains why the recipe is built this way.
 
 ### Not included
 
@@ -326,7 +325,7 @@ average. It refuses to start if any recorded setting differs, including the
 hash of the program itself. The 6.3.0 run was resumed four times this way.
 After the last superbatch the program writes the mean of the late
 checkpoints to `averaged/`, and that model is the input to QAT. The recipe
-numbers are in [NETWORK.md](../NETWORK.md).
+numbers are in [NETWORK.md as of 6.3.0](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/NETWORK.md).
 
 `zq_bt4_head_qat CONFIG OUTPUT [CHECKPOINT]` runs the QAT stage from a
 configuration table and inputs prepared from the averaged model.
@@ -343,7 +342,7 @@ configuration table and inputs prepared from the averaged model.
   rules are offered in [data-r2/README.md](../data-r2/README.md).
 - Bit-exact retraining. GPU training is not bitwise deterministic, so a
   rebuild gives the same programs, not the same weights. The released
-  weights are identified by their SHA-256 in [NETWORK.md](../NETWORK.md).
+  weights are identified by their SHA-256 in [NETWORK.md as of 6.3.0](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/NETWORK.md).
 
 ### License and origin
 
@@ -369,7 +368,7 @@ extension as a single patch against upstream bullet commit `d372d48`:
   the data mixing used by the recipe;
 - `examples/zqHalfKA9_fullthreats_w1024_relabel26.rs` (new): the training
   recipe of the original base network (architecture, schedule, and the data
-  components listed in `../NETWORK.md`; data paths are local);
+  components listed in [NETWORK.md as of 6.2.0](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md); data paths are local);
 - `tools/fullthreats_grader.py` (new): the reference grader that checks the
   trainer's feature indices against the engine's tables.
 
@@ -387,7 +386,7 @@ reproducibility; it carries bullet's MIT license for the modified files.
 
 The 6.2.0 head continuation (quantization-aware, heads only) used a later
 trainer change that this patch does not include; its recipe is in
-[NETWORK.md](../NETWORK.md) and the data corrections it trained on in
+[NETWORK.md as of 6.2.0](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md) and the data corrections it trained on in
 [data-r1/README.md](../data-r1/README.md).
 
 *Added with 6.3.0:* `bullet-fullthreats.patch` declares

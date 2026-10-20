@@ -42,6 +42,9 @@ pub const Method = enum {
     win_virtual,
     /// Plain fallback-allocator memory (small size, or every mapped rung failed).
     heap,
+    /// A view into a cross-process shared blob (util/shared_blob.zig). The
+    /// blob owns the mapping; freeing a `.shared` block is a no-op.
+    shared,
 
     pub fn name(self: Method) []const u8 {
         return switch (self) {
@@ -50,6 +53,7 @@ pub const Method = enum {
             .win_large => "win_large",
             .win_virtual => "win_virtual",
             .heap => "heap",
+            .shared => "shared",
         };
     }
 };
@@ -90,6 +94,12 @@ var clear_thp_disable_once = runtime.once(clearThpDisable);
 fn clearThpDisable() void {
     if (builtin.os.tag != .linux) return;
     _ = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_THP_DISABLE), 0, 0, 0, 0);
+}
+
+/// Clear an inherited PR_SET_THP_DISABLE once (see above). Also required
+/// before MADV_COLLAPSE on the shared weight blob, which the flag would veto.
+pub fn ensureThpAllowed() void {
+    clear_thp_disable_once.call();
 }
 
 // ---- Windows large pages ---------------------------------------------------
@@ -171,6 +181,15 @@ var win_status: WinStatusCell = .{};
 var win_large_min: usize = 0; // GetLargePageMinimum(); 0 => unsupported
 var win_privilege_ok: bool = false;
 var win_privilege_once = runtime.once(enableLockMemoryPrivilege);
+
+/// Windows: GetLargePageMinimum() when SeLockMemoryPrivilege is enabled for
+/// this process (the same gate as the VirtualAlloc large-page rung), else 0.
+/// Callers use it to decide SEC_LARGE_PAGES for a shared section.
+pub fn winLargePageMinimum() usize {
+    if (builtin.os.tag != .windows) return 0;
+    win_privilege_once.call();
+    return if (win_privilege_ok) win_large_min else 0;
+}
 
 pub fn winLargePageStatus() WinLargePageStatus {
     return win_status.read();
@@ -257,14 +276,36 @@ pub fn free(comptime T: type, fallback: std.mem.Allocator, backed: Backed(T)) vo
     freeAligned(T, std.mem.Alignment.of(T), fallback, backed);
 }
 
+/// Like `alloc`, but a block of any size takes the huge-page rungs, its mapping
+/// rounded up to whole huge pages. For hot, randomly touched structures below
+/// 2MB (the search context, ~1.8MB since the combined accumulator; the
+/// correction tables, ~320KB) one huge page is cheaper than the dTLB misses of
+/// hundreds of 4KB pages; the rounding costs at most one huge page of memory.
+/// Frees go through `free` as usual (the Linux unmap and the Windows release
+/// already cover the rounded mapping).
+pub fn allocWholePages(comptime T: type, fallback: std.mem.Allocator, n: usize) std.mem.Allocator.Error!Backed(T) {
+    return allocFrom(T, std.mem.Alignment.of(T), fallback, n, 1);
+}
+
 pub fn allocAligned(
     comptime T: type,
     comptime alignment: std.mem.Alignment,
     fallback: std.mem.Allocator,
     n: usize,
 ) std.mem.Allocator.Error!BackedAligned(T, alignment) {
+    return allocFrom(T, alignment, fallback, n, HUGE_PAGE_BYTES);
+}
+
+/// The ladder for blocks of at least `min_huge_bytes`; smaller ones go to `fallback`.
+fn allocFrom(
+    comptime T: type,
+    comptime alignment: std.mem.Alignment,
+    fallback: std.mem.Allocator,
+    n: usize,
+    min_huge_bytes: usize,
+) std.mem.Allocator.Error!BackedAligned(T, alignment) {
     const byte_len = n * @sizeOf(T);
-    const huge_candidate = byte_len >= HUGE_PAGE_BYTES and
+    const huge_candidate = byte_len != 0 and byte_len >= min_huge_bytes and
         comptime (alignment.toByteUnits() <= std.heap.page_size_min);
     if (builtin.os.tag == .linux and huge_candidate) {
         clear_thp_disable_once.call();
@@ -300,6 +341,8 @@ pub fn freeAligned(
     if (backed.items.len == 0) return;
     switch (backed.method) {
         .heap => fallback.free(backed.items),
+        // Owned by the shared blob, released with it.
+        .shared => {},
         // Mapped methods only ever come out of the Linux mmap ladder in `allocAligned`.
         .hugetlb, .thp_madvise => if (builtin.os.tag == .linux) {
             const byte_len = backed.items.len * @sizeOf(T);
@@ -400,6 +443,20 @@ test "large allocations are usable end-to-end whatever path engages" {
     // Every huge-page rung must hand back a 2MB-aligned base (hugetlb and
     // win_large by the kernel, thp_madvise by the over-map-and-trim dance).
     // win_virtual is a regular VirtualAlloc mapping, which promises 64KiB.
+    if (backed.method != .heap and backed.method != .win_virtual) {
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(backed.items.ptr) % HUGE_PAGE_BYTES);
+    }
+}
+
+test "whole-page allocations take the huge-page rungs below 2MB" {
+    const n = (HUGE_PAGE_BYTES - 4096) / @sizeOf(u64);
+    var backed = try allocWholePages(u64, std.testing.allocator, n);
+    defer free(u64, std.testing.allocator, backed);
+    try std.testing.expectEqual(n, backed.items.len);
+    @memset(backed.items, 3);
+    backed.items[n - 1] = 9;
+    try std.testing.expectEqual(@as(u64, 9), backed.items[n - 1]);
+    if (builtin.os.tag == .linux) try std.testing.expect(backed.method != .heap);
     if (backed.method != .heap and backed.method != .win_virtual) {
         try std.testing.expectEqual(@as(usize, 0), @intFromPtr(backed.items.ptr) % HUGE_PAGE_BYTES);
     }

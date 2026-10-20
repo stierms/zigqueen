@@ -19,6 +19,13 @@
 #   avx512 = x86-64-v4 + AVX512-VNNI — Ice Lake / Zen 4 and newer.
 # All variants are bit-exact (identical node counts); only speed differs.
 #
+# The four x86-64 binaries are PGO builds: scripts/pgo-build.sh `use` links each
+# with its committed profile, scripts/pgo/profiles/<os>-<variant>.profdata, and
+# gates it (profile matches this tree; bench 16 nodes equal to the plain build).
+# The work directories stay under release/pgo/. The Android binaries are plain.
+# PGO=0 builds all six without profiles. PGO_BENCH=0 skips the bench gate on a
+# host that cannot run a variant (no AVX-512, or no WSL interop for Windows).
+#
 # Requirements: zig 0.15.2 on PATH; `zip` or python3 for archiving.
 # Usage: scripts/package-release.sh   (from anywhere; paths are repo-relative)
 set -euo pipefail
@@ -69,9 +76,16 @@ for os_name in linux windows; do
             build_args+=(-Dtarget=x86_64-windows-gnu)
             ext=".exe"
         fi
-        zig build "${build_args[@]}"
-
-        built="zig-out/bin/zigqueen-x86_64-${variant}${ext}"
+        if [[ "${PGO:-1}" == 0 ]]; then
+            zig build "${build_args[@]}"
+            built="zig-out/bin/zigqueen-x86_64-${variant}${ext}"
+        else
+            # Same flags, inside pgo-build.sh; it links with the committed profile.
+            work="$OUT_DIR/pgo/${os_name}-${variant}"
+            "$ROOT/scripts/pgo-build.sh" use "${os_name}-${variant}" "$work" \
+                "$ROOT/scripts/pgo/profiles/${os_name}-${variant}.profdata"
+            built="$work/zigqueen-pgo${ext}"
+        fi
         [[ -f "$built" ]] || { echo "ERROR: expected artifact $built missing" >&2; exit 1; }
 
         name="zigqueen-${VERSION}-${os_name}-x86_64-${variant}"

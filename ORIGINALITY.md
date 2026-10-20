@@ -39,7 +39,8 @@ inherited defaults and formula lineage still require attribution.
 not erase the original source or make all remaining values independent.
 
 Two third-party libraries are vendored under their own licenses: Fathom
-(Syzygy probing, MIT) and the Android OEX provider library (Apache-2.0).
+(Syzygy probing, MIT; since 6.5.0 only in a test tool that checks the
+engine's own prober) and the Android OEX provider library (Apache-2.0).
 See `THIRD_PARTY_LICENSES.md`.
 
 ## Allowed references

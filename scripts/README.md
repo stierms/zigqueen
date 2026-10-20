@@ -30,6 +30,20 @@ See `docs/TUNING.md` for the validation ladder these implement.
 - `bolt-optimize.sh` — optional llvm-bolt post-link layout optimization,
   gated by a fixed-depth node-identity check.
 
+## Release build
+
+- `package-release.sh` — build and zip the six release binaries into
+  `release/`. The four x86-64 ones are PGO builds from the committed profiles
+  (`PGO=0` for plain builds); the Android ones are plain.
+- `pgo-build.sh` — context-sensitive PGO at Zig's LTO link: `train` a profile
+  for one packaged x86-64 variant (needs LLVM 20's `llvm-profdata`, and WSL
+  interop for the Windows variants), or `use` a profile, with gates for a
+  stale profile and for `bench 16` equality with the plain build. Helpers in
+  `pgo/`: `profsnap.py` (training run, counters read from the live process),
+  `profunion.py` (optional union of profiles), `rthook.c` (Windows stub),
+  `train-positions.json` (training workload); `pgo/profiles/` holds the
+  committed profiles.
+
 ## Windows build
 
 - `build-windows-revision.sh` — build a packaged native `zigqueen.exe` from a

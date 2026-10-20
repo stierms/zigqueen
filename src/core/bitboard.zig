@@ -13,7 +13,7 @@ pub inline fn fileMask(file: u3) Bitboard {
 }
 
 pub inline fn bit(square: square_mod.Square) Bitboard {
-    return @as(Bitboard, 1) << square.index();
+    return @as(Bitboard, 1) << @intFromEnum(square);
 }
 
 pub inline fn contains(bb: Bitboard, square: square_mod.Square) bool {
@@ -34,14 +34,12 @@ pub inline fn popCount(bb: Bitboard) u8 {
 
 pub inline fn lsb(bb: Bitboard) ?square_mod.Square {
     if (bb == 0) return null;
-    const idx: u6 = @intCast(@ctz(bb));
-    return square_mod.Square.fromIndex(idx);
+    return @enumFromInt(@as(u6, @intCast(@ctz(bb))));
 }
 
 pub inline fn msb(bb: Bitboard) ?square_mod.Square {
     if (bb == 0) return null;
-    const idx: u6 = @intCast(63 - @clz(bb));
-    return square_mod.Square.fromIndex(idx);
+    return @enumFromInt(@as(u6, @intCast(63 - @clz(bb))));
 }
 
 pub inline fn popLsbIndex(bb: *Bitboard) ?u6 {
@@ -55,6 +53,18 @@ pub inline fn popLsbIndex(bb: *Bitboard) ?u6 {
 pub inline fn popLsb(bb: *Bitboard) ?square_mod.Square {
     const idx = popLsbIndex(bb) orelse return null;
     return square_mod.Square.fromIndex(idx);
+}
+
+/// The lowest square of a NON-EMPTY `bb`, removed from it. The hot loops use
+/// `while (bb != 0) { const sq = popLsbUnchecked(&bb); ... }` instead of
+/// `while (popLsb(&bb)) |sq|`: the optional ?Square result (an i6 payload)
+/// left LLVM a spill slot it could not promote (i6 store, i8 load) in every
+/// loop it was inlined into; the builtins here keep the square in a register.
+pub inline fn popLsbUnchecked(bb: *Bitboard) square_mod.Square {
+    const value = bb.*;
+    std.debug.assert(value != 0);
+    bb.* = value & (value - 1);
+    return @enumFromInt(@as(u6, @intCast(@ctz(value))));
 }
 
 test "bitboard set clear and contains behave as expected" {

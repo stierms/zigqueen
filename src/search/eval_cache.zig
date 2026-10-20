@@ -9,54 +9,41 @@
 //! full NNUE forward on revisit. This table is a cheap second chance keyed
 //! ONLY by position, with no depth competition.
 //!
-//! Design:
-//!   - 2-way set-associative, 1-bit-LRU (shipped default since perf-r12; was
-//!     direct-mapped in v5.7.0). Sets are 2 adjacent 16-byte entries (32B,
-//!     in-line — 4 entries per 64B line); the victim is the slot NOT hit
-//!     last. The r12 sweep measured 2-way ≈ a full size doubling: at d18 it
-//!     buys +2.5-3.1pp hit rate at equal size (16MB 2-way == 32MB direct).
-//!   - Verifier = the FULL 64-bit zobrist key, matching the TT's verifier
-//!     width exactly: a hit returns the raw eval of that exact position up to
-//!     a full zobrist collision — the identical risk class the TT already
-//!     accepts for Entry.static_eval reuse. Never narrow this to save space;
-//!     d14 node-identity vs the uncached binary is the standing proof.
-//!   - Indexed by the HIGH key bits (key >> (64 - log2(len))). The TT and
-//!     rfp-hint tables both index by the LOW bits (key & mask); using the
-//!     high bits decorrelates this table's conflict sets from theirs at zero
-//!     cost (any index derivation is safe — the full key is the verifier).
-//!   - key == 0 is the empty sentinel; a real position whose zobrist is
-//!     exactly 0 (p ~ 2^-64, same class as a zobrist collision) is simply
-//!     never cached (probe misses, store skips).
-//!   - Sized off UCI Hash: Hash/4 clamped to [4, 64] MB (64MB default Hash
-//!     -> 16MB cache; was Hash/8 [4,32] in v5.7.0 — the d18 sweep showed the
-//!     8MB table 90-97% full and thrashing against a ~1.1M-entry working
-//!     set; 8->16MB 2-way is +7.7pp hit-after-TT-miss at d18). No UCI option
-//!     of its own; ucinewgame clears it (via Engine.reset), Hash resize
-//!     re-sizes it. At Threads = N every engine keeps a private copy of 1/N
-//!     of that size (floor 4 MB; engine.zig PrivateTableSizes).
+//! Design (perf r3, compact form; 2-way 16-byte entries before):
+//!   - 8-way sets of 8-byte entries: one set is one 64-byte line, so a probe
+//!     still touches one line, and the same memory holds twice the entries.
+//!     LRU by move-to-front inside the set: a hit or a store puts its entry
+//!     first, a store of a new key drops the last.
+//!   - An entry is the key's low 48 bits (the tag) above the i16 eval. Sets are
+//!     indexed by the HIGH key bits (key >> (64 - log2(sets))), at least 16 of
+//!     them at every allowed size (asserted at resize), so tag and index
+//!     together are the FULL 64-bit key: a hit returns the raw eval of that
+//!     exact position up to a full zobrist collision, the risk class the TT
+//!     already accepts for Entry.static_eval reuse. d13 node identity vs the
+//!     uncached binary is the standing proof.
+//!   - The TT and rfp-hint tables index by the LOW key bits; the high-bit index
+//!     decorrelates this table's conflict sets from theirs at zero cost.
+//!   - A zero entry is empty; a key whose low 48 bits are all zero (p ~ 2^-48)
+//!     is simply never cached (probe misses, store skips).
+//!   - Sized off UCI Hash: Hash/4 clamped to [4, 64] MB. No UCI option of its
+//!     own; ucinewgame clears it (via Engine.reset), Hash resize re-sizes it.
+//!     At Threads = N every engine keeps a private copy of 1/N of that size
+//!     (floor 4 MB; engine.zig PrivateTableSizes).
 //!   - Allocation routed through util/hugealloc like the TT/rfp-hint tables
 //!     (zobrist-indexed random access over MBs -> same dTLB story).
 //!
-//! perf-r12 experiment scaffolding (compiled into -Dsearch-stats builds ONLY;
-//! release builds comptime-fold every policy check to the shipped default):
-//!   - ZQ_EVAL_CACHE_MB: override the table size (clamped [4, 256] MB) for
-//!     sizing sweeps at fixed Hash.
-//!   - ZQ_EVAL_CACHE_ASSOC=1|2: direct-mapped vs 2-way. The 2-way variant
-//!     pairs adjacent entries (32B set — in-line: 4 entries per 64B line) and
-//!     replaces the slot NOT hit last (1-bit LRU stored in slot0's spare
-//!     byte; a probe hit writes the bit only when it changes). Values stay
-//!     exact — node-identity holds for every variant.
+//! Stats builds only (release builds fold it away): ZQ_EVAL_CACHE_MB overrides
+//! the table size (clamped [4, 256] MB) for sizing sweeps at fixed Hash.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const hugealloc = @import("../util/hugealloc.zig");
 
-/// Experiment knobs (env overrides + runtime associativity switch) exist only
-/// in stats builds; release builds fold every policy check to the default.
+/// The size override exists only in stats builds.
 pub const experiment_overrides_enabled: bool = build_options.search_stats;
 
-/// Shipped replacement policy: 1 = direct-mapped, 2 = 2-way 1-bit-LRU.
-pub const default_assoc: u8 = 2;
+/// Entries per set (one 64-byte line).
+pub const WAYS: usize = 8;
 
 /// Absolute table bounds (resize clamp). The wide 256MB ceiling exists for
 /// stats-build sizing sweeps; the SHIPPED size always comes from sizeForHash,
@@ -68,22 +55,21 @@ pub const MAX_CACHE_MB: u32 = 256;
 pub const HASH_DERIVED_MIN_MB: u32 = 4;
 pub const HASH_DERIVED_MAX_MB: u32 = 64;
 
-pub const Entry = struct {
-    /// Full 64-bit zobrist key (verifier). 0 = empty.
-    key: u64 = 0,
-    /// Raw static eval, exactly what evaluator.evaluate returned. Raw NNUE
-    /// output is well inside i16 (the TT stores the same value as i16).
-    eval: i16 = 0,
-    /// 2-way mode only, meaningful on slot0 of each pair: index (0/1) of the
-    /// most-recently-USED slot in the set; the victim is the other slot.
-    /// Lives in what was padding — Entry stays 16 bytes. Unused when direct.
-    meta: u8 = 0,
+/// Key bits stored in an entry; the set index must supply the other 16.
+const TAG_BITS = 48;
+const TAG_MASK: u64 = (@as(u64, 1) << TAG_BITS) - 1;
+const MIN_INDEX_BITS = 64 - TAG_BITS;
+
+/// One line: entries most recently used first. An entry is
+/// `tag << 16 | (eval as u16)`; 0 is empty.
+pub const Set = extern struct {
+    slots: [WAYS]u64 align(64) = [_]u64{0} ** WAYS,
 };
 
 comptime {
-    // 4 entries per 64B cache line; the index math assumes a 16B stride and
-    // 2-way sets (2 adjacent entries, 32B) never straddling a line.
-    std.debug.assert(@sizeOf(Entry) == 16);
+    std.debug.assert(@sizeOf(Set) == 64 and @alignOf(Set) == 64);
+    // The smallest table still has enough index bits for full-key equivalence.
+    std.debug.assert(std.math.log2_int(u64, setCountFor(MIN_CACHE_MB)) >= MIN_INDEX_BITS);
 }
 
 pub const Occupancy = struct { filled: usize, total: usize };
@@ -91,55 +77,52 @@ pub const Occupancy = struct { filled: usize, total: usize };
 pub const EvalCache = struct {
     allocator: std.mem.Allocator,
     configured_mb: u32 = 0,
-    entries: []Entry = &.{},
-    /// How `entries` is backed; frees must go through hugealloc with this.
+    sets: []Set = &.{},
+    /// How `sets` is backed; frees must go through hugealloc with this.
     alloc_method: hugealloc.Method = .heap,
-    /// Right-shift that maps a key's HIGH bits onto [0, entries.len).
+    /// Right-shift that maps a key's HIGH bits onto [0, sets.len).
     index_shift: u6 = 63,
-    /// Associativity (1 or 2). Only consulted in stats builds; release builds
-    /// use default_assoc at comptime (isTwoWay folds the field access away).
-    assoc: u8 = default_assoc,
 
     pub fn init(allocator: std.mem.Allocator, cache_mb: u32) !EvalCache {
         var cache = EvalCache{ .allocator = allocator };
         try cache.resize(cache_mb);
         if (comptime experiment_overrides_enabled) {
             if (envU32(allocator, "ZQ_EVAL_CACHE_MB")) |mb| try cache.resize(mb);
-            if (envU32(allocator, "ZQ_EVAL_CACHE_ASSOC")) |ways| {
-                if (ways == 1 or ways == 2) cache.assoc = @intCast(ways);
-            }
         }
         return cache;
     }
 
     pub fn deinit(self: *EvalCache) void {
-        hugealloc.free(Entry, self.allocator, .{ .items = self.entries, .method = self.alloc_method });
+        hugealloc.free(Set, self.allocator, .{ .items = self.sets, .method = self.alloc_method });
         self.configured_mb = 0;
-        self.entries = &.{};
+        self.sets = &.{};
         self.alloc_method = .heap;
         self.index_shift = 63;
     }
 
     pub fn clear(self: *EvalCache) void {
-        if (self.entries.len != 0) @memset(self.entries, .{});
+        if (self.sets.len != 0) @memset(self.sets, .{});
     }
 
     pub fn resize(self: *EvalCache, cache_mb: u32) !void {
         const clamped_mb = std.math.clamp(cache_mb, MIN_CACHE_MB, MAX_CACHE_MB);
-        const new_len = entryCountFor(clamped_mb);
-        if (self.entries.len == new_len) {
+        const new_len = setCountFor(clamped_mb);
+        if (self.sets.len == new_len) {
             self.configured_mb = clamped_mb;
             self.clear();
             return;
         }
 
-        hugealloc.free(Entry, self.allocator, .{ .items = self.entries, .method = self.alloc_method });
-        self.entries = &.{};
-        const backed = try hugealloc.alloc(Entry, self.allocator, new_len);
-        self.entries = backed.items;
+        hugealloc.free(Set, self.allocator, .{ .items = self.sets, .method = self.alloc_method });
+        self.sets = &.{};
+        const backed = try hugealloc.alloc(Set, self.allocator, new_len);
+        self.sets = backed.items;
         self.alloc_method = backed.method;
         self.configured_mb = clamped_mb;
-        self.index_shift = @intCast(@as(usize, 64) - std.math.log2_int(usize, new_len));
+        const index_bits = std.math.log2_int(usize, new_len);
+        // Tag + index = the full 64-bit key (see the design notes).
+        std.debug.assert(index_bits >= MIN_INDEX_BITS);
+        self.index_shift = @intCast(@as(usize, 64) - index_bits);
         self.clear();
     }
 
@@ -148,42 +131,34 @@ pub const EvalCache = struct {
     }
 
     pub fn assocWays(self: *const EvalCache) u8 {
-        return if (self.isTwoWay()) 2 else 1;
+        _ = self;
+        return WAYS;
     }
 
     /// Filled-entry count (report-time scan; never on the search path).
     pub fn occupancy(self: *const EvalCache) Occupancy {
         var filled: usize = 0;
-        for (self.entries) |*entry| {
-            if (entry.key != 0) filled += 1;
+        for (self.sets) |*set| {
+            for (set.slots) |slot| filled += @intFromBool(slot != 0);
         }
-        return .{ .filled = filled, .total = self.entries.len };
+        return .{ .filled = filled, .total = self.sets.len * WAYS };
     }
 
     /// The raw static eval for `key`, or null. A non-null result is THE value
     /// evaluator.evaluate would return for this position (full-key verified).
-    /// Takes *EvalCache: the 2-way variant refreshes its per-set LRU bit on a
-    /// hit (write only when the bit changes); the direct path never writes.
+    /// A hit moves its entry to the front of the set.
     pub inline fn probe(self: *EvalCache, key: u64) ?i16 {
-        if (self.entries.len == 0) return null;
-        if (self.isTwoWay()) {
-            if (key == 0) return null;
-            const base = self.setBase(key);
-            const e0: *Entry = &self.entries[base];
-            const e1: *Entry = &self.entries[base + 1];
-            if (e0.key == key) {
-                if (e0.meta != 0) e0.meta = 0;
-                return e0.eval;
-            }
-            if (e1.key == key) {
-                if (e0.meta != 1) e0.meta = 1;
-                return e1.eval;
-            }
-            return null;
-        }
-        const entry = &self.entries[self.index(key)];
-        if (entry.key == key and key != 0) return entry.eval;
-        return null;
+        if (self.sets.len == 0) return null;
+        const tag = key & TAG_MASK;
+        if (tag == 0) return null;
+        const set = &self.sets[self.setIndex(key)];
+        const slots: @Vector(WAYS, u64) = set.slots;
+        const hits: u8 = @bitCast((slots >> @splat(16)) == @as(@Vector(WAYS, u64), @splat(tag)));
+        if (hits == 0) return null;
+        const way: u3 = @intCast(@ctz(hits));
+        const entry = set.slots[way];
+        if (way != 0) moveToFront(set, slots, way, entry);
+        return @bitCast(@as(u16, @truncate(entry)));
     }
 
     /// Overlap a child's eval-cache miss with its TT probe: the parent issues
@@ -192,69 +167,44 @@ pub const EvalCache = struct {
     /// misses the caches on most probes (the probe compare was 6% of negamax and
     /// 11-17% of quiescence cycles). A hint only: no value changes.
     pub inline fn prefetch(self: *const EvalCache, key: u64) void {
-        if (self.entries.len == 0) return;
-        const slot = if (self.isTwoWay()) self.setBase(key) else self.index(key);
-        @prefetch(&self.entries[slot], .{ .rw = .read, .locality = 3, .cache = .data });
+        if (self.sets.len == 0) return;
+        @prefetch(&self.sets[self.setIndex(key)], .{ .rw = .read, .locality = 3, .cache = .data });
     }
 
-    /// Memoize a freshly computed raw eval. Direct: always replaces. 2-way:
-    /// matching slot, else an empty slot, else the slot NOT hit last.
+    /// Memoize a freshly computed raw eval: the entry goes to the front of its
+    /// set, replacing the key's old entry if there is one, else the last.
     pub inline fn store(self: *EvalCache, key: u64, eval: i16) void {
-        if (self.entries.len == 0 or key == 0) return;
-        if (self.isTwoWay()) {
-            const base = self.setBase(key);
-            const e0: *Entry = &self.entries[base];
-            const e1: *Entry = &self.entries[base + 1];
-            if (e0.key == key or e0.key == 0) {
-                e0.key = key;
-                e0.eval = eval;
-                e0.meta = 0;
-                return;
-            }
-            if (e1.key == key or e1.key == 0) {
-                e1.key = key;
-                e1.eval = eval;
-                e0.meta = 1;
-                return;
-            }
-            if (e0.meta == 0) {
-                // Slot0 was used last -> evict slot1.
-                e1.key = key;
-                e1.eval = eval;
-                e0.meta = 1;
-            } else {
-                e0.key = key;
-                e0.eval = eval;
-                e0.meta = 0;
-            }
-            return;
-        }
-        self.entries[self.index(key)] = .{ .key = key, .eval = eval };
+        if (self.sets.len == 0) return;
+        const tag = key & TAG_MASK;
+        if (tag == 0) return;
+        const set = &self.sets[self.setIndex(key)];
+        const slots: @Vector(WAYS, u64) = set.slots;
+        const hits: u8 = @bitCast((slots >> @splat(16)) == @as(@Vector(WAYS, u64), @splat(tag)));
+        const way: u3 = if (hits != 0) @intCast(@ctz(hits)) else WAYS - 1;
+        moveToFront(set, slots, way, (tag << 16) | @as(u16, @bitCast(eval)));
     }
 
-    inline fn isTwoWay(self: *const EvalCache) bool {
-        if (comptime !experiment_overrides_enabled) return default_assoc == 2;
-        return self.assoc == 2;
-    }
-
-    inline fn index(self: *const EvalCache, key: u64) usize {
+    inline fn setIndex(self: *const EvalCache, key: u64) usize {
         return @intCast(key >> self.index_shift);
-    }
-
-    /// 2-way set base: high key bits select one of len/2 sets of 2 adjacent
-    /// entries (even index). One extra shift vs direct — same single line.
-    inline fn setBase(self: *const EvalCache, key: u64) usize {
-        return @intCast((key >> (self.index_shift + 1)) << 1);
     }
 };
 
-fn entryCountFor(cache_mb: u32) usize {
-    const target_bytes = @as(u64, cache_mb) * 1024 * 1024;
-    const max_entries = @max(@as(u64, 1), target_bytes / @sizeOf(Entry));
+/// Write `entry` to the front of `set` and shift the entries before `way` back
+/// by one (`slots` is the set as loaded); entries after `way` stay.
+inline fn moveToFront(set: *Set, slots: @Vector(WAYS, u64), way: u3, entry: u64) void {
+    const LANE: @Vector(WAYS, u8) = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const shifted = @shuffle(u64, slots, @as(@Vector(1, u64), @splat(entry)), @Vector(WAYS, i32){ -1, 0, 1, 2, 3, 4, 5, 6 });
+    const moved = LANE <= @as(@Vector(WAYS, u8), @splat(way));
+    set.slots = @select(u64, moved, shifted, slots);
+}
 
-    var entries: u64 = 1;
-    while ((entries << 1) <= max_entries) : (entries <<= 1) {}
-    return @intCast(entries);
+fn setCountFor(cache_mb: u32) usize {
+    const target_bytes = @as(u64, cache_mb) * 1024 * 1024;
+    const max_sets = @max(@as(u64, 1), target_bytes / @sizeOf(Set));
+
+    var sets: u64 = 1;
+    while ((sets << 1) <= max_sets) : (sets <<= 1) {}
+    return @intCast(sets);
 }
 
 /// Cache size derived from UCI Hash: Hash/4, clamped to [4, 64] MB.
@@ -278,50 +228,112 @@ test "eval cache stores and retrieves the raw eval" {
     try std.testing.expect(cache.probe(0xDEADBEEF) == null);
     cache.store(0xDEADBEEF, -123);
     try std.testing.expectEqual(@as(?i16, -123), cache.probe(0xDEADBEEF));
+    cache.store(0xDEADBEEF, 77);
+    try std.testing.expectEqual(@as(?i16, 77), cache.probe(0xDEADBEEF));
+    try std.testing.expectEqual(@as(usize, 1), cache.occupancy().filled);
 }
 
-test "eval cache verifies the full key on colliding index" {
+test "eval cache verifies the full key: tag plus index bits" {
     var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
     defer cache.deinit();
-    // Direct-mapped-specific assertions; runnable only when the runtime
-    // assoc switch exists (stats builds) or the shipped default is direct.
-    cache.assoc = 1;
-    if (cache.assocWays() != 1) return error.SkipZigTest;
+    try std.testing.expect(64 - @as(usize, cache.index_shift) >= MIN_INDEX_BITS);
 
-    // Same table index (high bits), different keys: the low bits differ.
+    // Same set (high bits), different low bits: different tags.
     const key_a: u64 = 0xABCD_0000_0000_0001;
     const key_b: u64 = 0xABCD_0000_0000_0002;
-    try std.testing.expectEqual(cache.entries.len - 1, cache.index(0xFFFF_FFFF_FFFF_FFFF));
+    // Same low 48 bits, different high bits: different sets.
+    const key_c: u64 = 0x1234_0000_0000_0001;
+    try std.testing.expectEqual(cache.setIndex(key_a), cache.setIndex(key_b));
+    try std.testing.expect(cache.setIndex(key_a) != cache.setIndex(key_c));
     cache.store(key_a, 55);
     try std.testing.expectEqual(@as(?i16, 55), cache.probe(key_a));
     try std.testing.expect(cache.probe(key_b) == null);
-
-    // Direct-mapped always-replace: key_b evicts key_a.
-    cache.store(key_b, -7);
-    try std.testing.expectEqual(@as(?i16, -7), cache.probe(key_b));
-    try std.testing.expect(cache.probe(key_a) == null);
+    try std.testing.expect(cache.probe(key_c) == null);
 }
 
-test "eval cache never hits on the empty sentinel key" {
+test "eval cache never caches a key with an all-zero tag" {
     var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
     defer cache.deinit();
 
     try std.testing.expect(cache.probe(0) == null);
     cache.store(0, 99); // skipped
+    cache.store(0xFFFF_0000_0000_0000, 98); // skipped: low 48 bits zero
     try std.testing.expect(cache.probe(0) == null);
+    try std.testing.expect(cache.probe(0xFFFF_0000_0000_0000) == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.occupancy().filled);
+}
+
+test "eval cache keeps eight keys per set and evicts the least recently used" {
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    defer cache.deinit();
+
+    const base: u64 = 0x5A5A_0000_0000_0000;
+    for (1..9) |i| cache.store(base | i, @intCast(i));
+    for (1..9) |i| try std.testing.expectEqual(@as(?i16, @intCast(i)), cache.probe(base | i));
+    // Probed in order 1..8, so 1 is now the least recently used: a ninth key evicts it.
+    cache.store(base | 9, 9);
+    try std.testing.expect(cache.probe(base | 1) == null);
+    for (2..10) |i| try std.testing.expectEqual(@as(?i16, @intCast(i)), cache.probe(base | i));
+    // A hit refreshes: touch 2, then a new key evicts 3 (the oldest untouched).
+    _ = cache.probe(base | 2);
+    cache.store(base | 10, 10);
+    try std.testing.expect(cache.probe(base | 3) == null);
+    try std.testing.expectEqual(@as(?i16, 2), cache.probe(base | 2));
+    try std.testing.expectEqual(@as(?i16, 10), cache.probe(base | 10));
+}
+
+test "eval cache LRU order matches the scalar move-to-front reference" {
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    defer cache.deinit();
+    var reference: [WAYS]u64 = [_]u64{0} ** WAYS;
+    var prng = std.Random.DefaultPrng.init(0xe7a1_cac4);
+    const rand = prng.random();
+    const base: u64 = 0x3C3C_0000_0000_0000;
+    for (0..20_000) |_| {
+        const key = base | (1 + rand.uintLessThan(u64, 12));
+        const tag = key & TAG_MASK;
+        if (rand.boolean()) {
+            const eval: i16 = rand.int(i16);
+            cache.store(key, eval);
+            var way: usize = WAYS - 1;
+            for (reference, 0..) |slot, i| {
+                if (slot >> 16 == tag) {
+                    way = i;
+                    break;
+                }
+            }
+            var j = way;
+            while (j > 0) : (j -= 1) reference[j] = reference[j - 1];
+            reference[0] = (tag << 16) | @as(u16, @bitCast(eval));
+        } else {
+            const got = cache.probe(key);
+            var expected: ?i16 = null;
+            for (reference, 0..) |slot, i| {
+                if (slot != 0 and slot >> 16 == tag) {
+                    expected = @bitCast(@as(u16, @truncate(slot)));
+                    var j = i;
+                    while (j > 0) : (j -= 1) reference[j] = reference[j - 1];
+                    reference[0] = slot;
+                    break;
+                }
+            }
+            try std.testing.expectEqual(expected, got);
+        }
+        try std.testing.expectEqualSlices(u64, &reference, &cache.sets[cache.setIndex(base)].slots);
+    }
 }
 
 test "eval cache clear and resize drop previous entries" {
     var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
     defer cache.deinit();
 
-    cache.store(0x42_0000_0000_0000, 17);
+    cache.store(0x42_0000_0000_0042, 17);
     cache.clear();
-    try std.testing.expect(cache.probe(0x42_0000_0000_0000) == null);
+    try std.testing.expect(cache.probe(0x42_0000_0000_0042) == null);
 
-    cache.store(0x42_0000_0000_0000, 17);
+    cache.store(0x42_0000_0000_0042, 17);
     try cache.resize(MIN_CACHE_MB + 4);
-    try std.testing.expect(cache.probe(0x42_0000_0000_0000) == null);
+    try std.testing.expect(cache.probe(0x42_0000_0000_0042) == null);
 }
 
 test "hash-derived sizing clamps to [4, 64] MB" {
@@ -338,64 +350,9 @@ test "occupancy counts filled entries" {
     defer cache.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), cache.occupancy().filled);
-    cache.store(0x1111_0000_0000_0000, 5);
-    cache.store(0x2222_0000_0000_0000, 6);
+    cache.store(0x1111_0000_0000_0001, 5);
+    cache.store(0x2222_0000_0000_0002, 6);
     const occ = cache.occupancy();
     try std.testing.expectEqual(@as(usize, 2), occ.filled);
-    try std.testing.expectEqual(cache.entries.len, occ.total);
-}
-
-// ---- 2-way policy tests: run whenever the effective policy is 2-way
-// (always with the shipped default; via the runtime switch in stats builds).
-
-test "two-way set keeps two colliding keys live" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
-    defer cache.deinit();
-    cache.assoc = 2;
-    if (cache.assocWays() != 2) return error.SkipZigTest;
-
-    // Identical set (high bits after the extra shift), two distinct keys.
-    const key_a: u64 = 0xABCD_0000_0000_0001;
-    const key_b: u64 = 0xABCD_0000_0000_0002;
-    cache.store(key_a, 10);
-    cache.store(key_b, 20);
-    try std.testing.expectEqual(@as(?i16, 10), cache.probe(key_a));
-    try std.testing.expectEqual(@as(?i16, 20), cache.probe(key_b));
-}
-
-test "two-way evicts the slot not hit last" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
-    defer cache.deinit();
-    cache.assoc = 2;
-    if (cache.assocWays() != 2) return error.SkipZigTest;
-
-    const key_a: u64 = 0xABCD_0000_0000_0001;
-    const key_b: u64 = 0xABCD_0000_0000_0002;
-    const key_c: u64 = 0xABCD_0000_0000_0003;
-    cache.store(key_a, 10); // slot0, MRU=0
-    cache.store(key_b, 20); // slot1, MRU=1
-    _ = cache.probe(key_a); // MRU=0 -> victim is slot1 (key_b)
-    cache.store(key_c, 30);
-    try std.testing.expectEqual(@as(?i16, 10), cache.probe(key_a));
-    try std.testing.expectEqual(@as(?i16, 30), cache.probe(key_c));
-    try std.testing.expect(cache.probe(key_b) == null);
-
-    // Now key_c (slot1) was hit last -> victim is slot0 (key_a).
-    cache.store(key_b, 21);
-    try std.testing.expectEqual(@as(?i16, 21), cache.probe(key_b));
-    try std.testing.expectEqual(@as(?i16, 30), cache.probe(key_c));
-    try std.testing.expect(cache.probe(key_a) == null);
-}
-
-test "two-way verifies the full key and misses cleanly" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
-    defer cache.deinit();
-    cache.assoc = 2;
-    if (cache.assocWays() != 2) return error.SkipZigTest;
-
-    const key_a: u64 = 0xABCD_0000_0000_0001;
-    cache.store(key_a, 42);
-    try std.testing.expect(cache.probe(0xABCD_0000_0000_0009) == null);
-    try std.testing.expect(cache.probe(0) == null);
-    try std.testing.expectEqual(@as(?i16, 42), cache.probe(key_a));
+    try std.testing.expectEqual(cache.sets.len * WAYS, occ.total);
 }

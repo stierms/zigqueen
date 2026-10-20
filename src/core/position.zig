@@ -65,7 +65,7 @@ pub const Position = struct {
 
     pub inline fn pieceAt(self: *const Position, sq: square.Square) piece.Piece {
         const mailbox = &self.mailbox;
-        return mailbox[sq.index()];
+        return mailbox[@intFromEnum(sq)];
     }
 
     pub inline fn isSquareOccupied(self: *const Position, sq: square.Square) bool {
@@ -85,7 +85,7 @@ pub const Position = struct {
         self.pieces[ci][pti] &= ~mask;
         self.occupancies[ci] &= ~mask;
         self.occupied &= ~mask;
-        self.mailbox[sq.index()] = .none;
+        self.mailbox[@intFromEnum(sq)] = .none;
         if (piece_type == .king) self.king_squares[ci] = null;
         return existing;
     }
@@ -108,7 +108,7 @@ pub const Position = struct {
         self.pieces[ci][pti] |= mask;
         self.occupancies[ci] |= mask;
         self.occupied |= mask;
-        self.mailbox[sq.index()] = p;
+        self.mailbox[@intFromEnum(sq)] = p;
         if (piece_type == .king) self.king_squares[ci] = sq;
     }
 
@@ -121,6 +121,17 @@ pub const Position = struct {
         // + tag re-read through the stack was 69% of isInCheck's self time.
         const slot: *const ?square.Square = &self.king_squares[colorIndex(color)];
         return slot.*;
+    }
+
+    /// A pawn on rank 1 or 8 cannot occur in a game. fen.parse accepts it (TB
+    /// and PP1 test fixtures build such boards on purpose), but the full-threat
+    /// features have no rows for its attacks: a safe build panics and
+    /// ReleaseFast evaluates with wrong feature rows (audit B, E-BACKRANK-PAWN).
+    /// Every outside board that can reach evaluation or search is checked with
+    /// this once, when it is read; no search code pays for it.
+    pub fn hasBackRankPawn(self: *const Position) bool {
+        const back_ranks: bitboard.Bitboard = 0xFF00_0000_0000_00FF;
+        return (self.pieceBitboard(.white, .pawn) | self.pieceBitboard(.black, .pawn)) & back_ranks != 0;
     }
 
     pub fn eql(a: *const Position, b: *const Position) bool {
@@ -181,4 +192,22 @@ test "position kingSquare cache tracks set and clear" {
 
     try std.testing.expectEqual(piece.Piece.white_king, pos.clearSquare(.b1));
     try std.testing.expectEqual(@as(?square.Square, null), pos.kingSquare(.white));
+}
+
+test "a pawn of either colour on rank 1 or 8 is a back-rank pawn" {
+    var pos = Position.empty();
+    pos.setPiece(.e1, .white_king);
+    pos.setPiece(.e8, .black_king);
+    // Pawns on ranks 2 and 7 and a promoted queen on rank 8 are fine.
+    for ([_]square.Square{ .a2, .h7 }) |sq| pos.setPiece(sq, .white_pawn);
+    for ([_]square.Square{ .h2, .a7 }) |sq| pos.setPiece(sq, .black_pawn);
+    pos.setPiece(.d8, .white_queen);
+    try std.testing.expect(!pos.hasBackRankPawn());
+    for ([_]piece.Piece{ .white_pawn, .black_pawn }) |pawn| {
+        for ([_]square.Square{ .a1, .h1, .a8, .h8 }) |sq| {
+            var bad = pos;
+            bad.setPiece(sq, pawn);
+            try std.testing.expect(bad.hasBackRankPawn());
+        }
+    }
 }

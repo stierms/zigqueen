@@ -52,6 +52,17 @@ pub fn writeCurrMoveLine(output: anytype, cm: search_info.CurrMoveInfo) !void {
     try output.writeAll(line.buffered());
 }
 
+/// `info string <text>` diagnostic line; text longer than the line buffer is
+/// truncated.
+pub fn writeStringLine(output: anytype, text: []const u8) !void {
+    var buffer: [LINE_CAPACITY]u8 = undefined;
+    var line = std.Io.Writer.fixed(&buffer);
+    try line.writeAll("info string ");
+    try line.writeAll(text[0..@min(text.len, LINE_CAPACITY - 16)]);
+    try line.writeByte('\n');
+    try output.writeAll(line.buffered());
+}
+
 pub fn writeBestMoveLine(output: anytype, mv: ?move_mod.Move) !void {
     var buffer: [16]u8 = undefined;
     var line = std.Io.Writer.fixed(&buffer);
@@ -72,7 +83,7 @@ pub fn writeFinalLine(
         .depth = depth,
         .seldepth = @max(depth, result.seldepth),
         .score = result.score,
-        .bound = .exact,
+        .bound = result.score_bound,
         .nodes = result.nodes,
         .time_ms = elapsed_ms,
         .hashfull = hashfull,

@@ -57,19 +57,36 @@ pub fn evalPolicyBonusWith(gain: i32, scale: i32, clamp: i32, offset: i32) i32 {
     return @intCast(bounded + offset);
 }
 
+/// Rule-50 trust gate for TT scores (S-RULE50-TT). TT keys ignore the
+/// halfmove clock, so a score stored far from the 50-move boundary was reused
+/// at clock 98 where the line is a forced draw (judge A: warm 165 against
+/// cold 0). From this clock on an entry still orders moves and supplies the
+/// static eval, but its score neither cuts nor narrows the window, in main
+/// search or quiescence. A clock gate instead of a clock-qualified key: the
+/// key form cost +35 % nodes. 100 disables the gate.
+pub const TT_CUTOFF_HALFMOVE_MAX_DEFAULT: u16 = 90;
+
+pub inline fn ttCutoffHalfmoveMax() u16 {
+    if (comptime build_options.tuning) return @intCast(tunables.active.tt_cutoff_halfmove_max);
+    return TT_CUTOFF_HALFMOVE_MAX_DEFAULT;
+}
+
 pub inline fn allowMainTtCutoff(entry_score: types.Score, alpha: types.Score, pv_node: bool, cut_node: bool, halfmove_clock: u16) bool {
-    if (comptime build_options.tuning) {
-        return allowMainTtCutoffWith(
-            entry_score,
-            alpha,
-            pv_node,
-            cut_node,
-            halfmove_clock,
-            tunables.active.tt_cutoff_node_role != 0,
-            @intCast(tunables.active.tt_cutoff_halfmove_max),
-        );
-    }
-    return true;
+    return allowMainTtCutoffWith(
+        entry_score,
+        alpha,
+        pv_node,
+        cut_node,
+        halfmove_clock,
+        if (comptime build_options.tuning) tunables.active.tt_cutoff_node_role != 0 else false,
+        ttCutoffHalfmoveMax(),
+    );
+}
+
+/// The rule-50 gate alone (quiescence has no node-role gate). False from the
+/// gate clock on: tt_probe then treats the entry as ordering-only.
+pub inline fn rule50TrustsTtScore(halfmove_clock: u16) bool {
+    return allowMainTtCutoffWith(0, 0, false, false, halfmove_clock, false, ttCutoffHalfmoveMax());
 }
 
 pub fn allowMainTtCutoffWith(

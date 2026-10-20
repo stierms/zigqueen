@@ -3,11 +3,15 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     // CPU-target audit (perf-r6): the default query already resolves to the
     // NATIVE cpu (znver5-class here) — the release binary carries AVX-512
-    // (vpopcntq/vpternlogq on zmm), so no explicit -Dcpu is needed. The fathom
-    // C unit compiles inside the same `zig build-exe` invocation and inherits
-    // the same native target (its -march matches; no separate flag required).
+    // (vpopcntq/vpternlogq on zmm), so no explicit -Dcpu is needed. The engine
+    // is pure Zig; only the test-only tb-oracle tool compiles C (Fathom).
     var target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Zig 0.15.2 compiles Debug x86-64 code with its self-hosted backend, which
+    // rejects the engine's inline assembly (the "v" register constraint in
+    // src/eval/fullthreats.zig). Debug builds use LLVM like every other mode;
+    // release modes keep Zig's default (null), so their builds are unchanged.
+    const use_llvm: ?bool = if (optimize == .Debug) true else null;
 
     // Portable release baselines. The default (option omitted) remains the
     // native target used for development. Release packages select one of:
@@ -57,7 +61,7 @@ pub fn build(b: *std.Build) void {
     // Bump policy: MINOR for an accepted strength gain (each promoted baseline),
     // PATCH for fixes/tooling/perf-neutral changes, MAJOR for architecture
     // milestones. Highest version == newest.
-    const semver = "6.4.0";
+    const semver = "6.5.0";
     const version_override = b.option(
         []const u8,
         "version",
@@ -124,8 +128,31 @@ pub fn build(b: *std.Build) void {
         "Correct the quiescence stand-pat with correction history (default: false).",
     ) orelse false;
 
+    // Syzygy tablebase storage of the engine's own prober (src/tb): budget =
+    // MmapBudget (map every file unless a finite RLIMIT_AS caps the address
+    // space; positioned reads for the rest; the default), mmap = MmapAll,
+    // pread = Pread. Fathom is linked into the test-only tb-oracle tool alone.
+    const tb_storage = b.option(
+        []const u8,
+        "tb-storage",
+        "Syzygy storage: budget|mmap|pread (default: budget).",
+    ) orelse "budget";
+    if (!oneOf(tb_storage, &.{ "budget", "mmap", "pread" })) std.debug.panic("-Dtb-storage must be budget, mmap or pread, got '{s}'", .{tb_storage});
+
+    // PGO reference dump (src/tools/pgo_dump.zig): main() writes the raw profile through the
+    // LLVM profile runtime at exit. scripts/pgo-build.sh does not need it (it reads the counters
+    // out of the live process); it gives the runtime's own profile to check that reader against
+    // (scripts/pgo/profsnap.py --selftest). Links only with the runtime and
+    // --lto-cs-profile-generate; Zig's __anon_N names differ from the normal build's.
+    const pgo_dump = b.option(
+        bool,
+        "pgo-dump",
+        "Dump the LLVM raw profile at exit; for the instrumented PGO relink only (default: false).",
+    ) orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption([]const u8, "tb_storage", tb_storage);
     build_options.addOption(bool, "search_stats", search_stats);
     build_options.addOption(bool, "tuning", tuning);
     build_options.addOption(bool, "fail_soft", fail_soft);
@@ -133,6 +160,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "correction_history", correction_history);
     build_options.addOption([]const u8, "corr_learn", corr_learn);
     build_options.addOption(bool, "corr_qsearch", corr_qsearch);
+    build_options.addOption(bool, "pgo_dump", pgo_dump);
     const build_options_module = build_options.createModule();
 
     const root_module = b.createModule(.{
@@ -141,11 +169,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addImport("build_options", build_options_module);
-    addFathom(b, root_module);
 
     const exe = b.addExecutable(.{
         .name = b.fmt("zigqueen{s}", .{name_suffix}),
         .root_module = root_module,
+        .use_llvm = use_llvm,
     });
     // Keep linker relocations in the output (--emit-relocs): required for
     // llvm-bolt post-link optimization (scripts/bolt-optimize.sh) to reorder
@@ -154,7 +182,10 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .linux) exe.link_emit_relocs = true;
     // R10: cross-unit LTO — clean A/B (5-rep fixed-node): -2.5% opening,
     // -2.2% middle, -4.7% endgame wall-clock. One flag, node-identical.
-    exe.want_lto = true;
+    // Not for Windows ReleaseSafe: zig 0.15.2 cannot link the safety panic
+    // handler's thread-local state under LTO there (lld-link: undefined symbol
+    // _tls_index; audit D, U-WIN-LTO). The shipping ReleaseFast builds keep it.
+    exe.want_lto = !(target.result.os.tag == .windows and optimize == .ReleaseSafe);
 
     b.installArtifact(exe);
 
@@ -162,6 +193,7 @@ pub fn build(b: *std.Build) void {
     // instrumentation binary for search_profile/search_report tooling.
     const stats_options = b.addOptions();
     stats_options.addOption([]const u8, "version", version);
+    stats_options.addOption([]const u8, "tb_storage", tb_storage);
     stats_options.addOption(bool, "search_stats", true);
     stats_options.addOption(bool, "tuning", tuning);
     stats_options.addOption(bool, "fail_soft", fail_soft);
@@ -169,16 +201,17 @@ pub fn build(b: *std.Build) void {
     stats_options.addOption(bool, "correction_history", correction_history);
     stats_options.addOption([]const u8, "corr_learn", corr_learn);
     stats_options.addOption(bool, "corr_qsearch", corr_qsearch);
+    stats_options.addOption(bool, "pgo_dump", pgo_dump);
     const stats_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     stats_module.addImport("build_options", stats_options.createModule());
-    addFathom(b, stats_module);
     const stats_exe = b.addExecutable(.{
         .name = b.fmt("zigqueen-stats{s}", .{name_suffix}),
         .root_module = stats_module,
+        .use_llvm = use_llvm,
     });
     b.installArtifact(stats_exe);
 
@@ -195,14 +228,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addImport("build_options", build_options_module);
-    addFathom(b, test_module);
     const unit_tests = b.addTest(.{
         .root_module = test_module,
+        .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    // The same unit-test binary installed instead of run, for running it
+    // natively on another OS (e.g. `-Dtarget=x86_64-windows`).
+    const test_exe_step = b.step("test-exe", "Install the unit-test binary without running it");
+    test_exe_step.dependOn(&b.addInstallArtifact(unit_tests, .{}).step);
 
     // Cold initialization must also be tested before any other test can warm
     // the process-global once state. One executable, fresh process per case.
@@ -212,8 +249,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     init_module.addImport("build_options", build_options_module);
-    addFathom(b, init_module);
-    const init_tests = b.addExecutable(.{ .name = "search-init-test", .root_module = init_module });
+    const init_tests = b.addExecutable(.{ .name = "search-init-test", .root_module = init_module, .use_llvm = use_llvm });
     const init_step = b.step("test-search-init", "Test search initialization in fresh processes");
     for ([_][]const u8{ "constructors", "tm-first", "tuning", "failure-retry" }) |mode| {
         const check = b.addRunArtifact(init_tests);
@@ -221,10 +257,28 @@ pub fn build(b: *std.Build) void {
         init_step.dependOn(&check.step);
     }
     test_step.dependOn(init_step);
+
+    // Test-only Syzygy oracle tool (G0 census, G1 oracle, G3 micro-benchmark):
+    // our prober against vendored Fathom in one process. The only binary that
+    // links Fathom; never installed by default.
+    const oracle_module = b.createModule(.{
+        .root_source_file = b.path("src/tb_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oracle_module.addImport("build_options", build_options_module);
+    addFathom(b, oracle_module);
+    const oracle_exe = b.addExecutable(.{ .name = "zigqueen-tb-oracle", .root_module = oracle_module, .use_llvm = use_llvm });
+    const oracle_step = b.step("tb-oracle", "Build the test-only Syzygy oracle tool (links Fathom)");
+    oracle_step.dependOn(&b.addInstallArtifact(oracle_exe, .{}).step);
 }
 
-/// Fathom (Syzygy tablebase probing, deps/fathom, MIT) plus our narrow
-/// public-API bridge.
+fn oneOf(value: []const u8, comptime options: []const []const u8) bool {
+    inline for (options) |o| if (std.mem.eql(u8, value, o)) return true;
+    return false;
+}
+
+/// Vendored Fathom plus the oracle's narrow public-API bridge.
 fn addFathom(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true;
     module.addIncludePath(b.path("deps/fathom"));
@@ -233,7 +287,7 @@ fn addFathom(b: *std.Build, module: *std.Build.Module) void {
         .flags = &.{ "-std=gnu11", "-O2", "-DTB_NO_HW_POP_COUNT=0" },
     });
     module.addCSourceFile(.{
-        .file = b.path("src/search/fathom_bridge.c"),
+        .file = b.path("src/tb_oracle_fathom.c"),
         .flags = &.{ "-std=gnu11", "-O2", "-DTB_NO_HW_POP_COUNT=0" },
     });
 }

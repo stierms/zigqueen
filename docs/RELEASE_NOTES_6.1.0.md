@@ -33,7 +33,7 @@ noticeably stronger play, and two robustness fixes found in live games.
   tuning scaffold lives behind a build flag for development.
 
 Strength measurements, methodology and caveats live in
-[STRENGTH.md](STRENGTH.md); the short version is a clear step over 6.0.0
+[STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.1.0/docs/STRENGTH.md); the short version is a clear step over 6.0.0
 in both self-play and the anchored gauntlet.
 
 Single-threaded UCI engine, default Hash 256 MB, same embedded ZQB9

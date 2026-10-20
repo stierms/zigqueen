@@ -540,12 +540,18 @@ pub const SearchContext = struct {
         self.stats.move_order_detail_lmr_cutoffs[sample.node_type][sample.depth_band][bucket_index] += 1;
     }
 
+    pub fn noteInterruptedChallenger(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.interrupted_challengers += 1;
+    }
+
     pub fn noteHardStop(self: *SearchContext, reason: time.StopNowReason) void {
         if (comptime !stats_enabled) return;
         switch (reason) {
             .external => self.stats.hard_stops_external += 1,
             .node_limit => self.stats.hard_stops_node_limit += 1,
             .maximum_budget => self.stats.hard_stops_maximum_budget += 1,
+            .soft_budget => self.stats.hard_stops_soft_budget += 1,
         }
     }
 

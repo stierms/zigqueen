@@ -100,20 +100,17 @@ pub const HintTable = struct {
         if (self.entries.len == 0) return;
 
         const cluster = &self.entries[index(self.mask, key)];
-        var replacement: *Entry = &cluster.entries[0];
-
-        for (&cluster.entries) |*entry| {
-            if (entry.key == key) {
-                if (entry.depth > depth) return;
-                replacement = entry;
-                break;
-            }
-            if (entry.depth < 0) {
-                replacement = entry;
-                break;
-            }
-            if (entry.depth < replacement.depth) replacement = entry;
-        }
+        // The slot-order scan (first slot carrying `key` or empty, else the
+        // shallower slot, the first on a tie) as data, not branches; a slot
+        // carrying `key` is chosen only by that test, so a deeper one keeps
+        // its entry exactly as before.
+        comptime std.debug.assert(CLUSTER_SIZE == 2);
+        const e0 = &cluster.entries[0];
+        const e1 = &cluster.entries[1];
+        const take0 = @intFromBool(e0.key == key) | @intFromBool(e0.depth < 0);
+        const take1 = @intFromBool(e1.key == key) | @intFromBool(e1.depth < 0) | @intFromBool(e1.depth < e0.depth);
+        const replacement = if (take0 == 0 and take1 != 0) e1 else e0;
+        if (replacement.key == key and replacement.depth > depth) return;
 
         replacement.key = key;
         replacement.score = score;

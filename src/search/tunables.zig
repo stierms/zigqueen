@@ -63,7 +63,7 @@ pub const Tunables = struct {
     eval_policy_clamp: types.Score = 1841,
     eval_policy_offset: types.Score = 503,
     tt_cutoff_node_role: types.Score = 0,
-    tt_cutoff_halfmove_max: types.Score = 100,
+    tt_cutoff_halfmove_max: types.Score = 90, // = shallow_arms.TT_CUTOFF_HALFMOVE_MAX_DEFAULT (release)
     singular_neg_ext: types.Score = 0,
     singular_min_depth: types.Score = 6,
     singular_max_depth: types.Score = 8,
@@ -122,7 +122,7 @@ pub const specs = [_]Spec{
     .{ .uci_name = "EvalPolicyClamp", .field = "eval_policy_clamp", .default = 1841, .min = 0, .max = 32000 },
     .{ .uci_name = "EvalPolicyOffset", .field = "eval_policy_offset", .default = 503, .min = -5000, .max = 5000 },
     .{ .uci_name = "TtCutoffNodeRole", .field = "tt_cutoff_node_role", .default = 0, .min = 0, .max = 1 },
-    .{ .uci_name = "TtCutoffHalfmoveMax", .field = "tt_cutoff_halfmove_max", .default = 100, .min = 0, .max = 100 },
+    .{ .uci_name = "TtCutoffHalfmoveMax", .field = "tt_cutoff_halfmove_max", .default = 90, .min = 0, .max = 100 },
     .{ .uci_name = "SingularNegExt", .field = "singular_neg_ext", .default = 0, .min = 0, .max = 1 },
     .{ .uci_name = "SingularMinDepth", .field = "singular_min_depth", .default = 6, .min = 1, .max = 64 },
     .{ .uci_name = "SingularMaxDepth", .field = "singular_max_depth", .default = 8, .min = 1, .max = 64 },

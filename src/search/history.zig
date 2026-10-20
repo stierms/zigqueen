@@ -15,8 +15,8 @@ pub const HISTORY_LIMIT: i32 = 32_000;
 
 /// Bits describe attacks in the unchanged node position, including occupied squares.
 pub inline fn quietBucket(attacked: u64, mv: move_mod.Move) u2 {
-    const from: u2 = @intCast((attacked >> mv.from.index()) & 1);
-    const to: u2 = @intCast((attacked >> mv.to.index()) & 1);
+    const from: u2 = @intCast((attacked >> @intFromEnum(mv.from)) & 1);
+    const to: u2 = @intCast((attacked >> @intFromEnum(mv.to)) & 1);
     return (from << 1) | to;
 }
 
@@ -40,7 +40,7 @@ pub const CONT_NONE: u16 = std.math.maxInt(u16);
 /// Flat key for a (side, piece, to) triple: `(side*6 + piece)*64 + to`.
 pub inline fn contKey(side: types.Color, moved_piece: piece.PieceType, to: square.Square) u16 {
     const pc: u16 = @as(u16, @intFromEnum(side)) * 6 + @intFromEnum(moved_piece);
-    return pc * 64 + to.index();
+    return pc * 64 + @intFromEnum(to);
 }
 
 /// The same key straight from the MOVER's mailbox piece. `Piece` is encoded as
@@ -54,7 +54,7 @@ pub inline fn contKey(side: types.Color, moved_piece: piece.PieceType, to: squar
 /// of the continuation-history miss that dominates scoreMoves.
 pub inline fn contKeyOfPiece(moved: piece.Piece, to: square.Square) u16 {
     std.debug.assert(@intFromEnum(moved) < 12);
-    return @as(u16, @intFromEnum(moved)) * 64 + to.index();
+    return @as(u16, @intFromEnum(moved)) * 64 + @intFromEnum(to);
 }
 
 /// Stand-in row for a continuation ply with no usable predecessor. Reading it
@@ -179,7 +179,10 @@ const keep_mix_scalar = builtin.cpu.arch == .x86_64 and
     !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512dq);
 
 inline fn inGpr(x: u64) u64 {
-    if (comptime keep_mix_scalar) return asm ("" : [ret] "=r" (-> u64) : [x] "0" (x));
+    if (comptime keep_mix_scalar) return asm (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
     return x;
 }
 
@@ -318,6 +321,10 @@ pub const HistoryTable = struct {
     /// Heap-owned correction-history tables (~320 KB). Null when disabled — all
     /// corrhist reads return 0 and updates are no-ops (same pattern as conthist).
     correction: ?*CorrTables = null,
+    /// How the correction tables are backed: one whole 2MB huge page when the
+    /// OS grants it (keyed random access over 80 4KB pages otherwise). Frees
+    /// must go through hugealloc with this.
+    correction_method: hugealloc.Method = .heap,
 
     /// Allocate the continuation table on the heap (idempotent).
     pub fn initContinuation(self: *HistoryTable, allocator: std.mem.Allocator) !void {
@@ -337,18 +344,21 @@ pub const HistoryTable = struct {
         }
     }
 
-    /// Allocate the correction-history tables on the heap (idempotent).
+    /// Allocate the correction-history tables (idempotent).
     pub fn initCorrection(self: *HistoryTable, allocator: std.mem.Allocator) !void {
         if (self.correction != null) return;
-        const tables = try allocator.create(CorrTables);
-        @memset(std.mem.asBytes(tables), 0);
-        self.correction = tables;
+        const backed = try hugealloc.allocWholePages(CorrTables, allocator, 1);
+        @memset(std.mem.asBytes(&backed.items[0]), 0);
+        self.correction = &backed.items[0];
+        self.correction_method = backed.method;
     }
 
     pub fn deinitCorrection(self: *HistoryTable, allocator: std.mem.Allocator) void {
         if (self.correction) |tables| {
-            allocator.destroy(tables);
+            const items: []CorrTables = @as([*]CorrTables, @ptrCast(tables))[0..1];
+            hugealloc.free(CorrTables, allocator, .{ .items = items, .method = self.correction_method });
             self.correction = null;
+            self.correction_method = .heap;
         }
     }
 
@@ -356,13 +366,15 @@ pub const HistoryTable = struct {
         const saved = self.continuation;
         const saved_method = self.continuation_method;
         const saved_corr = self.correction;
-        self.* = .{ .continuation = saved, .continuation_method = saved_method, .correction = saved_corr };
+        const saved_corr_method = self.correction_method;
+        self.* = .{ .continuation = saved, .continuation_method = saved_method, .correction = saved_corr, .correction_method = saved_corr_method };
         if (saved) |table| @memset(std.mem.asBytes(table), 0);
         if (saved_corr) |tables| @memset(std.mem.asBytes(tables), 0);
     }
 
-    /// Static eval corrected by the learned class deviations, clamped out of the
-    /// mate band (a static eval must never look like a mate score).
+    /// Static eval corrected by the learned class deviations, clamped below the
+    /// tablebase band (score.ORDINARY_SCORE_LIMIT): a static eval must never
+    /// look like a tablebase or mate score.
     pub fn correctedEval(self: *const HistoryTable, pos: *const position.Position, raw: types.Score, cont: CorrCont, params: *const basin.Params) types.Score {
         if (self.correction == null) return raw;
         return self.correctedEvalKeyed(pos.side_to_move, corrKeys(pos), raw, cont, params);
@@ -419,7 +431,7 @@ pub const HistoryTable = struct {
         if (weight_sum <= 0) return raw;
         const correction = @divTrunc(@as(i64, weighted) * params.corr_apply_scale, @as(i64, weight_sum) * CORR_GRAIN * 64);
         const corrected = @as(i64, raw) + correction;
-        return @intCast(std.math.clamp(corrected, -(score_mod.MATE_THRESHOLD - 1), score_mod.MATE_THRESHOLD - 1));
+        return @intCast(std.math.clamp(corrected, -score_mod.ORDINARY_SCORE_LIMIT, score_mod.ORDINARY_SCORE_LIMIT));
     }
 
     /// The running mean learning target (cp) of the position's side to move and
@@ -464,7 +476,7 @@ pub const HistoryTable = struct {
         // self time in endgame profiles). `&...[piece]` forces in-place
         // addressing.
         const row: *const [64]i16 = &self.quiet[@intFromEnum(side)][bucket][@intFromEnum(moved_piece)];
-        return row[to.index()];
+        return row[@intFromEnum(to)];
     }
 
     /// Live [bucket][piece][to] rows for the side to move; never copied.
@@ -476,13 +488,13 @@ pub const HistoryTable = struct {
         // Row pointer for the same reason as `score` (the [64]?Move row copy is
         // 256 bytes; it dominated previousQuietCountermove's self time).
         const row: *const [64]?move_mod.Move = &self.countermove[@intFromEnum(previous_side)][@intFromEnum(previous_piece)];
-        return row[to.index()];
+        return row[@intFromEnum(to)];
     }
 
     pub fn rememberCounterMove(self: *HistoryTable, previous_side: types.Color, previous_piece: piece.PieceType, to: square.Square, response: move_mod.Move) void {
         const side_index = @intFromEnum(previous_side);
         const piece_index = @intFromEnum(previous_piece);
-        const square_index = to.index();
+        const square_index = @intFromEnum(to);
         const slot = &self.countermove[side_index][piece_index][square_index];
         if (slot.*) |existing| {
             if (existing == response) {
@@ -657,7 +669,7 @@ fn adjust(self: *HistoryTable, side: types.Color, moved_piece: piece.PieceType, 
     // `self.quiet[side][bucket][piece][to]` copied the whole 128-byte row to the stack
     // first (store-forwarding stall; the bulk of applyQuietCutoffLearning's
     // self time in endgame profiles).
-    const slot = &self.quiet[@intFromEnum(side)][bucket][@intFromEnum(moved_piece)][to.index()];
+    const slot = &self.quiet[@intFromEnum(side)][bucket][@intFromEnum(moved_piece)][@intFromEnum(to)];
     const next = applyGravity(@as(i32, slot.*), delta);
     slot.* = @intCast(next);
 }
@@ -745,6 +757,31 @@ test "correction history caps the target and never reaches the mate band" {
     try std.testing.expect(history.correctedEval(&pos, near_mate, .{}, &params) < score_mod.MATE_THRESHOLD);
     for (0..200) |_| history.updateCorrection(&pos, .{}, -5000, 16, &params);
     try std.testing.expect(history.correctedEval(&pos, -near_mate, .{}, &params) > -score_mod.MATE_THRESHOLD);
+}
+
+test "corrected evaluation stays below the tablebase band" {
+    // Review round (S-TB-PLY): the clamp sat at the mate threshold, so a raw
+    // evaluation just below the tablebase band plus a correction landed in it.
+    const fen = @import("../core/fen.zig");
+    var params = basin.Params{};
+    params.corr_mean_step = 4; // keep the mean slow so the deviation stays visible
+    var history = HistoryTable{};
+    try history.initCorrection(std.testing.allocator);
+    defer history.deinitCorrection(std.testing.allocator);
+    const pos = try fen.startpos();
+    const limit = score_mod.ORDINARY_SCORE_LIMIT;
+    for (0..50) |_| history.updateCorrection(&pos, .{}, 5000, 16, &params);
+    const up = history.correctedEval(&pos, 0, .{}, &params);
+    try std.testing.expect(up > 0);
+    try std.testing.expectEqual(limit, history.correctedEval(&pos, limit - 1, .{}, &params));
+    try std.testing.expectEqual(limit, history.correctedEval(&pos, limit, .{}, &params));
+    // Below the edge the correction still applies in full.
+    try std.testing.expectEqual(limit - 1, history.correctedEval(&pos, limit - up - 1, .{}, &params));
+    for (0..200) |_| history.updateCorrection(&pos, .{}, -5000, 16, &params);
+    const down = history.correctedEval(&pos, 0, .{}, &params);
+    try std.testing.expect(down < 0);
+    try std.testing.expectEqual(-limit, history.correctedEval(&pos, -limit + 1, .{}, &params));
+    try std.testing.expectEqual(-limit, history.correctedEval(&pos, -limit, .{}, &params));
 }
 
 test "continuation correction applies only with its key" {
@@ -917,8 +954,8 @@ test "quiet history has four fixed threat buckets" {
 
 test "quiet threat bucket bits and updates stay independent" {
     const mv = move_mod.Move.init(.g1, .f3, .quiet);
-    const from = @as(u64, 1) << mv.from.index();
-    const to = @as(u64, 1) << mv.to.index();
+    const from = @as(u64, 1) << @intFromEnum(mv.from);
+    const to = @as(u64, 1) << @intFromEnum(mv.to);
     const maps = [_]u64{ 0, to, from, from | to };
     const policy = basin.Params{};
     for (maps, 0..) |map, i| {

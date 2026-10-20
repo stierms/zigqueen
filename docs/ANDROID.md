@@ -3,7 +3,7 @@
 zigqueen runs on 64-bit Android as a native UCI engine. The NNUE evaluation
 uses portable integer SIMD, so the ARM build is **bit-identical** to the x86
 builds by design. Release checks compare fixed-depth node counts and
-evaluations. For 6.3.0 and 6.4.0 we ran both ARM builds under QEMU user-mode
+evaluations. For 6.3.0, 6.4.0 and 6.5.0 we ran both ARM builds under QEMU user-mode
 emulation: they answer `uci` with the documented options and reproduce the
 x86 builds' bench and fixed-depth results. That is an emulated check, not a
 test on a physical device, and ARM speed was not measured.
@@ -48,8 +48,9 @@ Anything else claiming to be zigqueen is not from us.
 
 6.4.0 changed the signing key; APKs up to 6.3.0 carry the certificate
 `c919e613db93d244216fe02288dfb1ab9af47ef43035d71b8676b6dc7cfa987e`. Android
-won't install an APK over an app signed with a different key, so uninstall an
-older zigqueen app before installing 6.4.0.
+won't install an APK over an app signed with a different key, so uninstall a
+zigqueen app from 6.3.0 or earlier before installing 6.4.0 or later. 6.5.0 is
+signed with the same key as 6.4.0 and installs over it.
 
 ## Building it yourself
 

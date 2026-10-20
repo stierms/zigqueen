@@ -1,4 +1,5 @@
 const std = @import("std");
+const attacks = @import("attacks.zig");
 const bitboard = @import("../core/bitboard.zig");
 const move_mod = @import("../core/move.zig");
 const piece = @import("../core/piece.zig");
@@ -56,14 +57,26 @@ pub fn makeMove(pos: *position.Position, mv: move_mod.Move, state: *StateInfo) a
 /// near key, i.e. a wasted hint. Callers must never use it for anything but a
 /// prefetch address, so it cannot change any search result.
 pub inline fn prefetchKeyAfter(pos: *const position.Position, mv: move_mod.Move) u64 {
-    const to = mv.to.index();
+    const to = @intFromEnum(mv.to);
     const moving_row = zobrist.pieceSquareRow(@intFromEnum(pos.pieceAt(mv.from)));
     // Row 12 (Piece.none) is all zeros, so a quiet move's target adds nothing.
     const captured_row = zobrist.pieceSquareRow(@intFromEnum(pos.pieceAt(mv.to)));
-    var key = pos.zobrist_key ^ zobrist.SIDE_TO_MOVE_KEY ^ moving_row[mv.from.index()] ^ moving_row[to] ^ captured_row[to];
+    var key = pos.zobrist_key ^ zobrist.SIDE_TO_MOVE_KEY ^ moving_row[@intFromEnum(mv.from)] ^ moving_row[to] ^ captured_row[to];
     if (pos.en_passant) |ep| key ^= zobrist.EN_PASSANT_FILE_KEYS[ep.file()];
-    if (mv.flag == .double_push) key ^= zobrist.EN_PASSANT_FILE_KEYS[mv.to.file()];
+    if (mv.flag == .double_push and doublePushTargetCapturable(pos, pos.side_to_move, mv)) key ^= zobrist.EN_PASSANT_FILE_KEYS[mv.to.file()];
     return key;
+}
+
+/// Whether the target square a double push of `side` leaves behind can be
+/// taken en passant, i.e. an enemy pawn stands beside the pushed pawn (the
+/// squares a `side` pawn on the target would attack). Only then are the
+/// target and its key recorded: a target no pawn can use is not part of the
+/// position, and recording it gave identical positions two keys (missed
+/// repetitions, unshared TT entries; C-EP-KEY). Pseudo-legal: a capture that
+/// a pin would forbid still counts, as in the FEN target rule.
+pub inline fn doublePushTargetCapturable(pos: *const position.Position, side: types.Color, mv: move_mod.Move) bool {
+    const target = betweenSquare(mv.from, mv.to);
+    return (attacks.pawnAttacksFrom(side, target) & pos.pieceBitboard(side.other(), .pawn)) != 0;
 }
 
 pub fn makeMoveForLegality(pos: *position.Position, mv: move_mod.Move) void {
@@ -118,12 +131,13 @@ pub fn unmakeMove(pos: *position.Position, mv: move_mod.Move, state: *const Stat
     pos.halfmove_clock = state.previous_halfmove_clock;
     pos.fullmove_number = state.previous_fullmove_number;
 
-    switch (mv.flag) {
-        .quiet, .double_push => movePieceWithoutHash(pos, state.moved_piece, mv.to, mv.from),
-        .capture => {
-            movePieceWithoutHash(pos, state.moved_piece, mv.to, mv.from);
-            restoreCaptured(pos, state.captured_piece, mv.to);
-        },
+    if (@intFromEnum(mv.flag) < @intFromEnum(move_mod.MoveFlag.castle)) {
+        // Quiet, capture and double push share one branch-free path: the
+        // captured piece is .none unless the move captured (see restoreIfAny).
+        movePieceWithoutHash(pos, state.moved_piece, mv.to, mv.from);
+        restoreIfAny(pos, state.captured_piece, mv.to);
+    } else switch (mv.flag) {
+        .quiet, .capture, .double_push => unreachable,
         .en_passant => {
             movePieceWithoutHash(pos, state.moved_piece, mv.to, mv.from);
             restoreCaptured(pos, state.captured_piece, enPassantCapturedPawnSquare(side, mv.to));
@@ -197,24 +211,25 @@ fn applyMove(
     const old_castling_index = zobrist.castlingIndex(pos.castling_rights);
     pos.en_passant = null;
 
-    if (isIrreversibleMove(moving_piece, mv)) {
-        pos.halfmove_clock = 0;
-    } else {
-        pos.halfmove_clock += 1;
-    }
-    if (side == .black) pos.fullmove_number += 1;
+    // Branch-free clock updates: reset (all-zero mask) on an irreversible
+    // move, else count; the full-move number steps after Black's move.
+    const keep_clock: u16 = @intFromBool(!isIrreversibleMove(moving_piece, mv));
+    pos.halfmove_clock = (pos.halfmove_clock +% 1) & (0 -% keep_clock);
+    pos.fullmove_number += @intFromBool(side == .black);
 
-    switch (mv.flag) {
-        .quiet => movePiece(pos, moving_piece, mv.from, mv.to),
-        .capture => {
-            captured_piece.* = pos.pieceAt(mv.to);
-            removePiece(pos, captured_piece.*, mv.to);
-            movePiece(pos, moving_piece, mv.from, mv.to);
-        },
-        .double_push => {
-            movePiece(pos, moving_piece, mv.from, mv.to);
-            pos.en_passant = betweenSquare(mv.from, mv.to);
-        },
+    const flag = @intFromEnum(mv.flag);
+    if (flag < @intFromEnum(move_mod.MoveFlag.castle)) {
+        // Quiet, capture and double push share one branch-free path: the
+        // target holds the captured piece, or .none for the two quiet kinds,
+        // and removing .none changes nothing (removeIfAny).
+        const captured = pos.pieceAt(mv.to);
+        std.debug.assert((captured != .none) == (mv.flag == .capture));
+        captured_piece.* = captured;
+        removeIfAny(pos, captured, mv.to);
+        movePiece(pos, moving_piece, mv.from, mv.to);
+        if (flag == @intFromEnum(move_mod.MoveFlag.double_push) and doublePushTargetCapturable(pos, side, mv)) pos.en_passant = betweenSquare(mv.from, mv.to);
+    } else switch (mv.flag) {
+        .quiet, .capture, .double_push => unreachable,
         .en_passant => {
             const capture_square = enPassantCapturedPawnSquare(side, mv.to);
             captured_piece.* = pos.pieceAt(capture_square);
@@ -245,72 +260,67 @@ fn applyMove(
         },
     }
 
-    updateCastlingRightsForMove(pos, moving_piece, mv.from);
-    updateCastlingRightsForCapture(pos, captured_piece.*, captureSquareForRights(side, mv));
+    // Castling rights lost to this move (see KING_RIGHTS): the mover's, and a
+    // rook captured on its home corner. An en passant capture takes a pawn,
+    // which owns no right, so `mv.to` serves as its capture square here.
+    const rights: u4 = @bitCast(pos.castling_rights);
+    const lost = KING_RIGHTS[@intFromEnum(moving_piece)] |
+        (CORNER_RIGHT[@intFromEnum(mv.from)] & ROOK_RIGHTS[@intFromEnum(moving_piece)]) |
+        (CORNER_RIGHT[@intFromEnum(mv.to)] & ROOK_RIGHTS[@intFromEnum(captured_piece.*)]);
+    pos.castling_rights = @bitCast(rights & ~lost);
 
+    // Unchanged rights xor the same key twice (a no-op), so no branch.
     const new_castling_index = zobrist.castlingIndex(pos.castling_rights);
-    if (new_castling_index != old_castling_index) {
-        pos.zobrist_key ^= zobrist.CASTLING_KEYS[old_castling_index] ^ zobrist.CASTLING_KEYS[new_castling_index];
-    }
+    pos.zobrist_key ^= zobrist.CASTLING_KEYS[old_castling_index] ^ zobrist.CASTLING_KEYS[new_castling_index];
     if (pos.en_passant) |ep| pos.zobrist_key ^= zobrist.EN_PASSANT_FILE_KEYS[ep.file()];
     pos.side_to_move = opponent;
     pos.zobrist_key ^= zobrist.SIDE_TO_MOVE_KEY;
 }
 
-fn updateCastlingRightsForMove(pos: *position.Position, moving_piece: piece.Piece, from: square.Square) void {
-    switch (moving_piece) {
-        .white_king => {
-            pos.castling_rights.white_king_side = false;
-            pos.castling_rights.white_queen_side = false;
-        },
-        .black_king => {
-            pos.castling_rights.black_king_side = false;
-            pos.castling_rights.black_queen_side = false;
-        },
-        .white_rook => switch (from) {
-            .a1 => pos.castling_rights.white_queen_side = false,
-            .h1 => pos.castling_rights.white_king_side = false,
-            else => {},
-        },
-        .black_rook => switch (from) {
-            .a8 => pos.castling_rights.black_queen_side = false,
-            .h8 => pos.castling_rights.black_king_side = false,
-            else => {},
-        },
-        else => {},
-    }
-}
+// Castling-right bits (`position.CastlingRights` as u4: white king side 1,
+// white queen side 2, black king side 4, black queen side 8) that a piece can
+// remove, indexed by `piece.Piece`. A king's move removes both of its side's
+// rights wherever it starts. A rook removes the right of its own home corner
+// when it leaves that corner or is captured on it: CORNER_RIGHT names the
+// corner's right and ROOK_RIGHTS keeps it only for the rook of that side
+// (a white rook on a8 removes nothing). Same rights as the per-piece
+// switches these tables replaced, without their jump table.
+const KING_RIGHTS = blk: {
+    var table = [_]u4{0} ** 13;
+    table[@intFromEnum(piece.Piece.white_king)] = 0b0011;
+    table[@intFromEnum(piece.Piece.black_king)] = 0b1100;
+    break :blk table;
+};
+const ROOK_RIGHTS = blk: {
+    var table = [_]u4{0} ** 13;
+    table[@intFromEnum(piece.Piece.white_rook)] = 0b0011;
+    table[@intFromEnum(piece.Piece.black_rook)] = 0b1100;
+    break :blk table;
+};
+const CORNER_RIGHT = blk: {
+    var table = [_]u4{0} ** 64;
+    table[@intFromEnum(square.Square.h1)] = 0b0001;
+    table[@intFromEnum(square.Square.a1)] = 0b0010;
+    table[@intFromEnum(square.Square.h8)] = 0b0100;
+    table[@intFromEnum(square.Square.a8)] = 0b1000;
+    break :blk table;
+};
 
-fn updateCastlingRightsForCapture(pos: *position.Position, captured_piece: piece.Piece, capture_square: square.Square) void {
-    switch (captured_piece) {
-        .white_rook => switch (capture_square) {
-            .a1 => pos.castling_rights.white_queen_side = false,
-            .h1 => pos.castling_rights.white_king_side = false,
-            else => {},
-        },
-        .black_rook => switch (capture_square) {
-            .a8 => pos.castling_rights.black_queen_side = false,
-            .h8 => pos.castling_rights.black_king_side = false,
-            else => {},
-        },
-        else => {},
-    }
-}
-
-fn captureSquareForRights(side: types.Color, mv: move_mod.Move) square.Square {
-    return if (mv.flag == .en_passant) enPassantCapturedPawnSquare(side, mv.to) else mv.to;
-}
-
+/// The square a double push passes: same file, middle rank, i.e. the mean of
+/// the two indices (they differ by exactly 16).
 fn betweenSquare(from: square.Square, to: square.Square) square.Square {
-    const mid_rank: u3 = @intCast((@as(u8, from.rank()) + @as(u8, to.rank())) / 2);
-    return square.Square.fromCoords(from.file(), mid_rank);
+    std.debug.assert(((@as(u7, @intFromEnum(from)) + @intFromEnum(to)) & 1) == 0);
+    return @enumFromInt(@as(u6, @intCast((@as(u7, @intFromEnum(from)) + @intFromEnum(to)) >> 1)));
 }
 
+/// The pawn an en passant capture to `destination` removes: one rank behind it
+/// from the capturer's side (index - 8 for White, + 8 for Black).
 fn enPassantCapturedPawnSquare(side: types.Color, destination: square.Square) square.Square {
-    return switch (side) {
-        .white => square.Square.fromCoords(destination.file(), @intCast(@as(u8, destination.rank()) - 1)),
-        .black => square.Square.fromCoords(destination.file(), @intCast(@as(u8, destination.rank()) + 1)),
-    };
+    const index: u6 = @intFromEnum(destination);
+    return @enumFromInt(switch (side) {
+        .white => index - 8,
+        .black => index + 8,
+    });
 }
 
 fn applyCastleRookMove(pos: *position.Position, side: types.Color, king_destination: square.Square) void {
@@ -377,18 +387,17 @@ fn movePiece(pos: *position.Position, p: piece.Piece, from: square.Square, to: s
     std.debug.assert(pos.pieceAt(from) == p);
     std.debug.assert(pos.pieceAt(to) == .none);
 
-    const from_index = from.index();
-    const to_index = to.index();
+    const from_index = @intFromEnum(from);
+    const to_index = @intFromEnum(to);
     const from_mask = @as(bitboard.Bitboard, 1) << from_index;
     const to_mask = @as(bitboard.Bitboard, 1) << to_index;
     const delta = from_mask | to_mask;
     const piece_index = @intFromEnum(p);
-    const ci = @as(usize, piece_index) / 6;
-    const pti = @as(usize, piece_index) % 6;
+    const ci = pieceColorIndex(p);
 
     const key_row = zobrist.pieceSquareRow(piece_index);
     pos.zobrist_key ^= key_row[from_index] ^ key_row[to_index];
-    pos.pieces[ci][pti] ^= delta;
+    pieceSlot(pos, p).* ^= delta;
     pos.occupancies[ci] ^= delta;
     pos.occupied ^= delta;
     pos.mailbox[from_index] = .none;
@@ -402,12 +411,11 @@ fn addPieceWithoutHash(pos: *position.Position, p: piece.Piece, sq: square.Squar
 
     const mask = bitboard.bit(sq);
     const ci = pieceColorIndex(p);
-    const pti = pieceTypeIndex(p);
 
-    pos.pieces[ci][pti] |= mask;
+    pieceSlot(pos, p).* |= mask;
     pos.occupancies[ci] |= mask;
     pos.occupied |= mask;
-    pos.mailbox[sq.index()] = p;
+    pos.mailbox[@intFromEnum(sq)] = p;
     updateKingSquareForAdd(pos, p, sq);
 }
 
@@ -417,12 +425,11 @@ fn removePieceWithoutHash(pos: *position.Position, p: piece.Piece, sq: square.Sq
 
     const mask = bitboard.bit(sq);
     const ci = pieceColorIndex(p);
-    const pti = pieceTypeIndex(p);
 
-    pos.pieces[ci][pti] &= ~mask;
+    pieceSlot(pos, p).* &= ~mask;
     pos.occupancies[ci] &= ~mask;
     pos.occupied &= ~mask;
-    pos.mailbox[sq.index()] = .none;
+    pos.mailbox[@intFromEnum(sq)] = .none;
     updateKingSquareForRemove(pos, p);
 }
 
@@ -435,18 +442,45 @@ fn movePieceWithoutHash(pos: *position.Position, p: piece.Piece, from: square.Sq
     const to_mask = bitboard.bit(to);
     const delta = from_mask | to_mask;
     const ci = pieceColorIndex(p);
-    const pti = pieceTypeIndex(p);
 
-    pos.pieces[ci][pti] ^= delta;
+    pieceSlot(pos, p).* ^= delta;
     pos.occupancies[ci] ^= delta;
     pos.occupied ^= delta;
-    pos.mailbox[from.index()] = .none;
-    pos.mailbox[to.index()] = p;
+    pos.mailbox[@intFromEnum(from)] = .none;
+    pos.mailbox[@intFromEnum(to)] = p;
     updateKingSquareForMove(pos, p, to);
 }
 
 fn restoreCaptured(pos: *position.Position, captured: piece.Piece, sq: square.Square) void {
     if (captured != .none) addPieceWithoutHash(pos, captured, sq);
+}
+
+/// `removePiece` for a piece that may be .none (then nothing changes: a zero
+/// mask, the all-zero key row 12, and any valid bitboard slot), without a
+/// branch on it.
+inline fn removeIfAny(pos: *position.Position, p: piece.Piece, sq: square.Square) void {
+    std.debug.assert(p != .white_king and p != .black_king);
+    const sq_index = @intFromEnum(sq);
+    const mask = (@as(bitboard.Bitboard, 1) << sq_index) & (0 -% @as(bitboard.Bitboard, @intFromBool(p != .none)));
+    pos.zobrist_key ^= zobrist.pieceSquareRow(@intFromEnum(p))[sq_index];
+    const flat: *[12]bitboard.Bitboard = @ptrCast(&pos.pieces);
+    flat[@min(@intFromEnum(p), 11)] &= ~mask;
+    pos.occupancies[pieceColorIndex(p)] &= ~mask;
+    pos.occupied &= ~mask;
+    pos.mailbox[sq_index] = .none;
+}
+
+/// `restoreCaptured` without a branch on .none (see removeIfAny); also
+/// writes the mailbox square (.none stays .none).
+inline fn restoreIfAny(pos: *position.Position, p: piece.Piece, sq: square.Square) void {
+    std.debug.assert(p != .white_king and p != .black_king);
+    const sq_index = @intFromEnum(sq);
+    const mask = (@as(bitboard.Bitboard, 1) << sq_index) & (0 -% @as(bitboard.Bitboard, @intFromBool(p != .none)));
+    const flat: *[12]bitboard.Bitboard = @ptrCast(&pos.pieces);
+    flat[@min(@intFromEnum(p), 11)] |= mask;
+    pos.occupancies[pieceColorIndex(p)] |= mask;
+    pos.occupied |= mask;
+    pos.mailbox[sq_index] = p;
 }
 
 inline fn updateKingSquareForAdd(pos: *position.Position, p: piece.Piece, sq: square.Square) void {
@@ -466,23 +500,30 @@ inline fn updateKingSquareForRemove(pos: *position.Position, p: piece.Piece) voi
 }
 
 inline fn updateKingSquareForMove(pos: *position.Position, p: piece.Piece, to: square.Square) void {
-    switch (p) {
-        .white_king => pos.king_squares[@intFromEnum(types.Color.white)] = to,
-        .black_king => pos.king_squares[@intFromEnum(types.Color.black)] = to,
-        else => {},
-    }
+    // The mover's colour slot is rewritten either way (with its own value
+    // unless a king moved), the value picked by index: a select on the
+    // optional compiled to branches on the piece.
+    const slot = &pos.king_squares[pieceColorIndex(p)];
+    const is_king = (p == .white_king) or (p == .black_king);
+    const choices = [2]?square.Square{ slot.*, to };
+    slot.* = choices[@intFromBool(is_king)];
 }
 
 inline fn pieceColorIndex(p: piece.Piece) usize {
-    return @as(usize, @intFromEnum(p)) / 6;
+    return @intFromBool(@intFromEnum(p) >= 6);
 }
 
-inline fn pieceTypeIndex(p: piece.Piece) usize {
-    return @as(usize, @intFromEnum(p)) % 6;
+/// The bitboard of piece `p`: `pieces[c][t]` is element `c * 6 + t` of the
+/// contiguous [2][6] array, and that is exactly the `piece.Piece` encoding,
+/// so the piece indexes it directly (no divide-by-6 split and re-multiply).
+inline fn pieceSlot(pos: *position.Position, p: piece.Piece) *bitboard.Bitboard {
+    std.debug.assert(@intFromEnum(p) < 12);
+    const flat: *[12]bitboard.Bitboard = @ptrCast(&pos.pieces);
+    return &flat[@intFromEnum(p)];
 }
 
 fn pieceKey(p: piece.Piece, sq: square.Square) u64 {
-    return zobrist.pieceSquareRow(@intFromEnum(p))[sq.index()];
+    return zobrist.pieceSquareRow(@intFromEnum(p))[@intFromEnum(sq)];
 }
 
 fn expectRoundTrip(fen_text: []const u8, mv: move_mod.Move) !void {
@@ -503,6 +544,55 @@ fn findLegalMoveBySpec(pos: *const position.Position, from: square.Square, to: s
         if (mv.from == from and mv.to == to and mv.flag == flag) return mv;
     }
     return error.MoveNotFound;
+}
+
+test "double push records and hashes the en passant target only when it can be used" {
+    const fen = @import("../core/fen.zig");
+    const zobrist_check = @import("../core/zobrist.zig");
+
+    // Judge C repro: e4, then a knight shuffle back to the same position. The
+    // key after the shuffle must equal the key right after e4 (it did not,
+    // because only the first carried the unusable e3 target).
+    var pos = try fen.startpos();
+    var states: [5]StateInfo = undefined;
+    const e4 = try findLegalMoveBySpec(&pos, .e2, .e4, .double_push);
+    const after_e4 = makeMove(&pos, e4, &states[0]);
+    try std.testing.expectEqual(@as(?square.Square, null), pos.en_passant);
+    try std.testing.expectEqual(zobrist_check.hashPosition(&pos), after_e4);
+    const shuffle = [_][2]square.Square{ .{ .g8, .f6 }, .{ .g1, .f3 }, .{ .f6, .g8 }, .{ .f3, .g1 } };
+    for (shuffle, 1..) |pair, i| {
+        const mv = try findLegalMoveBySpec(&pos, pair[0], pair[1], .quiet);
+        _ = makeMove(&pos, mv, &states[i]);
+    }
+    try std.testing.expectEqual(after_e4, pos.zobrist_key);
+    try std.testing.expectEqual(pos.zobrist_key, (try fen.parse("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 4 3")).zobrist_key);
+
+    // An enemy pawn beside the pushed pawn: the target is real, both colours.
+    var white_push = try fen.parse("4k3/8/8/8/3p4/8/4P3/4K3 w - - 0 1");
+    var state = StateInfo{};
+    const key = makeMove(&white_push, try findLegalMoveBySpec(&white_push, .e2, .e4, .double_push), &state);
+    try std.testing.expectEqual(@as(?square.Square, .e3), white_push.en_passant);
+    try std.testing.expectEqual(zobrist_check.hashPosition(&white_push), key);
+    var black_push = try fen.parse("4k3/2p5/8/1P6/8/8/8/4K3 b - - 0 1");
+    _ = makeMove(&black_push, try findLegalMoveBySpec(&black_push, .c7, .c5, .double_push), &state);
+    try std.testing.expectEqual(@as(?square.Square, .c6), black_push.en_passant);
+    try std.testing.expectEqual(zobrist_check.hashPosition(&black_push), black_push.zobrist_key);
+}
+
+test "prefetch key matches the made key for double pushes" {
+    const fen = @import("../core/fen.zig");
+    for ([_][]const u8{ "4k3/8/8/8/3p4/8/4P3/4K3 w - - 0 1", "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1", "4k3/2p5/8/1P6/8/8/8/4K3 b - - 0 1", "4k3/2p5/8/8/8/8/8/4K3 b - - 0 1" }) |fen_text| {
+        var pos = try fen.parse(fen_text);
+        var list = move_mod.MoveList.init();
+        @import("legal.zig").generate(&pos, &list);
+        for (list.slice()) |mv| {
+            if (mv.flag != .double_push) continue;
+            const hinted = prefetchKeyAfter(&pos, mv);
+            var state = StateInfo{};
+            try std.testing.expectEqual(hinted, makeMove(&pos, mv, &state));
+            unmakeMove(&pos, mv, &state);
+        }
+    }
 }
 
 test "quiet move round-trips exactly" {

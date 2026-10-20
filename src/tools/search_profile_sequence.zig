@@ -46,6 +46,8 @@ pub fn runFileWithOptions(writer: anytype, path: []const u8, depth: u16, eval_op
         if (line.len == 0 or line[0] == '#') continue;
         if (std.mem.eql(u8, line, "fen")) continue;
         const pos = fen.parse(line) catch continue;
+        // Skipped like a malformed row (Position.hasBackRankPawn).
+        if (pos.hasBackRankPawn()) continue;
         index += 1;
 
         var history = repetition.History{};

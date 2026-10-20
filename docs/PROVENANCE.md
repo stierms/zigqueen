@@ -1,6 +1,6 @@
 # Provenance and licensing record
 
-**Updated October 2026 for 6.4.0.** This record distinguishes inherited
+**Updated October 2026 for 6.5.0.** This record distinguishes inherited
 ideas and initial parameters, local implementations and retunes, trained
 weights, data transformations and redistributed third-party code.
 
@@ -29,13 +29,15 @@ https://github.com/stierms/zigqueen/issues.
 | Component / source | License | How zigqueen relates to it |
 |---|---|---|
 | zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
-| Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1); threat-conditioned quiet history is a published idea it also uses (§1, 6.3.0); fail-firm cutoff returns, correction-history classes and the \|correction\| terms in pruning and reductions are published ideas it also uses (§1, 6.4.0). No code. GPL-compatible. |
-| Stockfish 18 and 19 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§1, §2, §3); pawn-pair input concept (SFNNv16, credited to Pawnocchio's author; §2, 6.4.0). No code. Training data: see next row. |
+| Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1); threat-conditioned quiet history is a published idea it also uses (§1, 6.3.0); fail-firm cutoff returns, correction-history classes and the \|correction\| terms in pruning and reductions are published ideas it also uses (§1, 6.4.0); ray-space threat updates (idea, §3). No code. GPL-compatible. |
+| Stockfish 18 and 19 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§1, §2, §3); pawn-pair input concept (SFNNv16, credited to Pawnocchio's author; §2, 6.4.0); threat updates around the changed squares (idea, 6.5.0). No code. Training data: see next row. |
 | Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/from_kaggle_2_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03 and 2026-09-14); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the 6.4.0 and 6.3.0 networks (40 of their 42 components, same database) and for the 6.2.0 network (§4), with local score alterations. Notice and alteration offer below. |
 | `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the two 2024 components. |
 | Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | LCZero-derived components of the training mix (§4). ODbL notice below. |
 | bullet (Jamie Whiting) | MIT | NNUE trainer, used with full-threat, pawn-pair and deployed-arithmetic QAT extensions written for zigqueen and published as patches (§4). Not linked into the engine. |
-| Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, compiled into the engine, three local modifications (§5). |
+| Fathom (Ronald de Man, basil00, Jon Dart) | MIT | Vendored in `deps/fathom`, three local modifications (§5). Compiled into the engine up to 6.4.0; since 6.5.0 linked only into the test-only `tb-oracle` tool that checks our own prober against it. |
+| Syzygy format references (Ronald de Man's prober and posts, Stockfish, python-chess, shakmaty-syzygy) | various (see `docs/SYZYGY_FORMAT.md`) | Format facts for `docs/SYZYGY_FORMAT.md`, from which our own prober was written (6.5.0, §5). No code. |
+| LLVM (`llvm-profdata` 20.x; the LLD linker inside Zig) | Apache-2.0 with LLVM exception | Release build tooling only, for profile-guided optimization (§5). |
 | chessenginesupport-androidlib (gkalab) | Apache-2.0 | Vendored unmodified in `android/oex/…/com/kalab/chess/enginesupport/` for the OEX APK (§5). |
 | Gradle wrapper | Apache-2.0 | `android/oex/gradle/wrapper/gradle-wrapper.jar` (§5). |
 | Opening books used for testing (UHO, Stefan Pohl) | not redistributed | Used to run gauntlets only. |
@@ -186,6 +188,20 @@ review that included an originality check.
   - no time plan may exceed the remaining clock;
   - helper threads split the single-thread hint-table and eval-cache budget.
 
+**Changes in 6.5.0.**
+
+- A new time manager: an anytime root, a clock model with an explicit
+  reserve, and a continuously checked stop driven by the search's own
+  convergence signals.
+- Pin-aware SEE, from our own audit.
+- Search and tablebase-root fixes (fifty-move handling, repetitions, root
+  ranking of tablebase wins).
+- An exact speed rework. Two of its pieces have a specific outside origin:
+  the ray-space threat updates (87flowers/Stormphrax, §3) and threat updates
+  around the changed squares (Stockfish).
+
+The other 6.5.0 changes are our own work or general engine practice.
+
 ## 2. NNUE evaluation: published forms, our own implementation
 
 - **Feature transformer.** Mirrored HalfKA with 8 king buckets (each perspective's own king; files e–h mirrored onto
@@ -234,6 +250,10 @@ checked against one another bit-for-bit.
 
 The 5.x networks used a smaller 7,680-input "lean" threat set of our own design (attacker square dropped); it is
 no longer shipped.
+
+**Threat updates in ray space (6.5.0):** the byteboard technique by 87flowers, as introduced for threat
+updates in Stormphrax. Our implementation was written from our own specification and contains no code from any
+engine.
 
 ## 4. The network: weights and data
 
@@ -297,9 +317,10 @@ no longer shipped.
   scripts are in `docs/trainer/tools/`; `v2_net.py` reproduces the 6.4.0 file
   byte for byte from the trainer's output. The trainer change behind the
   6.2.0 head continuation is not published.
-  [NETWORK.md](NETWORK.md) records the recipes and model hashes.
+  [NETWORK.md](NETWORK.md) records the recipe and hash of the shipped network
+  and links the earlier networks' records.
 - **Data (6.0.0–6.2.0).** Twenty-seven published components, with exact source families
-  listed in [NETWORK.md](NETWORK.md). Publisher metadata identifies
+  listed in [NETWORK.md as of 6.2.0](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md). Publisher metadata identifies
   Stockfish-project relabels, including BT4 teacher labels. Twenty-six
   components have LCZero-derived position ancestry; the generation ancestry
   of `wrongIsRight_nodes5000pv2` remains unresolved in our audit. We have
@@ -331,13 +352,18 @@ no longer shipped.
   offered under ODbL-1.0 and individual contents under DbCL-1.0; we added no
   individual contents. The same `data-r2` offer covers the 6.4.0 network,
   which was trained on the same derivative database; the archive is attached
-  unchanged to the 6.4.0 release. The `data-r1` offer covers the 6.2.0
+  unchanged to the 6.4.0 release, and again to 6.5.0, which ships the same
+  network. The `data-r1` offer covers the 6.2.0
   network only.
 
 ## 5. Third-party code compiled or packaged with zigqueen
 
+- **zigqueen's own Syzygy prober** (`src/tb`, 6.5.0) was written from
+  [SYZYGY_FORMAT.md](SYZYGY_FORMAT.md), our description of the format, which cites its sources for each fact. It is
+  checked against Fathom and python-chess (out of process) in tests.
 - **Fathom** (`deps/fathom`, MIT): Syzygy tablebase prober by Ronald de Man, basil00 and Jon Dart, vendored from
-  `github.com/jdart1/Fathom` (the unmodified files match upstream commit `c9c6fef`, 2025-12-23). Three local changes in
+  `github.com/jdart1/Fathom` (the unmodified files match upstream commit `c9c6fef`, 2025-12-23). Since 6.5.0 it is
+  linked only into the test-only `tb-oracle` tool (`zig build tb-oracle`), never into the engine. Three local changes in
   `tbprobe.c`, marked
   `/* zigqueen: … */`: a table that cannot be mapped into memory is treated as a probe miss instead of terminating the
   engine; an allocation failure disables tablebases instead of exiting; and (6.3.0) the file-mapping helper no longer
@@ -348,6 +374,8 @@ no longer shipped.
   unmodified for the Android APKs; license text in `THIRD_PARTY_LICENSES.md` and in the APK.
 - **Gradle wrapper** (Apache-2.0): standard build tooling in `android/oex`.
 - The Zig build declares no package dependencies; nothing else is linked.
+- **PGO release tooling** (6.5.0): `scripts/pgo-build.sh` and `scripts/pgo/` were written for zigqueen and use only
+  Zig and LLVM's `llvm-profdata`. The committed profiles are counts from zigqueen's own search.
 
 ## 6. Conventional tables and constants
 
@@ -385,7 +413,7 @@ Codex. Assistants write and review code under human direction; the author
 sets scope and decides releases. Correctness gates precede match testing.
 The ladder uses screening, SPRT and external validation; not every accepted
 small effect reached an SPRT boundary. [STRENGTH.md](STRENGTH.md) records
-the evidence and acceptance limits for this release.
+the gauntlet results and links each earlier release's evidence.
 
 Corrections supported by specific source or artifact evidence are welcome
 at https://github.com/stierms/zigqueen/issues.
@@ -405,3 +433,6 @@ at https://github.com/stierms/zigqueen/issues.
   trained from scratch on the 6.3.0 database and finished with full-network
   QAT; its trainer patches and export script; local retune of 17 inherited
   search coordinates; origins of the 6.4.0 search changes.
+- October 2026, 6.5.0: own Syzygy prober and its format description (Fathom
+  now only in a test tool); credits for the ray-space and changed-square
+  threat updates; PGO release tooling. The network is unchanged.

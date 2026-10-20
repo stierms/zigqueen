@@ -1,232 +1,115 @@
-# zigqueen 6.4.0 — full-threats NNUE chess engine
+# zigqueen 6.5.0
 
 <p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
 
-zigqueen is a UCI chess engine written in Zig (0.15.2) with a from-scratch
-NNUE evaluation and an alpha-beta search that runs on 1 to 32 threads. The
-engine code was written for this project; no code was copied or translated
-from other engines. What was learned from where is credited in `docs/PROVENANCE.md`
-(rules: `ORIGINALITY.md`). The network is
-trained from random initialization on publicly published Stockfish NNUE
-training datasets.
+zigqueen is a UCI chess engine written in Zig, with its own NNUE evaluation
+and an alpha-beta search on 1 to 32 threads. The engine code was written for
+this project; credits for ideas, parameters and data are in
+[docs/PROVENANCE.md](docs/PROVENANCE.md). License: GPL-3.0-or-later.
 
-Copyright (C) 2026 stierms — licensed under the GNU GPL, version 3 or (at
-your option) any later version (see `LICENSE`). The
-vendored Fathom tablebase prober (`deps/fathom`) is MIT-licensed; all
-third-party notices are collected in `THIRD_PARTY_LICENSES.md`.
+## Download
+
+From the [releases page](https://github.com/stierms/zigqueen/releases):
+
+| File | For |
+|---|---|
+| `…-windows-x86_64-avx512.zip`, `…-linux-x86_64-avx512.zip` | CPUs with AVX-512 (AMD Zen 4 and newer, Intel Ice Lake or newer with AVX-512) |
+| `…-windows-x86_64-avx2.zip`, `…-linux-x86_64-avx2.zip` | other x86-64 CPUs from Intel Haswell or AMD Zen 1 on |
+| `…-oex-armv8.apk`, `…-oex-armv8-dotprod.apk` | Android chess GUIs that support OEX engines ([docs/ANDROID.md](docs/ANDROID.md)) |
+| `…-android-armv8.zip`, `…-android-armv8-dotprod.zip` | raw Android binaries, e.g. for Termux |
+
+All builds play the same moves; they differ only in speed. Take `dotprod`
+only if the CPU has both the dotprod and i8mm extensions.
 
 ## Strength
 
-| Version | [Self-assessment](docs/STRENGTH.md), 1 thread | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) (120+1) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) (40 moves in 15 min) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC (144+1.12) |
+| Version | Our gauntlet, 1 thread | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC |
 |---|---|---|---|---|
-| 6.4.0 | **3701** (95%: 3694–3707) — 1,628 games, 22 opponents, 2026-10-09 | — | — | — |
-| 6.3.0 | **3676** (95%: 3670–3683) — 1,628 games, 22 opponents, 2026-09-25, new field | — | — | 3563 ±81 |
-| 6.2.0 | **~3672** — 1,620 games, 27 opponents, 2026-09-09 | **3649 ±18** ([#60, 749 games](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.2.0%2064-bit)) | — | — |
-| 6.1.1 | as 6.1.0 (compliance release, engine bit-identical) | — | — | 3475 ±45 |
-| 6.1.0 | ~3644 — 1,620 games, 2026-08-31 | — | — | 3490 ±41 |
-| 6.0.0 | ~3602 — 1,620 games, 2026-08-19 | — | **3498 ±18** ([#80, 582 games](https://computerchess.org.uk/ccrl/4040/cgi/engine_details.cgi?print=Details&eng=ZigQueen%206.0.0%2064-bit)) | 3402 ±45 |
-| 5.8.3 | ~3590 — 1,620 games, 2026-07-26 | **3559 ±14** ([1,327 games](https://computerchess.org.uk/ccrl/404/cgi/engine_details.cgi?print=Details&eng=ZigQueen%205.8.3%2064-bit)) | — | 3384 ±33 |
-| 5.8.0 | ~3588 — 1,620 games, 2026-07-19 | — | — | — |
+| 6.5.0 | 3717 (95%: 3713–3721) | — | — | — |
+| 6.4.0 | 3701 (95%: 3694–3707) | — | — | — |
+| 6.3.0 | 3676 (95%: 3670–3683) | — | — | 3563 ±81 |
+| 6.2.0 | ~3672 | 3649 ±18 | — | — |
+| 6.1.1 | ~3644 | — | — | 3475 ±45 |
+| 6.0.0 | ~3602 | — | 3498 ±18 | 3402 ±45 |
+| 5.8.3 | ~3590 | 3559 ±14 | — | 3384 ±33 |
 
-Time controls are seconds per game + increment per move. Self-assessments
-are our own gauntlets anchored to CCRL Blitz ratings, not official numbers;
-method and caveats in [docs/STRENGTH.md](docs/STRENGTH.md). Up to 6.2.0 they
-used a 27-opponent roster at a fixed 180+1. 6.3.0 and 6.4.0 use a 22-opponent
-field from the 2026-09-21 CCRL list and CCRL's 120+1 scaled to our hardware
-with a Stockfish 10 benchmark, so their numbers cannot be compared with the
-rows below. At 8 threads against an 8-CPU field, 6.4.0 measured 3736 (95%:
-3726–3746) and the 6.3 release candidate 3697. CCRL and CCI figures as of 2026-09-29.
-The [Computer Chess Index](https://computer-chess-index.github.io/cci/)
-uses its own Bayesian-Elo scale on an i5-7500T (Stockfish 19 = 3555 at
-STC), so its numbers are not comparable to CCRL's; STC and LTC are on the
-engine page.
+Our gauntlets are our own estimates against CCRL-rated engines, not official
+numbers. The field changed between versions, so the rows are not directly
+comparable ([docs/STRENGTH.md](docs/STRENGTH.md)).
 
 ## Features
 
-**Evaluation** — pure NNUE (`ZQBA` container, 88.7 MB net embedded):
+- NNUE: HalfKA with 16 king buckets, threat features and pawn pairs, width
+  1024, embedded (88.7 MB).
+- Network trained from scratch on public data ([docs/NETWORK.md](docs/NETWORK.md)).
+- Integer inference with AVX-512, AVX2 or NEON, identical on every build.
+- Lazy SMP on 1 to 32 threads with one shared hash table.
+- Search: null move, probcut, singular extensions, correction history.
+- Own Syzygy tablebase prober: WDL in the search, DTZ at the root.
+- Time manager that always has a searched move ready.
+- Large pages: automatic on Linux; on Windows after granting "Lock pages in
+  memory".
+- Profile-guided (PGO) x86-64 release builds.
+- Android OEX engine APKs.
 
-- HalfKA feature transformer, 16 king buckets with horizontal mirroring,
-  width 1024
-- pawn-pair input block (new in 6.4.0)
-- full-threat feature set with 60,144 sparse attacker/target relations and
-  custom incremental non-local update algorithms
-- PSQT head and eight material-bucketed `1024 -> 16 -> 32 -> 1` layer stacks
-  with i8 VNNI/dot-product matmul
-- 6.4.0 network trained from scratch on the same 42 published relabelled
-  data components as 6.3.0's, finished with quantization-aware training of the
-  whole network in the deployed integer arithmetic
-- incremental accumulators with lazy materialization and a finny-style
-  refresh cache
-- trained with the [bullet](https://github.com/jw1912/bullet) trainer on
-  the publicly published Stockfish NNUE training datasets — see
-  [docs/NETWORK.md](docs/NETWORK.md) for exactly what was and was not used
+## UCI options
 
-**Search** — negamax + iterative deepening, aspiration windows:
-
-- Lazy SMP on 1 to 32 threads: independent searches of the same root that
-  share one transposition table; `Threads=1` is the single-threaded search
-- fractional "basin" reductions: interior LMR and the pruning families
-  (null move, reverse futility, futility, late-move, history) share one
-  depth-dose scheme initially parameterised from Stormphrax 8.0.0;
-  this release includes a local pruning retune (see `docs/PROVENANCE.md`)
-- root late-move reductions: post-PV root moves are scouted at reduced
-  depth and re-searched at full depth on a fail-high
-- clustered transposition table with static-eval caching, huge-page backed;
-  dedicated 2-way eval cache
-- null move with verification, probcut, singular extensions,
-  desperation-conditioned check extensions
-- killer/countermove/continuation history, and a quiet history kept in
-  four tables by whether the move's from- and to-squares are attacked
-- correction history (pawn, non-pawn, minor, major and continuation tables)
-  adjusts the static evaluation; fail-soft cutoff scores
-- honest node accounting: one visited position, one node
-- Syzygy via Fathom: WDL probes in the search; at a covered root, a DTZ
-  probe of every legal move keeps the search to the moves that hold the
-  tablebase result; tablebase-decided root results are proven once and
-  reused instead of re-searched every iteration
-- time management with an instability-armed burst: the hard per-move
-  deadline extends only after a completed iteration changed its best move
-  or dropped the score
-- SEE-gated quiet checks at the first qsearch ply (the six built-in root
-  book moves of 6.0.0/6.1.0 are gone as of 6.1.1 — see `docs/PROVENANCE.md`)
-
-**Performance** — AVX-512 (512-bit NNUE kernels) and AVX2 SIMD via Zig
-`@Vector` (portable, bit-exact), hot functions aligned for stable code
-placement, LTO, transparent-huge-page self-enable on Linux/WSL2, Windows large
-pages, optional llvm-bolt post-link pass.
-
-## Development hardware
-
-Three privately owned desktops, no cluster:
-
-| Role | CPU | GPU | RAM |
-|---|---|---|---|
-| Development, native Windows speed tests, gauntlets | Ryzen 9 9950X3D (AVX-512) | RTX 4090 (training of the 6.0.0 base) | 128 GB |
-| SPRTs, AVX2 and 8-thread gauntlets | Ryzen 9 5950X (AVX2) | — | 128 GB |
-| Network training (6.3.0 and 6.4.0 networks), Windows tests | Ryzen 5 7600X3D (AVX-512) | RTX 5080 | 64 GB |
-
-Training and most development testing run under WSL2; the Ryzen 9 5950X
-runs native Linux. Release binaries are cross-built with Zig; GitHub Actions
-builds the same tagged sources.
-
-## How this engine was built (AI disclosure)
-
-zigqueen is developed by [stierms](https://github.com/stierms) with AI
-assistants (Anthropic's Claude, OpenAI's Codex). The assistants write and
-review code and run experiments; the author sets the goals, approves every
-experiment that costs machine time and decides what ships.
-
-Correctness rests on perft, make/unmake invariants and NNUE parity against
-an independent reference. Strength changes go through short paired screens,
-SPRT self-play at two time controls and an external gauntlet; performance
-changes must be node-identical at fixed depth. Not every accepted change
-reached an SPRT boundary. What was accepted on what evidence is recorded in
-[STRENGTH.md](docs/STRENGTH.md).
-
-`ORIGINALITY.md` documents the originality rules: no code was copied
-or translated from other engines. `docs/PROVENANCE.md` records what was
-learned from which engine or dataset and under which license, including the
-search-shaping parameter set that was taken from Stormphrax's published
-defaults rather than derived locally.
+| Option | Default | Description |
+|---|---|---|
+| `Hash` | 256 | Hash table in MB (1–65536), shared by all threads. |
+| `Threads` | 1 | Search threads (1–32). |
+| `Move Overhead` | 20 | Time reserve per move in ms for GUI latency (0–1000). |
+| `NNUE Scale Percent` | 44 | Evaluation scale; keep the default for the embedded network. |
+| `SyzygyPath` | empty | Tablebase directories, separated by `:` (`;` on Windows). |
+| `Contempt` | 0 | Draw contempt in centipawns (−200 to 200). |
+| `EvalFile` | `<builtin>` | Path to an external `.zqb` network. |
+| `NNUE Shared Weights` | false | Share one copy of the network weights between zigqueen processes of the same user (about 90 MB saved per extra process). |
 
 ## Build
 
 Requires Zig 0.15.2:
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast   # ./zig-out/bin/zigqueen, for the native CPU
 zig build test
-./zig-out/bin/zigqueen
 ```
 
-The default build targets the native CPU. Portable release binaries use
-`-Dcpu-baseline=avx2` (x86-64-v3: AVX2, no AVX-512 — runs on Haswell/Zen 1
-and newer) or `-Dcpu-baseline=avx512` (x86-64-v4 + VNNI — Ice Lake/Zen 4 and
-newer); all variants are bit-exact, only speed differs. Windows binaries
-cross-compile with `-Dtarget=x86_64-windows-gnu`. Android uses the `armv8`
-and `armv8-dotprod` baselines. `scripts/package-release.sh` builds and zips
-all six raw-binary release variants into `release/`; signed OEX APKs are
-packaged locally from `android/oex/`.
+Every 6.5.0 build gives `bench 16` = 162,091 nodes.
 
-## UCI options
+`scripts/package-release.sh` builds the six release binaries, the x86-64 ones
+as PGO builds from the profiles in `scripts/pgo/profiles/`; the method is
+described at the top of `scripts/pgo-build.sh`.
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `Hash` | spin | 256 | Transposition table size in MB (1-65536), one table shared by all threads; also sizes each thread's private caches. |
-| `Threads` | spin | 1 | Search threads (1-32). 1 is the single-threaded search; more threads share the hash table (Lazy SMP). |
-| `Move Overhead` | spin | 20 | Per-move time reserve in ms for GUI/connection latency (0-1000). |
-| `NNUE Scale Percent` | spin | 44 | Eval scaling in percent (0-400). The default is keyed to the embedded net; changing it is not recommended. |
-| `SyzygyPath` | string | empty | Syzygy tablebase directories, separated by `:` (Linux, Android) or `;` (Windows). WDL files are probed in the search, DTZ files at the root. |
-| `Contempt` | spin | 0 | Draw contempt in centipawns (-200 to 200); 0 = classical draw scoring. |
-| `EvalFile` | string | `<builtin>` | Path to an external `.zqb` net; leave at `<builtin>` for the embedded net. |
+## How this engine was built
 
-That is the complete list. Development builds compiled with `-Dtuning=true`
-additionally expose the search-policy parameters (`Basin*` and friends).
-Both build flavours share the same defaults; tuning options take effect
-between searches.
-
-**Threads and memory.** Besides the hash table, the search keeps private
-caches sized from `Hash`: half of it (at most 1 GB) plus a quarter (at most
-64 MB), split evenly across the threads. A change of `Threads` or `Hash` is applied between searches, briefly holds the
-old and new tables, and clears the hash. `nodes`, `nps` and `go nodes` count
-all threads together. Playing strength was measured at 1 and 8 threads; see the
-[6.4.0 release notes](docs/RELEASE_NOTES_6.4.0.md).
-
-## Platform notes
-
-**Android**: each release ships OEX engine APKs (auto-discovered by Chess for
-Android, DroidFish and other OEX-compatible GUIs) plus raw aarch64 binaries;
-the ARM build is bit-identical to x86 by design. See [docs/ANDROID.md](docs/ANDROID.md).
-
-- **Linux/WSL2:** the engine transparently enables 2 MB huge pages for its
-  large tables (THP `madvise`), no setup needed.
-- **Windows:** large pages need `SeLockMemoryPrivilege` — grant "Lock pages
-  in memory" (secpol.msc) once and re-login; otherwise the engine silently
-  uses regular pages. See `docs/WINDOWS_BUILD.md`.
+zigqueen is developed by [stierms](https://github.com/stierms) with AI
+assistants (Anthropic's Claude, OpenAI's Codex), which write and review code
+and run experiments; the author decides what ships. Every change passes
+correctness tests, strength changes are tested in self-play, and releases in
+gauntlets against other engines. The rules are in
+[ORIGINALITY.md](ORIGINALITY.md), the credits in
+[docs/PROVENANCE.md](docs/PROVENANCE.md).
 
 ## Documentation
 
-- `docs/RELEASE_NOTES_6.4.0.md` — what changed in 6.4.0
-- `docs/RELEASE_NOTES_6.3.0.md` — what changed in 6.3.0, and its known limits
-- `docs/RELEASE_NOTES_6.2.0.md` — what changed in 6.2.0
-- `docs/RELEASE_NOTES_6.1.1.md` — what changed in 6.1.1
-- `docs/RELEASE_NOTES_6.1.0.md` — what changed in 6.1.0
-- `docs/STRENGTH.md` — gauntlet methodology and per-opponent results
-- `docs/ARCHITECTURE.md` — module map, NNUE and search architecture
-- `docs/TUNING.md`, `docs/QUALITY_GATES.md` — validation methodology
-- `docs/WINDOWS_BUILD.md` — Windows builds and large pages
-- `ORIGINALITY.md` — originality rules
-- `docs/PROVENANCE.md` — provenance and licensing record (ideas, parameters,
-  data, third-party code)
-- `THIRD_PARTY_LICENSES.md` — notices for the vendored components
+- [Release notes](docs/RELEASE_NOTES_6.5.0.md), [strength](docs/STRENGTH.md),
+  [architecture](docs/ARCHITECTURE.md), [network](docs/NETWORK.md)
+- [Android](docs/ANDROID.md), [Windows builds](docs/WINDOWS_BUILD.md),
+  [all documents](docs/README.md)
 
 ## Acknowledgments
 
-- The [Stockfish](https://stockfishchess.org/) project and its community,
-  whose openly published NNUE training datasets made the network possible,
-  and the people behind the relabelled collections the 6.3.0 and 6.4.0
-  networks are trained on: Linmiao Xu (linrock), Joost VandeVondele (vondele), xushawn and
-  the contributors to the community BT4 relabelling.
-  Parts of that data are made available under the Open Database License
-  (ODbL-1.0, http://opendatacommons.org/licenses/odbl/1.0/) by the Stockfish
-  project and, for the LCZero-derived components, by the
-  [LCZero](https://lczero.org/) project; see `docs/NETWORK.md`. Our
-  changes to that data for the 6.3.0 and 6.4.0 networks are offered in
-  `docs/data-r2/README.md`.
-- [Stormphrax](https://github.com/Ciekce/Stormphrax) (Ciekce, GPL-3.0): the
-  search's reduction/pruning formulas and initial constants follow its
-  published parameter set; selected pruning values have since been retuned locally (`docs/PROVENANCE.md`, section 1). No code.
-- [bullet](https://github.com/jw1912/bullet), the NNUE trainer.
-- [Fathom](https://github.com/jdart1/Fathom) for Syzygy probing (MIT), and
-  [chessenginesupport-androidlib](https://github.com/gkalab/chessenginesupport-androidlib)
-  (Apache-2.0) for the Android OEX provider.
-- The engine-testing ecosystem, especially
-  [fastchess](https://github.com/Disservin/fastchess), and the computer
-  chess community's published research.
+- Stockfish, LCZero and the data relabellers (linrock, vondele, xushawn, BT4
+  relabelling): training data, partly ODbL-1.0 ([our changes](docs/data-r2/README.md)).
+- [Stormphrax](https://github.com/Ciekce/Stormphrax): the search's reduction and pruning parameters.
+- [bullet](https://github.com/jw1912/bullet): the NNUE trainer.
+- Ronald de Man: Syzygy; [Fathom](https://github.com/jdart1/Fathom): our prober's test reference.
+- [chessenginesupport-androidlib](https://github.com/gkalab/chessenginesupport-androidlib): Android OEX.
+- [fastchess](https://github.com/Disservin/fastchess): engine testing.
 
 ## License
 
-GNU GPL version 3 or (at your option) any later version — see `LICENSE`
-(SPDX: `GPL-3.0-or-later`). Third-party components keep their own licenses
-(Fathom: MIT; the Android OEX support library and Gradle wrapper:
-Apache-2.0); their notices are in `THIRD_PARTY_LICENSES.md`.
+- zigqueen: GPL-3.0-or-later ([LICENSE](LICENSE)).
+- Fathom (`deps/fathom`, test tool only): MIT.
+- Android OEX support library and Gradle wrapper: Apache-2.0.
+- All third-party notices: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

@@ -14,7 +14,7 @@ substantially faster inference path.
   [NETWORK.md](NETWORK.md).
 - External check: 52.3% over a 1,620-game gauntlet against 27 CCRL-listed
   engines (~3602 on the project's anchored gauntlet scale). Details and caveats in
-  [STRENGTH.md](STRENGTH.md).
+  [STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.0.0/docs/STRENGTH.md).
 
 ## Performance
 

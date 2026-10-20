@@ -73,10 +73,12 @@ pub fn enumerateColors(pos: *const position.Position, out_white: *PerspBits, out
         inline for ([_]piece.PieceType{ .pawn, .knight, .bishop, .rook, .queen }) |pt| {
             const pt_lean: usize = @intFromEnum(pt); // 0..4
             var bb = pos.pieces[ac_idx][pt_lean];
-            while (bitboard.popLsb(&bb)) |from| {
+            while (bb != 0) {
+                const from = bitboard.popLsbUnchecked(&bb);
                 var tb = attackSet(pt, ac, from, occ) & occ;
-                while (bitboard.popLsb(&tb)) |to| {
-                    const to_idx: u6 = to.index();
+                while (tb != 0) {
+                    const to = bitboard.popLsbUnchecked(&tb);
+                    const to_idx: u6 = @intFromEnum(to);
                     const tp = pos.mailbox[to_idx];
                     const tcolor = tp.color().?;
                     const tpt: usize = @intFromEnum(tp.pieceType()); // 0..5

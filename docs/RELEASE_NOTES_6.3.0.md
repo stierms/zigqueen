@@ -63,7 +63,7 @@ At one thread, 6.3.0 performed at **3676** in our gauntlet against 22 engines
 near its level on the CCRL Blitz list, with the clock set the way CCRL does
 it. That's our own measurement, not a CCRL rating, and it can't be compared
 with 6.2.0's number, which came from a different field and clock.
-[STRENGTH.md](STRENGTH.md) has the full results and method.
+[STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/STRENGTH.md) has the full results and method.
 
 ## Things to know
 

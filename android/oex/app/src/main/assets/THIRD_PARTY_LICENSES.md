@@ -7,7 +7,9 @@ provenance of ideas, data and parameters is recorded separately in `docs/PROVENA
 
 ## Fathom — Syzygy tablebase prober (`deps/fathom`, MIT)
 
-Vendored from https://github.com/jdart1/Fathom. Three local modifications in `tbprobe.c`,
+Vendored from https://github.com/jdart1/Fathom in the source tree. Since 6.5.0 it is
+linked only into the test-only `tb-oracle` tool, which checks zigqueen's own Syzygy
+prober against it; the engine binaries contain no Fathom code. Three local modifications in `tbprobe.c`,
 each marked `/* zigqueen: ... */`: a table file that cannot be mapped into memory is
 treated as a probe miss instead of terminating the engine; an allocation failure
 disables tablebase probing instead of exiting; and the file-mapping helper no longer
@@ -268,9 +270,9 @@ Our alterations to these data (file selection, local re-encoding, position
 filter, holdout, quotas and score conversion) and the method to reproduce
 them are offered free of charge under ODbL-1.0 (individual contents: DBCL-1.0)
 at:
-https://github.com/stierms/zigqueen/blob/v6.4.0/docs/data-r2/README.md
+https://github.com/stierms/zigqueen/blob/v6.5.0/docs/data-r2/README.md
 Data sources, scope and model lineage:
-https://github.com/stierms/zigqueen/blob/v6.4.0/docs/NETWORK.md
+https://github.com/stierms/zigqueen/blob/v6.5.0/docs/NETWORK.md
 
 The source-only tools in that offer are GPL-3.0-or-later. Cargo fetches their
 dependencies under their own licenses: sfbinpack 0.6.2 (GPL-3.0,

@@ -24,11 +24,14 @@ pub fn run(out: *std.io.Writer, net_path: ?[]const u8, fen_file: []const u8) !vo
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
         const pos = fen.parse(line) catch continue;
+        // Skipped like a malformed row (Position.hasBackRankPawn).
+        if (pos.hasBackRankPawn()) continue;
         var acc: nnue.Accumulator = undefined;
         acc.refresh(net, &pos);
         // evaluate() dispatches to the threats refresh for ZQB5; for other nets it is
-        // refresh + evaluateAcc (identical to the local acc above). The CSV dump stays
-        // the HalfKA accumulator (threats share it but the dump is debug-only).
+        // refresh + evaluateAcc (identical to the local acc above). The CSV dump is
+        // the accumulator as maintained: HalfKA rows, plus the threat rows that
+        // ZQB5 and ZQB9/ZQBA nets add into the same halves (debug-only).
         const eval = nnue.evaluate(net, &pos, 100);
         try out.print("{d};", .{eval});
         for (acc.white[0..h], 0..) |v, i| {

@@ -22,7 +22,7 @@
 //! i.e. ~31% of TB-won endings were labelled DRAW, poisoning ~7% of corpus
 //! positions through the result channel. So: `runThreaded` REFUSES to start
 //! without `--syzygy`, verifies the path really holds a complete 3-4-5 set
-//! (145 .rtbw + 145 .rtbz) and that Fathom actually loaded it (largest >= 5),
+//! (145 .rtbw + 145 .rtbz) and that the prober actually loaded it (largest >= 5),
 //! and logs the tablebase state in the startup banner of every run. The only
 //! escape is the explicit `--allow-no-syzygy`, which prints a loud warning
 //! banner and exists for deliberate experiments only.
@@ -137,8 +137,8 @@ pub const TbState = struct {
 
 const TbFileCounts = struct { rtbw: usize = 0, rtbz: usize = 0 };
 
-/// Fathom accepts several directories in one path string, ':'-separated on
-/// POSIX and ';'-separated on Windows (deps/fathom/tbprobe.c SEP_CHAR). The
+/// SyzygyPath accepts several directories in one string, ':'-separated on
+/// POSIX and ';'-separated on Windows (src/tb/registry.zig path_separator). The
 /// gate must count over the same split, or a legitimate multi-directory setup
 /// would fail the file-count check.
 const TB_PATH_SEP: u8 = if (builtin.os.tag == .windows) ';' else ':';
@@ -177,7 +177,7 @@ fn countTbFiles(path: []const u8) !TbFileCounts {
 ///   SyzygyFlagConflict    — both flags passed (the intent is ambiguous)
 ///   SyzygyPathUnreadable  — a listed directory cannot be opened
 ///   SyzygyTablesIncomplete— fewer than 145 .rtbw / 145 .rtbz across the path
-///   SyzygyInitFailed      — Fathom refused the path, or loaded < 5-man tables
+///   SyzygyInitFailed      — the prober refused the path, or loaded < 5-man tables
 pub fn initTablebases(progress: *std.Io.Writer, opts: TbOptions) !TbState {
     const path = opts.path orelse {
         if (!opts.allow_none) {
@@ -238,12 +238,12 @@ pub fn initTablebases(progress: *std.Io.Writer, opts: TbOptions) !TbState {
         const largest = syzygy.pieceLimit();
         syzygy.disable();
         try progress.print(
-            "datagen FATAL: Fathom could not load tablebases from '{s}' (largest = {d}, need >= 5).\n" ++
+            "datagen FATAL: could not load tablebases from '{s}' (largest = {d}, need >= 5).\n" ++
                 "  The files are present but unusable — check permissions and file integrity.\n",
             .{ path, largest },
         );
         try progress.flush();
-        std.debug.print("datagen FATAL: Fathom could not load tablebases from '{s}' (largest {d})\n", .{ path, largest });
+        std.debug.print("datagen FATAL: could not load tablebases from '{s}' (largest {d})\n", .{ path, largest });
         return error.SyzygyInitFailed;
     }
 
@@ -466,10 +466,9 @@ pub fn runThreaded(
     if (random_plies == 0 or random_plies > 100) return error.InvalidRandomPlies;
     if (hash_mb == 0 or hash_mb > 65_536) return error.InvalidHashSize;
 
-    // THE GATE — before any game is played, before the net is loaded. Fathom's
-    // globals are set up once here and shared by every worker (tbprobe.c guards
-    // its lazy table mapping with a mutex; TB_NO_THREADS is deliberately not
-    // defined in the build, see build.zig addFathom).
+    // THE GATE — before any game is played, before the net is loaded. One
+    // tablebase snapshot is loaded here and pinned by every worker's searches
+    // (src/search/syzygy.zig); probes take no lock.
     const tb = try initTablebases(progress, tb_options);
     defer if (tb.enabled) syzygy.disable();
 
@@ -999,7 +998,7 @@ test "tablebase score band is disjoint from the mate band" {
 }
 
 test "tablebase gate accepts a real table directory (opt-in via ZQ_TB_PATH)" {
-    const tb_path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return;
+    const tb_path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return error.SkipZigTest;
     defer std.testing.allocator.free(tb_path);
 
     var sink = std.Io.Writer.Allocating.init(std.testing.allocator);

@@ -19,7 +19,7 @@ const NOT_FILE_A: bitboard.Bitboard = ~FILE_A;
 const NOT_FILE_H: bitboard.Bitboard = ~FILE_H;
 
 pub inline fn knightAttacksDirect(sq: square.Square) bitboard.Bitboard {
-    return KNIGHT_ATTACKS[sq.index()];
+    return KNIGHT_ATTACKS[@intFromEnum(sq)];
 }
 
 pub fn knightAttacksFrom(sq: square.Square) bitboard.Bitboard {
@@ -27,7 +27,7 @@ pub fn knightAttacksFrom(sq: square.Square) bitboard.Bitboard {
 }
 
 pub inline fn kingAttacksDirect(sq: square.Square) bitboard.Bitboard {
-    return KING_ATTACKS[sq.index()];
+    return KING_ATTACKS[@intFromEnum(sq)];
 }
 
 pub fn kingAttacksFrom(sq: square.Square) bitboard.Bitboard {
@@ -36,8 +36,8 @@ pub fn kingAttacksFrom(sq: square.Square) bitboard.Bitboard {
 
 pub inline fn pawnAttacksFromDirect(color: types.Color, sq: square.Square) bitboard.Bitboard {
     return switch (color) {
-        .white => WHITE_PAWN_ATTACKS[sq.index()],
-        .black => BLACK_PAWN_ATTACKS[sq.index()],
+        .white => WHITE_PAWN_ATTACKS[@intFromEnum(sq)],
+        .black => BLACK_PAWN_ATTACKS[@intFromEnum(sq)],
     };
 }
 
@@ -87,19 +87,34 @@ pub fn attackedSquares(pos: *const position.Position, by: types.Color) bitboard.
     attacked |= pawnAttacksDirect(by, pos.pieceBitboard(by, .pawn));
 
     var knights = pos.pieceBitboard(by, .knight);
-    while (bitboard.popLsb(&knights)) |sq| attacked |= knightAttacksDirect(sq);
+    while (knights != 0) {
+        const sq = bitboard.popLsbUnchecked(&knights);
+        attacked |= knightAttacksDirect(sq);
+    }
 
     var bishops = pos.pieceBitboard(by, .bishop);
-    while (bitboard.popLsb(&bishops)) |sq| attacked |= bishopAttacksDirect(sq, occupied);
+    while (bishops != 0) {
+        const sq = bitboard.popLsbUnchecked(&bishops);
+        attacked |= bishopAttacksDirect(sq, occupied);
+    }
 
     var rooks = pos.pieceBitboard(by, .rook);
-    while (bitboard.popLsb(&rooks)) |sq| attacked |= rookAttacksDirect(sq, occupied);
+    while (rooks != 0) {
+        const sq = bitboard.popLsbUnchecked(&rooks);
+        attacked |= rookAttacksDirect(sq, occupied);
+    }
 
     var queens = pos.pieceBitboard(by, .queen);
-    while (bitboard.popLsb(&queens)) |sq| attacked |= queenAttacksDirect(sq, occupied);
+    while (queens != 0) {
+        const sq = bitboard.popLsbUnchecked(&queens);
+        attacked |= queenAttacksDirect(sq, occupied);
+    }
 
     var kings = pos.pieceBitboard(by, .king);
-    while (bitboard.popLsb(&kings)) |sq| attacked |= kingAttacksDirect(sq);
+    while (kings != 0) {
+        const sq = bitboard.popLsbUnchecked(&kings);
+        attacked |= kingAttacksDirect(sq);
+    }
 
     return attacked;
 }
@@ -115,7 +130,7 @@ pub inline fn isSquareAttackedByBitboards(
     queens: bitboard.Bitboard,
     king: bitboard.Bitboard,
 ) bool {
-    const target_index = target.index();
+    const target_index = @intFromEnum(target);
     const pawn_attackers = switch (by) {
         .white => BLACK_PAWN_ATTACKS[target_index],
         .black => WHITE_PAWN_ATTACKS[target_index],

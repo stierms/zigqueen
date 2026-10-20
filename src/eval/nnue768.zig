@@ -47,6 +47,12 @@
 const std = @import("std");
 const pair_permutation = @import("pair_permutation.zig");
 const builtin = @import("builtin");
+/// Windows x64: the hot NNUE kernels below use the SysV ABI, where xmm6-15 (and
+/// rsi/rdi) are caller-saved. Under the Win64 ABI every kernel call saved and
+/// restored ten xmm registers; with SysV the Win64 caller saves them once.
+/// Elsewhere this is the default convention (no codegen change).
+const kernel_sysv = builtin.os.tag == .windows and builtin.cpu.arch == .x86_64;
+const kernel_cc: std.builtin.CallingConvention = if (kernel_sysv) .{ .x86_64_sysv = .{} } else .auto;
 const position = @import("../core/position.zig");
 const bitboard = @import("../core/bitboard.zig");
 const types = @import("../core/types.zig");
@@ -59,6 +65,7 @@ const fullthreats_mod = @import("fullthreats.zig");
 const pawnpairs_mod = @import("pawnpairs.zig");
 const attacks = @import("../movegen/attacks.zig");
 const hugealloc = @import("../util/hugealloc.zig");
+const shared_blob_mod = @import("../util/shared_blob.zig");
 
 /// Allocate a 64-byte-aligned weight block, 2MB-huge-page backed when the OS
 /// grants it (multi-MB blocks like feature_weights/threat_w8 are random-access
@@ -212,12 +219,6 @@ pub const Net = struct {
     // then hold ONLY the HalfKA rows). Empty for ZQB5 (threat rows live in
     // feature_weights at [inputs + idx], i16). len != 0 selects the i8 kernels.
     threat_w8: []align(64) i8 = &.{}, // threat_inputs*hidden, row-major
-    // Bytes in front of every threat_w8 row (0, or THREAT_ROW_HEADER for ZQB8/9):
-    // row `feat` starts at feat*(hidden+header)+header. A ZQB8/9 header holds the
-    // row's PSQT weight (the same i32 as psqtw[king_buckets*INPUTS + feat]), so
-    // the incremental delta reads it from the line the row's data continues from
-    // instead of a separate random load into the 240 KB PSQT table.
-    threat_row_header: usize = 0,
     // ZQBA: pawn-pair rows (PP1), i8 like threat_w8, row-major [idx*hidden + h].
     // Their PSQT weights follow the threat block in psqtw
     // ([inputs + threat_inputs + idx]). pawn_inputs == 0: no pawn block.
@@ -239,11 +240,13 @@ pub const Net = struct {
     // (initL1Blocked): the VNNI build blocks l1_weights, the AVX2 build blocks
     // l1_byte_weights. Empty = the row-major kernels above serve every bucket.
     l1_blocked: []align(64) i8 = &.{},
-    // AVX2 fused activation+l1 (initL1Fused): a group8-blocked copy of the
-    // SERIALIZED (unpermuted) l1 weights with every lane group that fails the
-    // grouped-kernel bound zeroed, those groups' weights as exact i16 residual
-    // pairs (l1_res_w), and per bucket the residual groups' byte offsets
-    // (l1_residual). Empty = not built; the activation pass + finisher serve.
+    // AVX2 fused activation+l1 (initL1Fused): a row-blocked copy of the
+    // SERIALIZED (column-unpermuted) l1 weights, rows reordered per bucket so
+    // that the rows with a nonzero weight lead (l1_residual: rows, slot), with
+    // every lane group that fails the grouped-kernel bound zeroed, those groups'
+    // weights as exact i16 residual pairs (l1_res_w), and per bucket the residual
+    // groups' byte offsets (l1_residual). Empty = not built; the activation pass
+    // + finisher serve.
     l1_fused: []align(64) i8 = &.{},
     l1_res_w: []align(64) i16 = &.{},
     l1_residual: [MAX_BUCKETS]L1Residual = [_]L1Residual{.{}} ** MAX_BUCKETS,
@@ -266,6 +269,10 @@ pub const Net = struct {
     /// Frees MUST mirror the method; every Net constructor must set this
     /// (allocator.create applies no field defaults).
     weight_methods: WeightMethods = .{},
+    /// Set by net_share.share once every slice above points into a
+    /// cross-process read-only blob; `destroy` then releases the blob
+    /// instead of freeing the slices. Null = private weights.
+    shared_blob: ?*shared_blob_mod.Blob = null,
 
     pub const WeightMethods = struct {
         feature_weights: hugealloc.Method = .heap,
@@ -276,8 +283,22 @@ pub const Net = struct {
         l2_weights_t: hugealloc.Method = .heap,
     };
 
-    /// Free the weight slices and the net itself (allocated by loadFromBytes).
+    /// Free the weights (or release the shared blob) and the net itself
+    /// (allocated by loadFromBytes).
     pub fn destroy(self: *Net, allocator: std.mem.Allocator) void {
+        if (self.shared_blob) |blob| {
+            shared_blob_mod.release(blob);
+            allocator.destroy(blob);
+        } else {
+            self.freeWeightSlices(allocator);
+        }
+        allocator.destroy(self);
+    }
+
+    /// Free the privately allocated weight slices (not the Net). Used by
+    /// `destroy` and by net_share.share after the blob replaced them.
+    pub fn freeWeightSlices(self: *Net, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.shared_blob == null);
         freeWeights(i16, allocator, self.feature_weights, self.weight_methods.feature_weights);
         allocator.free(self.feature_bias);
         freeWeights(i16, allocator, self.output_weights, self.weight_methods.output_weights);
@@ -301,7 +322,6 @@ pub const Net = struct {
         allocator.free(self.l1_blocked);
         allocator.free(self.l1_fused);
         allocator.free(self.l1_res_w);
-        allocator.destroy(self);
     }
 
     /// Output bucket index from total piece count, matching bullet's
@@ -447,11 +467,30 @@ const L1_RES_MAX: usize = 16;
 /// One bucket's residual groups for the AVX2 fused l1: `ok` = the bucket's fused
 /// copy is valid (at most L1_RES_MAX residual groups); `off[k]` = the byte offsets
 /// in the l1 input of residual group k's two column pairs (low chunk, high chunk).
+/// The bucket's fused copy (and its residual pairs) holds the l1 rows in a
+/// load-time order with every row that has a nonzero weight first: `rows` (4, 8,
+/// 12 or 16) = the leading rows the fused kernels multiply (every later row is
+/// all zero, so its dot is exactly 0), and `slot[j]` = the position of l1 row j
+/// in that order (identity when rows == 16).
 pub const L1Residual = struct {
     ok: bool = false,
     count: u8 = 0,
+    rows: u8 = HOT_L2,
+    slot: [HOT_L2]i32 = identitySlots(),
     off: [L1_RES_MAX][2]u16 = undefined,
 };
+
+fn identitySlots() [HOT_L2]i32 {
+    var a: [HOT_L2]i32 = undefined;
+    for (&a, 0..) |*v, j| v.* = @intCast(j);
+    return a;
+}
+
+/// The fused row count for a bucket with `live` rows that have a nonzero weight:
+/// the smallest kernel shape (4, 8, 12 or 16 rows) covering them.
+fn fusedRowCount(live: usize) u8 {
+    return if (live <= 4) 4 else if (live <= 8) 8 else if (live <= 12) 12 else HOT_L2;
+}
 
 /// AVX2 fused activation + l1 (l1FusedAvx2): x86-64-v3 LLVM builds without
 /// VNNI, the HOT_L2 x HOT_L3 shape, hidden % 128 == 0.
@@ -483,11 +522,37 @@ fn initL1Fused(net: *Net, allocator: std.mem.Allocator) void {
         return;
     };
     @memset(res, 0);
-    @memcpy(flat, net.l1_weights);
+    @memset(copy, 0);
     var any = false;
     for (0..net.buckets) |bucket| {
         const w = flat[bucket * stride ..][0..stride];
+        const src = net.l1_weights[bucket * stride ..][0..stride];
         var info: L1Residual = .{};
+        // Row order of the fused copy: rows with a nonzero weight first, then the
+        // all-zero rows (each part in ascending row order). With at most 12 such
+        // rows the kernels skip the trailing all-zero rows (rows < 16).
+        var order: [HOT_L2]usize = undefined;
+        var live: usize = 0;
+        for (0..HOT_L2) |r| {
+            if (std.mem.allEqual(i8, src[r * h ..][0..h], 0)) continue;
+            order[live] = r;
+            live += 1;
+        }
+        info.rows = fusedRowCount(live);
+        if (info.rows == HOT_L2) {
+            for (&order, 0..) |*o, r| o.* = r;
+        } else {
+            var n = live;
+            for (0..HOT_L2) |r| {
+                if (!std.mem.allEqual(i8, src[r * h ..][0..h], 0)) continue;
+                order[n] = r;
+                n += 1;
+            }
+        }
+        for (order, 0..) |r, slot| {
+            @memcpy(w[slot * h ..][0..h], src[r * h ..][0..h]);
+            info.slot[r] = @intCast(slot);
+        }
         var ok = true;
         for (0..h / 64) |blk| {
             for (0..16) |lane| {
@@ -529,6 +594,19 @@ fn initL1Fused(net: *Net, allocator: std.mem.Allocator) void {
         info.ok = ok;
         net.l1_residual[bucket] = info;
         any = any or ok;
+        // The kernels' row groups: rows 0-3 (rows == 4) or 0-7, then 8-11
+        // (rows == 12) or 8-15 (rows == 16); later rows stay zero and unread.
+        const dst = copy[bucket * stride ..][0..stride];
+        const first: usize = if (info.rows == 4) 4 else 8;
+        switch (first) {
+            inline 4, 8 => |g| blockL1Weights(g, dst[0 .. g * h], w[0 .. g * h], g, h),
+            else => unreachable,
+        }
+        switch (info.rows - first) {
+            0 => {},
+            inline 4, 8 => |g| blockL1Weights(g, dst[8 * h ..][0 .. g * h], w[8 * h ..][0 .. g * h], g, h),
+            else => unreachable,
+        }
     }
     if (!any) {
         allocator.free(copy);
@@ -537,7 +615,6 @@ fn initL1Fused(net: *Net, allocator: std.mem.Allocator) void {
         net.l1_avxvnni = false;
         return;
     }
-    blockL1Weights(8, copy, flat, net.buckets * HOT_L2, h);
     net.l1_fused = copy;
     net.l1_res_w = res;
     net.l1_avxvnni = cpuHasAvxVnni();
@@ -627,7 +704,9 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
     // on incremental update.
     if ((is_v5 or is_v6 or is_v7 or is_v8) and (threat_inputs != MAX_THREAT_INPUTS or mirror_u != 1)) return error.UnsupportedShape;
     // ZQB9: the threat block is the FROZEN 60,144-feature full space — nothing else loads.
-    if (is_v9 and threat_inputs != MAX_FULL_THREAT_INPUTS) return error.UnsupportedShape;
+    // Mirrored only, like ZQB5-8 and ZQBA: the full-threat frame is always the king-file
+    // mirror, and no recipe writes an unmirrored ZQB9 (audit B, E-ZQB9-MIRROR).
+    if (is_v9 and (threat_inputs != MAX_FULL_THREAT_INPUTS or mirror_u != 1)) return error.UnsupportedShape;
     // ZQBA: only the frozen PP1 block (1,488 rows, layout 2) loads, and its frame
     // is the king-file mirror, so the net must be mirrored.
     const pawn_inputs: usize = if (is_va) readU32(bytes, &idx) else 0;
@@ -688,7 +767,6 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
     net.psqtb = &.{};
     net.psqt_buckets = 1;
     net.threat_w8 = &.{};
-    net.threat_row_header = 0; // `create` applies no field defaults; ZQB8/9 set it below
     net.pawn_inputs = pawn_inputs;
     net.pawn_w8 = &.{};
     net.l1_weights = &.{};
@@ -699,6 +777,7 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
     net.l3_weights = &.{};
     net.l3_bias = &.{};
     net.weight_methods = .{};
+    net.shared_blob = null;
 
     const feat_rows = inputs + threat_inputs; // == inputs for non-threat nets (threat_inputs = 0)
     // v6+ keeps threat rows in the separate i8 block, so feature_weights holds HalfKA only.
@@ -776,13 +855,12 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
         errdefer allocator.free(net.l3_weights);
         net.l3_bias = try allocator.alloc(f32, buckets);
         errdefer allocator.free(net.l3_bias);
-        // Threat rows with a one-line header carrying the row's PSQT weight
-        // (filled once psqtw is read): see Net.threat_row_header. Only when the
-        // rows stay 64-byte aligned.
-        const row_header: usize = if (h % 64 == 0) THREAT_ROW_HEADER else 0;
-        net.threat_w8 = try allocWeights(i8, allocator, threat_inputs * (h + row_header), &net.weight_methods.threat_w8);
+        // Threat rows are plain hidden-byte rows; their PSQT weights stay in
+        // psqtw (a 240 KB table the emission walk prefetches from, see
+        // FullThreatState.RowSink.emit). A one-line header holding the weight in
+        // front of every row cost 1/17 of the threat-row lines read per node.
+        net.threat_w8 = try allocWeights(i8, allocator, threat_inputs * h, &net.weight_methods.threat_w8);
         errdefer freeWeights(i8, allocator, net.threat_w8, net.weight_methods.threat_w8);
-        net.threat_row_header = row_header;
         net.pawn_w8 = try allocWeights(i8, allocator, pawn_inputs * h, &net.weight_methods.pawn_w8);
         errdefer freeWeights(i8, allocator, net.pawn_w8, net.weight_methods.pawn_w8);
         const psqt_rows = feat_rows + pawn_inputs;
@@ -799,19 +877,8 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
         for (net.l2_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
         for (net.l3_weights) |*w| w.* = try readFiniteF32(bytes, &idx);
         for (net.l3_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (0..threat_inputs) |t| {
-            const row = net.threat_w8[t * (h + row_header) ..][0 .. h + row_header];
-            @memset(row[0..row_header], 0);
-            for (row[row_header..]) |*w| w.* = readI8(bytes, &idx);
-        }
+        for (net.threat_w8) |*w| w.* = readI8(bytes, &idx);
         for (net.psqtw[0..feat_rows]) |*w| w.* = try readPsqtQ20(bytes, &idx);
-        if (row_header != 0) {
-            const threat_base = feat_rows - threat_inputs;
-            for (0..threat_inputs) |t| {
-                const psqt_slot: *[4]u8 = @ptrCast(net.threat_w8[t * (h + row_header) ..][0..4]);
-                std.mem.writeInt(i32, psqt_slot, net.psqtw[threat_base + t], .little);
-            }
-        }
         for (net.psqtb) |*b| b.* = try readPsqtQ20(bytes, &idx);
         for (net.pawn_w8) |*w| w.* = readI8(bytes, &idx);
         for (net.psqtw[feat_rows..psqt_rows]) |*w| w.* = try readPsqtQ20(bytes, &idx);
@@ -1011,8 +1078,8 @@ pub const MAX_MOVE_CHANGES: usize = 4;
 /// element-width stores feeding element-width loads, which forward cleanly.
 inline fn gatherChangesInto(comptime mc: types.Color, mv: move_mod.Move, state: *const make_unmake.StateInfo, out: *[MAX_MOVE_CHANGES]Change) usize {
     const mpt = state.moved_piece.pieceType();
-    const from = mv.from.index();
-    const to = mv.to.index();
+    const from = @intFromEnum(mv.from);
+    const to = @intFromEnum(mv.to);
     var g = struct { changes: *[MAX_MOVE_CHANGES]Change, n: usize }{ .changes = out, .n = 0 };
     switch (mv.flag) {
         .quiet, .double_push => {
@@ -1029,7 +1096,7 @@ inline fn gatherChangesInto(comptime mc: types.Color, mv: move_mod.Move, state: 
         },
         .en_passant => {
             const cap = state.captured_piece;
-            const cap_sq = enPassantCapturedSquare(mc, mv.to).index();
+            const cap_sq = @intFromEnum(enPassantCapturedSquare(mc, mv.to));
             g.changes[0] = .{ .color = cap.color().?, .pt = cap.pieceType(), .sq = cap_sq, .add = false };
             g.changes[1] = .{ .color = mc, .pt = mpt, .sq = from, .add = false };
             g.changes[2] = .{ .color = mc, .pt = mpt, .sq = to, .add = true };
@@ -1079,9 +1146,9 @@ pub inline fn decodeMoveChanges(mv: move_mod.Move, state: *const make_unmake.Sta
         const captured = state.captured_piece;
         const is_capture: usize = @intFromBool(flag == @intFromEnum(move_mod.MoveFlag.capture));
         // Written for every flag; a quiet move overwrites it with the next entry.
-        out[0] = .{ .color = @enumFromInt(@intFromBool(@intFromEnum(captured) >= 6)), .pt = captured.pieceType(), .sq = mv.to.index(), .add = false };
-        out[is_capture] = .{ .color = mc, .pt = mpt, .sq = mv.from.index(), .add = false };
-        out[is_capture + 1] = .{ .color = mc, .pt = mpt, .sq = mv.to.index(), .add = true };
+        out[0] = .{ .color = @enumFromInt(@intFromBool(@intFromEnum(captured) >= 6)), .pt = captured.pieceType(), .sq = @intFromEnum(mv.to), .add = false };
+        out[is_capture] = .{ .color = mc, .pt = mpt, .sq = @intFromEnum(mv.from), .add = false };
+        out[is_capture + 1] = .{ .color = mc, .pt = mpt, .sq = @intFromEnum(mv.to), .add = true };
         return 2 + is_capture;
     }
     return switch (state.moved_piece.color().?) {
@@ -1257,6 +1324,9 @@ const FinnyEntry = struct {
     // a full 32-piece scan of random psqtw lookups — even though the diff loop
     // right above already knew exactly which pieces changed.
     psqt_h: [MAX_BUCKETS]i64 = [_]i64{0} ** MAX_BUCKETS,
+    // Full-threat nets (finnySync): the snapshot as a mailbox, so the diff is
+    // one 64-byte compare and one loop over the changed squares.
+    mail: [64]piece.Piece = [_]piece.Piece{.none} ** 64,
     valid: bool = false,
 };
 
@@ -1300,18 +1370,11 @@ pub const Accumulator = struct {
     // via the move change-list so eval needn't iterate the pieces.
     psqt_hw: [MAX_BUCKETS]i64 = [_]i64{0} ** MAX_BUCKETS,
     psqt_hb: [MAX_BUCKETS]i64 = [_]i64{0} ** MAX_BUCKETS,
-    // ZQB9 full threats (docs/V6_INCREMENTAL_DESIGN.md): SEPARATE per-colour threat
-    // accumulator halves — Σ threat rows over the active full-threat features, NO
-    // bias, HalfKA rows never mixed in (white/black stay HalfKA-only for ZQB9).
-    // Kept apart from white/black because the full-threat state does not depend on
-    // king BUCKETS at all: bucket-only king crossings rebuild the HalfKA half via
-    // finny while these halves ride along untouched; only the horizontal mirror
-    // flip forces a threat rebuild (via FullThreatState's 2-slot flip cache).
-    // Eval sums HalfKA half + threat half lane-wise (evaluateFull9Incremental).
-    // The matching per-colour threat-PSQT scalars reuse psqt_tw/psqt_tb above.
-    // Unused (undefined) for every other net format.
-    ftw: [MAX_HIDDEN]i16 align(64) = undefined,
-    ftb: [MAX_HIDDEN]i16 align(64) = undefined,
+    // ZQB9 full threats (docs/V6_INCREMENTAL_DESIGN.md): white/black hold the
+    // COMBINED half — HalfKA rows + bias + the active full-threat (and ZQBA
+    // pawn-pair) rows — so a move reads and writes one half per perspective
+    // (FullThreatState.advanceMove) and eval reads it directly. The per-colour
+    // threat-PSQT scalars are psqt_tw/psqt_tb above.
 
     /// King bucket + mirror flip for `persp`, keyed on that side's king square in
     /// the perspective's OWN frame (own king at the bottom): white as-is, black
@@ -1333,7 +1396,7 @@ pub const Accumulator = struct {
     }
 
     fn perspCtx(net: *const Net, comptime persp: types.Color, pos: *const position.Position) PerspCtx {
-        return kingCtx(net, persp, pos.kingSquare(persp).?.index());
+        return kingCtx(net, persp, @intFromEnum(pos.kingSquare(persp).?));
     }
 
     /// Add/remove ONE piece's feature row for a SINGLE perspective, applying that
@@ -1436,10 +1499,11 @@ pub const Accumulator = struct {
         for (0..h) |i| acc[i] = net.feature_bias[i];
         const ctx = perspCtx(net, persp, pos);
         var occ = pos.occupancy();
-        while (bitboard.popLsb(&occ)) |sq| {
+        while (occ != 0) {
+            const sq = bitboard.popLsbUnchecked(&occ);
             const p = pos.pieceAt(sq);
             const color = p.color() orelse continue;
-            self.editP(net, persp, ctx, color, p.pieceType(), sq.index(), true);
+            self.editP(net, persp, ctx, color, p.pieceType(), @intFromEnum(sq), true);
         }
     }
 
@@ -1475,16 +1539,18 @@ pub const Accumulator = struct {
                 const cur = pos.pieceBitboard(c, pt);
                 const old = entry.bbs[@intFromEnum(c)][ptn];
                 var removed = old & ~cur;
-                while (bitboard.popLsb(&removed)) |sq| {
-                    pending.pushSub(&entry.acc, h, featureRow(net, persp, ctx, c, pt, sq.index()));
+                while (removed != 0) {
+                    const sq = bitboard.popLsbUnchecked(&removed);
+                    pending.pushSub(&entry.acc, h, featureRow(net, persp, ctx, c, pt, @intFromEnum(sq)));
                     // Only threats nets (ZQB5+) carry a PSQT head at all — older
                     // formats have an EMPTY psqtw, so the lookup must not run.
-                    if (net.threats) addPsqtVecRaw(&entry.psqt_h, net, halfkaIndex(persp, ctx, c, pt, sq.index()), false);
+                    if (net.threats) addPsqtVecRaw(&entry.psqt_h, net, halfkaIndex(persp, ctx, c, pt, @intFromEnum(sq)), false);
                 }
                 var added = cur & ~old;
-                while (bitboard.popLsb(&added)) |sq| {
-                    pending.pushAdd(&entry.acc, h, featureRow(net, persp, ctx, c, pt, sq.index()));
-                    if (net.threats) addPsqtVecRaw(&entry.psqt_h, net, halfkaIndex(persp, ctx, c, pt, sq.index()), true);
+                while (added != 0) {
+                    const sq = bitboard.popLsbUnchecked(&added);
+                    pending.pushAdd(&entry.acc, h, featureRow(net, persp, ctx, c, pt, @intFromEnum(sq)));
+                    if (net.threats) addPsqtVecRaw(&entry.psqt_h, net, halfkaIndex(persp, ctx, c, pt, @intFromEnum(sq)), true);
                 }
                 entry.bbs[@intFromEnum(c)][ptn] = cur;
             }
@@ -1493,9 +1559,9 @@ pub const Accumulator = struct {
         // (the caller enumerates into self.tw/tb before finnyRefresh) — same idea as the
         // piece diff above. Runs BEFORE the pending piece rows flush; both are commuting
         // adds into entry.acc, so the reordering vs the old edit-then-delta sequence is
-        // value-identical. ZQB9 full-threat nets skip this: their threat rows live in the
-        // SEPARATE ftw/ftb halves (untouched by king-bucket crossings), the finny entry
-        // stays HalfKA-only, and FinnyEntry.tbits (lean-sized) is never consulted.
+        // value-identical. ZQB9 full-threat nets never come here: their accumulator is
+        // maintained by FullThreatState.advanceMove, their finny entries stay HalfKA-only
+        // (finnySync), and FinnyEntry.tbits (lean-sized) is never consulted.
         if (net.threats and !net.full_threats) {
             const cur_bits = if (persp == .white) &self.tw else &self.tb;
             if (net.threat_w8.len != 0)
@@ -1521,27 +1587,24 @@ pub const Accumulator = struct {
         }
     }
 
-    /// ZQB9: full recompute of the SEPARATE threat halves (ftw/ftb) + both PSQT
-    /// scalar families from the board. The HalfKA halves (white/black) must
-    /// already be refreshed (refreshPersp) and contain NO threat rows.
+    /// ZQB9: add the full-threat rows into the HalfKA-refreshed halves
+    /// (white/black, refreshPersp) — the combined halves — and recompute both
+    /// PSQT scalar families from the board.
     fn refreshFullThreats(self: *Accumulator, net: *const Net, pos: *const position.Position) void {
-        const h = net.hidden;
         var wbits: fullthreats_mod.PerspBits = undefined;
         var bbits: fullthreats_mod.PerspBits = undefined;
         fullthreats_mod.enumerateColors(pos, &wbits, &bbits);
-        @memset(self.ftw[0..h], 0);
-        @memset(self.ftb[0..h], 0);
         self.psqt_tw = [_]i64{0} ** MAX_BUCKETS;
         self.psqt_tb = [_]i64{0} ** MAX_BUCKETS;
-        addThreatBitsetRows(i8, &self.ftw, net, &wbits, &self.psqt_tw);
-        addThreatBitsetRows(i8, &self.ftb, net, &bbits, &self.psqt_tb);
-        // ZQBA: pawn-pair rows depend on the flip only, like threat rows, so they
-        // live in the same flip-only halves (and PSQT scalars).
+        addThreatBitsetRows(i8, &self.white, net, &wbits, &self.psqt_tw);
+        addThreatBitsetRows(i8, &self.black, net, &bbits, &self.psqt_tb);
+        // ZQBA: pawn-pair rows join the same combined halves (and the threat
+        // PSQT scalars).
         if (net.pawn_inputs != 0) {
             const sets = pawnpairs_mod.pawnSets(pos);
             const flips = fullthreats_mod.kingFlips(pos);
-            addPawnPairRows(.white, &self.ftw, net, sets, flips.w, &self.psqt_tw);
-            addPawnPairRows(.black, &self.ftb, net, sets, flips.b, &self.psqt_tb);
+            addPawnPairRows(.white, &self.white, net, sets, flips.w, &self.psqt_tw);
+            addPawnPairRows(.black, &self.black, net, sets, flips.b, &self.psqt_tb);
         }
         sumHalfkaPsqt(net, .white, pos, &self.psqt_hw);
         sumHalfkaPsqt(net, .black, pos, &self.psqt_hb);
@@ -1607,11 +1670,9 @@ pub const Accumulator = struct {
         copyHalf(&self.white, &parent.white, hidden);
         copyHalf(&self.black, &parent.black, hidden);
         if (net.full_threats) {
-            // ZQB9: the separate threat halves + all PSQT scalars carry over (a null
-            // move — the only copyFrom user — changes no pieces). The lean bitsets
-            // tw/tb are unmaintained for full-threat nets: nothing to copy.
-            copyHalf(&self.ftw, &parent.ftw, hidden);
-            copyHalf(&self.ftb, &parent.ftb, hidden);
+            // ZQB9: the combined halves (copied above) + all PSQT scalars carry
+            // over (a null move — the only copyFrom user — changes no pieces). The
+            // lean bitsets tw/tb are unmaintained for full-threat nets.
             self.psqt_tw = parent.psqt_tw;
             self.psqt_tb = parent.psqt_tb;
             self.psqt_hw = parent.psqt_hw;
@@ -1637,7 +1698,14 @@ pub const Accumulator = struct {
     /// `changes` is the move's already-decoded piece feature list (decodeMoveChanges):
     /// the materialization walk decodes it ONCE and hands the same buffer to this and
     /// to FullThreatState.advanceMove, which used to decode the identical list again.
-    pub fn applyMove(self: *Accumulator, parent: *const Accumulator, net: *const Net, mv: move_mod.Move, state: *const make_unmake.StateInfo, pos: *const position.Position, finny: *FinnyTable, changes: []const Change) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
+    pub inline fn applyMove(self: *Accumulator, parent: *const Accumulator, net: *const Net, mv: move_mod.Move, state: *const make_unmake.StateInfo, pos: *const position.Position, finny: *FinnyTable, changes: []const Change) void {
+        applyMoveImpl(self, parent, net, mv, state, pos, finny, changes.ptr, changes.len);
+    }
+
+    /// applyMove's body behind a kernel_cc entry (the slice as pointer + length,
+    /// so every parameter is a C-ABI type).
+    fn applyMoveImpl(self: *Accumulator, parent: *const Accumulator, net: *const Net, mv: move_mod.Move, state: *const make_unmake.StateInfo, pos: *const position.Position, finny: *FinnyTable, changes_ptr: [*]const Change, changes_len: usize) align(64) callconv(kernel_cc) void { // align(64): pins hot entry placement (layout stability, not call speed)
+        const changes = changes_ptr[0..changes_len];
         const wctx = perspCtx(net, .white, pos);
         const bctx = perspCtx(net, .black, pos);
         // The mover colour matters only for a king move (the mover-perspective
@@ -1674,7 +1742,7 @@ pub const Accumulator = struct {
     ) void {
         const mctx = if (mc == .white) wctx else bctx; // mover's POST-move ctx
         const mpt = state.moved_piece.pieceType();
-        const from = mv.from.index();
+        const from = @intFromEnum(mv.from);
         // A king move only needs a full mover-perspective refresh if it crosses a
         // bucket or mirror-half boundary; otherwise it is a cheap 2-edit like any
         // piece (bucket/flip unchanged -> the incremental edits reproduce the
@@ -1737,10 +1805,9 @@ pub const Accumulator = struct {
             self.applyPerspDual(net, wctx, bctx, parent, changes[0..n]);
         }
 
-        // ZQB5-8 LEAN threat delta (after HalfKA). ZQB9 full-threat nets skip all of
-        // this: their threat state lives in the SEPARATE ftw/ftb halves + the shared
-        // FullThreatState bitsets, maintained by the search backend's materialization
-        // walk (ensureMaterialized -> FullThreatState.advanceMove) — never here.
+        // ZQB5-8 LEAN threat delta (after HalfKA). ZQB9 full-threat nets never come
+        // here: the search backend's materialization walk maintains their combined
+        // halves with FullThreatState.advanceMove instead of applyMove.
         //  - mover perspective, if HalfKA was finny-REBUILT (threats lost): add the FULL threats;
         //  - otherwise (HalfKA was applyPersp'd, so parent threats are still present): apply only
         //    the parent->child bitset delta (add newly-set rows, sub newly-cleared rows).
@@ -1842,13 +1909,13 @@ fn enPassantCapturedSquare(side: types.Color, destination: square.Square) square
 fn castleRookSquares(side: types.Color, king_destination: square.Square) struct { from: u6, to: u6 } {
     return switch (side) {
         .white => switch (king_destination) {
-            .g1 => .{ .from = square.Square.h1.index(), .to = square.Square.f1.index() },
-            .c1 => .{ .from = square.Square.a1.index(), .to = square.Square.d1.index() },
+            .g1 => .{ .from = @intFromEnum(square.Square.h1), .to = @intFromEnum(square.Square.f1) },
+            .c1 => .{ .from = @intFromEnum(square.Square.a1), .to = @intFromEnum(square.Square.d1) },
             else => unreachable,
         },
         .black => switch (king_destination) {
-            .g8 => .{ .from = square.Square.h8.index(), .to = square.Square.f8.index() },
-            .c8 => .{ .from = square.Square.a8.index(), .to = square.Square.d8.index() },
+            .g8 => .{ .from = @intFromEnum(square.Square.h8), .to = @intFromEnum(square.Square.f8) },
+            .c8 => .{ .from = @intFromEnum(square.Square.a8), .to = @intFromEnum(square.Square.d8) },
             else => unreachable,
         },
     };
@@ -1988,10 +2055,11 @@ fn evaluateThreats(net: *const Net, pos: *const position.Position, scale_percent
         for (0..h) |i| a[i] = net.feature_bias[i];
         const ctx = Accumulator.perspCtx(net, persp, pos);
         var occ = pos.occupancy();
-        while (bitboard.popLsb(&occ)) |sq| {
+        while (occ != 0) {
+            const sq = bitboard.popLsbUnchecked(&occ);
             const p = pos.pieceAt(sq);
             const color = p.color() orelse continue;
-            const sidx = sq.index();
+            const sidx = @intFromEnum(sq);
             editAcc(a, net, persp, ctx, color, p.pieceType(), sidx, true);
             if (persp == stm) addPsqtVecRaw(&psqt_vec, net, halfkaIndex(persp, ctx, color, p.pieceType(), sidx), true);
         }
@@ -2053,10 +2121,11 @@ pub fn evaluateFull9WithPawnRows(net: *const Net, pos: *const position.Position,
         for (0..h) |i| a[i] = net.feature_bias[i];
         const ctx = Accumulator.perspCtx(net, persp, pos);
         var occ = pos.occupancy();
-        while (bitboard.popLsb(&occ)) |sq| {
+        while (occ != 0) {
+            const sq = bitboard.popLsbUnchecked(&occ);
             const p = pos.pieceAt(sq);
             const color = p.color() orelse continue;
-            const sidx = sq.index();
+            const sidx = @intFromEnum(sq);
             editAcc(a, net, persp, ctx, color, p.pieceType(), sidx, true);
             if (persp == stm) addPsqtVecRaw(&psqt_vec, net, halfkaIndex(persp, ctx, color, p.pieceType(), sidx), true);
         }
@@ -2076,8 +2145,8 @@ pub fn evaluateFull9WithPawnRows(net: *const Net, pos: *const position.Position,
     }
     // ZQBA: pawn-pair rows (both perspectives) + stm PSQT over the stm pairs.
     if (net.pawn_inputs != 0) {
-        addPawnRowList(&acc.white, net, wrows, if (stm == .white) &psqt_vec else null);
-        addPawnRowList(&acc.black, net, brows, if (stm == .black) &psqt_vec else null);
+        addPawnRowList(false, &acc.white, net, wrows, if (stm == .white) &psqt_vec else null);
+        addPawnRowList(false, &acc.black, net, brows, if (stm == .black) &psqt_vec else null);
     }
     const pc: usize = @popCount(pos.occupancy());
     const pbkt = if (net.psqt_buckets > 1) net.bucketIndex(pc) else 0;
@@ -2102,14 +2171,47 @@ inline fn pawnPsqtFeature(net: *const Net, idx: usize) usize {
 /// addThreatRows (a Debug overflow trap means the net is not i16-safe), and, if
 /// `psqt` is given, their PSQT weights. The refresh reference and the root
 /// refresh of the flip-only halves.
+/// Test support: the SPLIT accumulator layout the incremental path kept before
+/// the combined halves, built from scratch — per perspective a HalfKA half
+/// (bias + piece rows, the refresh's canonical adds) and a threat half (zero +
+/// full-threat rows + ZQBA pawn-pair rows). The combined half must equal
+/// hk[p] +% th[p] lane for lane (backend FuzzWalker checks it after random moves).
+pub fn splitReferenceHalves(net: *const Net, pos: *const position.Position, hk: *[2][MAX_HIDDEN]i16, th: *[2][MAX_HIDDEN]i16) void {
+    std.debug.assert(net.full_threats);
+    const h = net.hidden;
+    var wbits: fullthreats_mod.PerspBits = undefined;
+    var bbits: fullthreats_mod.PerspBits = undefined;
+    fullthreats_mod.enumerateColors(pos, &wbits, &bbits);
+    const sets = pawnpairs_mod.pawnSets(pos);
+    const flips = fullthreats_mod.kingFlips(pos);
+    inline for (.{ types.Color.white, types.Color.black }, 0..) |persp, pi| {
+        for (0..h) |i| hk[pi][i] = net.feature_bias[i];
+        const ctx = Accumulator.perspCtx(net, persp, pos);
+        var occ = pos.occupancy();
+        while (bitboard.popLsb(&occ)) |sq| {
+            const p = pos.pieceAt(sq);
+            const color = p.color() orelse continue;
+            editAcc(&hk[pi], net, persp, ctx, color, p.pieceType(), sq.index(), true);
+        }
+        @memset(th[pi][0..h], 0);
+        var unused: [MAX_BUCKETS]i64 = [_]i64{0} ** MAX_BUCKETS;
+        addThreatBitsetRows(i8, &th[pi], net, if (pi == 0) &wbits else &bbits, &unused);
+        if (net.pawn_inputs != 0) addPawnPairRows(persp, &th[pi], net, sets, if (pi == 0) flips.w else flips.b, null);
+    }
+}
+
+/// The incremental side's refresh (Accumulator.refresh): wrapping adds, like every
+/// other add into a ZQB9/ZQBA combined half.
 fn addPawnPairRows(comptime persp: types.Color, half: *[MAX_HIDDEN]i16, net: *const Net, sets: [2]u64, flip: u6, psqt: ?*[MAX_BUCKETS]i64) void {
     var list: [pawnpairs_mod.MAX_PAIRS]u16 = undefined;
     const n = pawnpairs_mod.enumerate(persp, sets[0], sets[1], flip, &list);
-    addPawnRowList(half, net, list[0..n], psqt);
+    addPawnRowList(true, half, net, list[0..n], psqt);
 }
 
 /// addPawnPairRows over an explicit row list (each index < pawn_inputs).
-fn addPawnRowList(half: *[MAX_HIDDEN]i16, net: *const Net, rows: []const u16, psqt: ?*[MAX_BUCKETS]i64) void {
+/// `wrap` = false is the canonical-order reference (evaluateFull9WithPawnRows):
+/// a Debug overflow trap there means the net is not i16-safe — see editAcc.
+fn addPawnRowList(comptime wrap: bool, half: *[MAX_HIDDEN]i16, net: *const Net, rows: []const u16, psqt: ?*[MAX_BUCKETS]i64) void {
     const h = net.hidden;
     for (rows) |p| {
         const row = pawnRow(net, p);
@@ -2117,10 +2219,12 @@ fn addPawnRowList(half: *[MAX_HIDDEN]i16, net: *const Net, rows: []const u16, ps
         while (i + VEC16 <= h) : (i += VEC16) {
             const wv: @Vector(VEC16, i16) = @as(@Vector(VEC16, i8), row[i..][0..VEC16].*);
             var av: @Vector(VEC16, i16) = half[i..][0..VEC16].*;
-            av = av + wv;
+            av = if (wrap) av +% wv else av + wv;
             half[i..][0..VEC16].* = av;
         }
-        while (i < h) : (i += 1) half[i] += @as(i16, row[i]);
+        while (i < h) : (i += 1) {
+            if (wrap) half[i] +%= @as(i16, row[i]) else half[i] += @as(i16, row[i]);
+        }
         if (psqt) |ps| addPsqtVecRaw(ps, net, pawnPsqtFeature(net, p), true);
     }
 }
@@ -2169,28 +2273,14 @@ inline fn addPsqtVecRaw(dst: *[MAX_BUCKETS]i64, net: *const Net, feat: usize, co
     dst.* = acc;
 }
 
-/// A threat feature's single-bucket PSQT weight (psqt_buckets == 1): from its
-/// row header when the net keeps one, else psqtw[base + feat]. Same value.
+/// A threat feature's single-bucket PSQT weight (psqt_buckets == 1).
 inline fn threatPsqtWeight(net: *const Net, base: usize, feat: usize) i64 {
     std.debug.assert(net.psqt_buckets == 1);
-    if (net.threat_row_header != 0) {
-        const w = threatRowPsqt(net, feat);
-        std.debug.assert(w == net.psqtw[base + feat]);
-        return w;
-    }
     return net.psqtw[base + feat];
 }
 
-/// A threat feature's PSQT weight into `dst`: from its row header when the net
-/// keeps one (always a single bucket there), else from psqtw. Same value.
+/// A threat feature's PSQT weight(s) into `dst`.
 inline fn addThreatPsqt(dst: *[MAX_BUCKETS]i64, net: *const Net, base: usize, feat: usize, comptime add: bool) void {
-    if (net.threat_row_header != 0) {
-        std.debug.assert(net.psqt_buckets == 1);
-        const w = threatRowPsqt(net, feat);
-        std.debug.assert(w == net.psqtw[base + feat]);
-        if (add) dst[0] += w else dst[0] -= w;
-        return;
-    }
     addPsqtVecRaw(dst, net, base + feat, add);
 }
 
@@ -2200,10 +2290,11 @@ fn sumHalfkaPsqt(net: *const Net, comptime persp: types.Color, pos: *const posit
     out.* = [_]i64{0} ** MAX_BUCKETS;
     const ctx = Accumulator.perspCtx(net, persp, pos);
     var occ = pos.occupancy();
-    while (bitboard.popLsb(&occ)) |sq| {
+    while (occ != 0) {
+        const sq = bitboard.popLsbUnchecked(&occ);
         const p = pos.pieceAt(sq);
         const color = p.color() orelse continue;
-        addPsqtVecRaw(out, net, halfkaIndex(persp, ctx, color, p.pieceType(), sq.index()), true);
+        addPsqtVecRaw(out, net, halfkaIndex(persp, ctx, color, p.pieceType(), @intFromEnum(sq)), true);
     }
 }
 
@@ -2214,21 +2305,10 @@ fn sumHalfkaPsqt(net: *const Net, comptime persp: types.Color, pos: *const posit
 /// (ZQB6 — half the row bytes, widened to i16 at apply). `feat` is the THREAT-relative
 /// index (leanIndex). The PSQT weight for it is `psqtw[king_buckets*INPUTS + feat]` —
 /// psqtw spans HalfKA+threat features in both formats.
-/// Header bytes per threat_w8 row in ZQB8/9 nets: one cache line, so every row's
-/// data stays 64-byte aligned (hidden is a multiple of 64 for these shapes).
-const THREAT_ROW_HEADER: usize = 64;
-
-/// The PSQT weight of threat feature `feat` kept in its row header
-/// (threat_row_header != 0, single PSQT bucket only).
-inline fn threatRowPsqt(net: *const Net, feat: usize) i64 {
-    const at: *const [4]u8 = @ptrCast(net.threat_w8[feat * (net.hidden + THREAT_ROW_HEADER) ..][0..4]);
-    return std.mem.readInt(i32, at, .little);
-}
-
 inline fn threatRowT(comptime T: type, net: *const Net, feat: usize) []const T {
     const h = net.hidden;
     return if (T == i8)
-        net.threat_w8[feat * (h + net.threat_row_header) + net.threat_row_header ..][0..h]
+        net.threat_w8[feat * h ..][0..h]
     else
         net.feature_weights[(net.king_buckets * INPUTS + feat) * h ..][0..h];
 }
@@ -2247,8 +2327,10 @@ fn PendingThreatRowsT(comptime T: type) type {
         // Keep only its address: push order and every indexed row value are
         // unchanged, so wrapping add/sub order and the resulting i16 lanes are
         // bit-identical while the hot logs use an 8-byte rather than 16-byte stride.
-        adds: [MAX][*]const T = undefined,
-        subs: [MAX][*]const T = undefined,
+        // One slot past MAX: finnySync appends branch-free (store, then a
+        // conditional count increment) and may store once past the last row.
+        adds: [MAX + 1][*]const T = undefined,
+        subs: [MAX + 1][*]const T = undefined,
         na: usize = 0,
         ns: usize = 0,
 
@@ -2304,7 +2386,7 @@ fn PendingThreatRowsT(comptime T: type) type {
         /// read the same values the copy would have staged and the add order is
         /// unchanged -> bit-exact. Unlike flush, no early return: with zero pending
         /// rows this must still perform the copy. Resets the pending counts.
-        fn flushInto(self: *Self, dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
+        fn flushInto(self: *Self, dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) align(64) callconv(kernel_cc) void { // align(64): pins hot entry placement (layout stability, not call speed)
             var i: usize = 0;
             // 8-wide chunk unroll: 8 accumulator vectors stay live across the row loop,
             // so each row iteration does 8 loads+adds per loop-overhead set (vs 1 in the
@@ -2312,17 +2394,22 @@ fn PendingThreatRowsT(comptime T: type) type {
             // loaded once per row per super-chunk. h=768 at VEC16=32 -> 3 super-chunks.
             const U = 8;
             while (i + U * VEC16 <= h) : (i += U * VEC16) {
+                // Tile-relative pointers: per-vector offsets as displacements.
+                const sp: [*]const i16 = src[i..].ptr;
+                const dp: [*]i16 = dst[i..].ptr;
                 var acc: [U]@Vector(VEC16, i16) = undefined;
-                inline for (0..U) |u| acc[u] = src[i + u * VEC16 ..][0..VEC16].*;
+                inline for (0..U) |u| acc[u] = sp[u * VEC16 ..][0..VEC16].*;
                 for (self.adds[0..self.na]) |row| {
                     if (T == i8) prefetchRowAhead(row, i);
-                    inline for (0..U) |u| acc[u] +%= widen(row[i + u * VEC16 ..][0..VEC16].*);
+                    const r = row + i;
+                    inline for (0..U) |u| acc[u] +%= widen(r[u * VEC16 ..][0..VEC16].*);
                 }
                 for (self.subs[0..self.ns]) |row| {
                     if (T == i8) prefetchRowAhead(row, i);
-                    inline for (0..U) |u| acc[u] -%= widen(row[i + u * VEC16 ..][0..VEC16].*);
+                    const r = row + i;
+                    inline for (0..U) |u| acc[u] -%= widen(r[u * VEC16 ..][0..VEC16].*);
                 }
-                inline for (0..U) |u| dst[i + u * VEC16 ..][0..VEC16].* = acc[u];
+                inline for (0..U) |u| dp[u * VEC16 ..][0..VEC16].* = acc[u];
             }
             while (i + VEC16 <= h) : (i += VEC16) {
                 var av: @Vector(VEC16, i16) = src[i..][0..VEC16].*;
@@ -2345,10 +2432,19 @@ fn PendingThreatRowsT(comptime T: type) type {
         /// `dst` (the child) until the first flush. The overflow flush is COLD (>MAX
         /// pending one direction mid-delta; never observed — mean churn ~14): it
         /// materializes dst = src + pending early and redirects src to dst, after
-        /// which further flushes are dst-in-place exactly like flush.
+        /// which further flushes are dst-in-place exactly like flush. On Windows the
+        /// cold flush goes through a default-convention trampoline: the Win64
+        /// functions that inline the push helpers (emitMoveDelta) would otherwise
+        /// save xmm6-15 on every call for this rare kernel_cc call.
+        const overflow_flush = if (kernel_sysv) flushIntoCold else flushInto;
+        fn flushIntoCold(self: *Self, dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) void {
+            @branchHint(.cold);
+            self.flushInto(dst, src, h);
+        }
+
         inline fn pushAddFrom(self: *Self, dst: *[MAX_HIDDEN]i16, src: **const [MAX_HIDDEN]i16, h: usize, row: []const T) void {
             if (self.na == MAX) {
-                @call(.never_inline, flushInto, .{ self, dst, src.*, h });
+                @call(.never_inline, overflow_flush, .{ self, dst, src.*, h });
                 src.* = dst;
             }
             self.adds[self.na] = row.ptr;
@@ -2357,7 +2453,7 @@ fn PendingThreatRowsT(comptime T: type) type {
 
         inline fn pushSubFrom(self: *Self, dst: *[MAX_HIDDEN]i16, src: **const [MAX_HIDDEN]i16, h: usize, row: []const T) void {
             if (self.ns == MAX) {
-                @call(.never_inline, flushInto, .{ self, dst, src.*, h });
+                @call(.never_inline, overflow_flush, .{ self, dst, src.*, h });
                 src.* = dst;
             }
             self.subs[self.ns] = row.ptr;
@@ -2371,7 +2467,7 @@ fn PendingThreatRowsT(comptime T: type) type {
         /// replacing flush-then-copyHalf's extra full read+write of the half.
         /// Same adds, dst_b = a copy of the final dst_a values -> bit-exact.
         /// No early return (the copy must always run). Resets pending counts.
-        fn flushIntoDual(self: *Self, dst_a: *[MAX_HIDDEN]i16, dst_b: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) void {
+        fn flushIntoDual(self: *Self, dst_a: *[MAX_HIDDEN]i16, dst_b: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize) callconv(kernel_cc) void {
             var i: usize = 0;
             const U = 8;
             while (i + U * VEC16 <= h) : (i += U * VEC16) {
@@ -2404,6 +2500,238 @@ fn PendingThreatRowsT(comptime T: type) type {
             self.ns = 0;
         }
     };
+}
+
+/// ZQB9/ZQBA combined accumulator (one half per perspective holds HalfKA + threat
+/// + pawn-pair rows): `dst = src + Σ hadd[0..na] - Σ hsub[0..ns] + pend's i8 rows`
+/// in ONE pass (read src, add every row, write dst once) — the move's HalfKA rows
+/// (i16, comptime counts) and its threat/pawn-pair rows (i8, widened per chunk),
+/// where separate HalfKA and threat halves each took their own read+write pass.
+/// dst may alias src. Wrapping ops and an i16-safe final value: bit-exact with any
+/// order of the same adds. Resets pend's counts.
+fn CombinedFlush(comptime na: usize, comptime ns: usize) type {
+    return struct {
+        fn run(pend: *PendingThreatRowsT(i8), dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize, hadd: *const [2][*]const i16, hsub: *const [2][*]const i16) callconv(kernel_cc) void {
+            const P = PendingThreatRowsT(i8);
+            const U = 8;
+            var i: usize = 0;
+            while (i + U * VEC16 <= h) : (i += U * VEC16) {
+                // Tile-relative pointers: the per-vector offsets become address
+                // displacements instead of one index register per vector,
+                // recomputed every tile.
+                const sp: [*]const i16 = src[i..].ptr;
+                const dp: [*]i16 = dst[i..].ptr;
+                var acc: [U]@Vector(VEC16, i16) = undefined;
+                inline for (0..U) |u| acc[u] = sp[u * VEC16 ..][0..VEC16].*;
+                inline for (0..na) |k| {
+                    const r = hadd[k] + i;
+                    inline for (0..U) |u| acc[u] +%= @as(@Vector(VEC16, i16), r[u * VEC16 ..][0..VEC16].*);
+                }
+                inline for (0..ns) |k| {
+                    const r = hsub[k] + i;
+                    inline for (0..U) |u| acc[u] -%= @as(@Vector(VEC16, i16), r[u * VEC16 ..][0..VEC16].*);
+                }
+                for (pend.adds[0..pend.na]) |row| {
+                    P.prefetchRowAhead(row, i);
+                    const r = row + i;
+                    inline for (0..U) |u| acc[u] +%= P.widen(r[u * VEC16 ..][0..VEC16].*);
+                }
+                for (pend.subs[0..pend.ns]) |row| {
+                    P.prefetchRowAhead(row, i);
+                    const r = row + i;
+                    inline for (0..U) |u| acc[u] -%= P.widen(r[u * VEC16 ..][0..VEC16].*);
+                }
+                inline for (0..U) |u| dp[u * VEC16 ..][0..VEC16].* = acc[u];
+            }
+            while (i + VEC16 <= h) : (i += VEC16) {
+                var av: @Vector(VEC16, i16) = src[i..][0..VEC16].*;
+                inline for (0..na) |k| av +%= @as(@Vector(VEC16, i16), hadd[k][i..][0..VEC16].*);
+                inline for (0..ns) |k| av -%= @as(@Vector(VEC16, i16), hsub[k][i..][0..VEC16].*);
+                for (pend.adds[0..pend.na]) |row| av +%= P.widen(row[i..][0..VEC16].*);
+                for (pend.subs[0..pend.ns]) |row| av -%= P.widen(row[i..][0..VEC16].*);
+                dst[i..][0..VEC16].* = av;
+            }
+            while (i < h) : (i += 1) {
+                var v = src[i];
+                inline for (0..na) |k| v +%= hadd[k][i];
+                inline for (0..ns) |k| v -%= hsub[k][i];
+                for (pend.adds[0..pend.na]) |row| v +%= @as(i16, row[i]);
+                for (pend.subs[0..pend.ns]) |row| v -%= @as(i16, row[i]);
+                dst[i] = v;
+            }
+            pend.na = 0;
+            pend.ns = 0;
+        }
+    };
+}
+
+/// The king-bucket-crossing twin of CombinedFlush for the mover perspective
+/// (threat mirror unchanged): `fa`/`fb` are the finny entries of the OLD and NEW
+/// bucket, brought to the parent's and the child's pieces by their pending rows
+/// `qa`/`qb` (stored back, as finnyRefresh does), and
+///   dst = src - fa' + fb' + pend's i8 rows.
+/// src = HalfKA(old bucket, parent pieces) + the parent's threat part (mod 2^16)
+/// and fa' is exactly that HalfKA term, so dst = the new bucket's HalfKA half +
+/// the child's threat part: wrapping ops, i16-safe final value -> bit-exact.
+/// dst may alias src. Resets all three pending counts.
+fn crossFlush(pend: *PendingThreatRowsT(i8), dst: *[MAX_HIDDEN]i16, src: *const [MAX_HIDDEN]i16, h: usize, fa: *[MAX_HIDDEN]i16, qa: *PendingThreatRowsT(i16), fb: *[MAX_HIDDEN]i16, qb: *PendingThreatRowsT(i16)) callconv(kernel_cc) void {
+    const P = PendingThreatRowsT(i8);
+    const V = @Vector(VEC16, i16);
+    const U = 8;
+    var i: usize = 0;
+    // Tiles of UF vectors: the finny rows are memory-operand adds (no temporary
+    // register), so their phases run 16 live vectors and half as many row-loop
+    // instances (each a data-dependent exit) as 8-vector tiles; the child's
+    // sub-tiles of 8 then take the i8 rows, which need a widening temporary.
+    inline for (.{ 2 * U, U }) |UF| {
+        while (i + UF * VEC16 <= h) : (i += UF * VEC16) {
+            // Each finny entry's tile in its own row-blocked phase, then the
+            // child re-reads both from L1.
+            inline for (.{ .{ fa, qa }, .{ fb, qb } }) |fq| {
+                // Tile-relative pointers: the per-vector offsets become address
+                // displacements (no index register per vector).
+                const e: [*]i16 = fq[0][i..].ptr;
+                var t: [UF]V = undefined;
+                inline for (0..UF) |u| t[u] = e[u * VEC16 ..][0..VEC16].*;
+                for (fq[1].adds[0..fq[1].na]) |row| {
+                    const r = row + i;
+                    inline for (0..UF) |u| t[u] +%= @as(V, r[u * VEC16 ..][0..VEC16].*);
+                }
+                for (fq[1].subs[0..fq[1].ns]) |row| {
+                    const r = row + i;
+                    inline for (0..UF) |u| t[u] -%= @as(V, r[u * VEC16 ..][0..VEC16].*);
+                }
+                inline for (0..UF) |u| e[u * VEC16 ..][0..VEC16].* = t[u];
+            }
+            inline for (0..UF / U) |sub| {
+                const j = i + sub * U * VEC16;
+                const sp: [*]const i16 = src[j..].ptr;
+                const ap: [*]const i16 = fa[j..].ptr;
+                const bp: [*]const i16 = fb[j..].ptr;
+                const dp: [*]i16 = dst[j..].ptr;
+                var acc: [U]V = undefined;
+                inline for (0..U) |u| {
+                    const o = u * VEC16;
+                    acc[u] = @as(V, sp[o..][0..VEC16].*) -% @as(V, ap[o..][0..VEC16].*) +% @as(V, bp[o..][0..VEC16].*);
+                }
+                for (pend.adds[0..pend.na]) |row| {
+                    P.prefetchRowAhead(row, j);
+                    const r = row + j;
+                    inline for (0..U) |u| acc[u] +%= P.widen(r[u * VEC16 ..][0..VEC16].*);
+                }
+                for (pend.subs[0..pend.ns]) |row| {
+                    P.prefetchRowAhead(row, j);
+                    const r = row + j;
+                    inline for (0..U) |u| acc[u] -%= P.widen(r[u * VEC16 ..][0..VEC16].*);
+                }
+                inline for (0..U) |u| dp[u * VEC16 ..][0..VEC16].* = acc[u];
+            }
+        }
+    }
+    while (i + VEC16 <= h) : (i += VEC16) {
+        var a: V = fa[i..][0..VEC16].*;
+        for (qa.adds[0..qa.na]) |row| a +%= @as(V, row[i..][0..VEC16].*);
+        for (qa.subs[0..qa.ns]) |row| a -%= @as(V, row[i..][0..VEC16].*);
+        fa[i..][0..VEC16].* = a;
+        var b: V = fb[i..][0..VEC16].*;
+        for (qb.adds[0..qb.na]) |row| b +%= @as(V, row[i..][0..VEC16].*);
+        for (qb.subs[0..qb.ns]) |row| b -%= @as(V, row[i..][0..VEC16].*);
+        fb[i..][0..VEC16].* = b;
+        var av: V = @as(V, src[i..][0..VEC16].*) -% a +% b;
+        for (pend.adds[0..pend.na]) |row| av +%= P.widen(row[i..][0..VEC16].*);
+        for (pend.subs[0..pend.ns]) |row| av -%= P.widen(row[i..][0..VEC16].*);
+        dst[i..][0..VEC16].* = av;
+    }
+    while (i < h) : (i += 1) {
+        var a = fa[i];
+        for (qa.adds[0..qa.na]) |row| a +%= row[i];
+        for (qa.subs[0..qa.ns]) |row| a -%= row[i];
+        fa[i] = a;
+        var b = fb[i];
+        for (qb.adds[0..qb.na]) |row| b +%= row[i];
+        for (qb.subs[0..qb.ns]) |row| b -%= row[i];
+        fb[i] = b;
+        var v = src[i] -% a +% b;
+        for (pend.adds[0..pend.na]) |row| v +%= @as(i16, row[i]);
+        for (pend.subs[0..pend.ns]) |row| v -%= @as(i16, row[i]);
+        dst[i] = v;
+    }
+    pend.na = 0;
+    pend.ns = 0;
+    qa.na = 0;
+    qa.ns = 0;
+    qb.na = 0;
+    qb.ns = 0;
+}
+
+/// Each piece code's HalfKA plane seen from `persp` (own pieces 0..5, the
+/// opponent's 6..11), so feature = INPUTS*bucket + 64*plane + oriented square.
+/// `.none` maps to plane 0: a valid row that finnySync counts zero times.
+fn halfkaPlanes(comptime persp: types.Color) [13]u8 {
+    var t: [13]u8 = undefined;
+    for (0..12) |p| t[p] = @intCast(if (persp == .white) p else (p + 6) % 12);
+    t[12] = 0;
+    return t;
+}
+
+/// dst += s * the PSQT weights of feature `feat`, s in {-1, 0, 1}: the
+/// branch-free twin of addPsqtVecRaw (the same i64 sums).
+inline fn addPsqtVecSigned(dst: *[MAX_BUCKETS]i64, net: *const Net, feat: usize, s: i64) void {
+    const pb = net.psqt_buckets;
+    if (pb == 1) {
+        dst[0] += s * @as(i64, net.psqtw[feat]);
+        return;
+    }
+    const wv: @Vector(MAX_BUCKETS, i32) = net.psqtw[feat * pb ..][0..MAX_BUCKETS].*;
+    const wide: @Vector(MAX_BUCKETS, i64) = wv;
+    dst.* = @as(@Vector(MAX_BUCKETS, i64), dst.*) + wide * @as(@Vector(MAX_BUCKETS, i64), @splat(s));
+}
+
+/// Bring the finny entry of (`persp`, `ctx`) to the position `mail` (a
+/// mailbox) WITHOUT applying the rows: the changed pieces' HalfKA rows are
+/// pushed into `pending` for the caller's fused pass (which stores the entry
+/// back), and the entry's HalfKA-PSQT sum and snapshot are updated here.
+/// The changed squares come from one 64-byte compare of the two mailboxes and
+/// one loop over them (an old piece there is a removal, a new one an add),
+/// appended branch-free: the same rows as diffing the twelve piece sets, in
+/// square order (wrapping i16 adds and i64 PSQT sums commute). Seeded with
+/// bias + empty board on first use; at most 32 adds and 32 subs, so the
+/// pending lists never overflow.
+fn finnySync(finny: *FinnyTable, net: *const Net, comptime persp: types.Color, ctx: PerspCtx, mail: *const [64]piece.Piece, pending: *PendingThreatRowsT(i16)) *FinnyEntry {
+    const h = net.hidden;
+    const slot = ctx.bucket * 2 + @as(usize, @intFromBool(ctx.flip != 0));
+    const entry = &finny.sides[@intFromEnum(persp)][slot];
+    if (!entry.valid) {
+        for (0..h) |i| entry.acc[i] = net.feature_bias[i];
+        entry.mail = [_]piece.Piece{.none} ** 64;
+        entry.psqt_h = [_]i64{0} ** MAX_BUCKETS;
+        entry.valid = true;
+    }
+    const planes = comptime halfkaPlanes(persp);
+    const old: @Vector(64, u8) = @bitCast(entry.mail);
+    const cur: @Vector(64, u8) = @bitCast(mail.*);
+    var changed: u64 = @bitCast(old != cur);
+    const base = INPUTS * ctx.bucket;
+    const orient: u6 = (if (persp == .white) @as(u6, 0) else 56) ^ ctx.flip;
+    const rows = net.feature_weights.ptr;
+    while (changed != 0) {
+        const sq: u6 = @intCast(@ctz(changed));
+        changed &= changed - 1;
+        const o = entry.mail[sq];
+        const n = mail[sq];
+        const fo = base + 64 * @as(usize, planes[@intFromEnum(o)]) + (sq ^ orient);
+        const fnew = base + 64 * @as(usize, planes[@intFromEnum(n)]) + (sq ^ orient);
+        const has_o = o != .none;
+        const has_n = n != .none;
+        pending.subs[pending.ns] = rows + fo * h;
+        pending.ns += @intFromBool(has_o);
+        pending.adds[pending.na] = rows + fnew * h;
+        pending.na += @intFromBool(has_n);
+        addPsqtVecSigned(&entry.psqt_h, net, fnew, @intFromBool(has_n));
+        addPsqtVecSigned(&entry.psqt_h, net, fo, -@as(i64, @intFromBool(has_o)));
+    }
+    entry.mail = mail.*;
+    return entry;
 }
 
 /// Add every set threat feature's row into `half` (full threats — refresh / finny rebuild),
@@ -2713,20 +3041,24 @@ fn directThreatDelta(comptime T: type, self: *Accumulator, net: *const Net, pos:
         const ci = @intFromEnum(col);
         cu[ci][0] = attacks.pawnAttacksDirect(col, pos.pieceBitboard(col, .pawn));
         var kn = pos.pieceBitboard(col, .knight);
-        while (bitboard.popLsb(&kn)) |s| cu[ci][1] |= attacks.knightAttacksDirect(s);
+        while (kn != 0) {
+            const s = bitboard.popLsbUnchecked(&kn);
+            cu[ci][1] |= attacks.knightAttacksDirect(s);
+        }
     }
     inline for ([_]piece.PieceType{ .bishop, .rook, .queen }) |pt| {
         inline for ([_]types.Color{ .white, .black }) |col| {
             const ci = @intFromEnum(col);
             const pi = @intFromEnum(pt);
             var sb = pos.pieceBitboard(col, pt);
-            while (bitboard.popLsb(&sb)) |s| {
+            while (sb != 0) {
+                const s = bitboard.popLsbUnchecked(&sb);
                 const a_child = threatAttackBB(pt, col, s, child_occ);
                 cu[ci][pi] |= a_child;
                 const rays = switch (pt) {
-                    .bishop => attacks.BISHOP_RAYS[s.index()],
-                    .rook => attacks.ROOK_RAYS[s.index()],
-                    .queen => attacks.BISHOP_RAYS[s.index()] | attacks.ROOK_RAYS[s.index()],
+                    .bishop => attacks.BISHOP_RAYS[@intFromEnum(s)],
+                    .rook => attacks.ROOK_RAYS[@intFromEnum(s)],
+                    .queen => attacks.BISHOP_RAYS[@intFromEnum(s)] | attacks.ROOK_RAYS[@intFromEnum(s)],
                     else => unreachable,
                 };
                 if ((rays & flip_bb) == 0) continue;
@@ -2752,8 +3084,9 @@ fn directThreatDelta(comptime T: type, self: *Accumulator, net: *const Net, pos:
         @memset(&wpsqt, 0);
         @memset(&bpsqt, 0);
     }
-    while (bitboard.popLsb(&affected)) |t| {
-        updateThreatTarget(T, self, net, pos, t.index(), &cu, changes, wflip, bflip, &wpend, &bpend, &wpsqt, &bpsqt);
+    while (affected != 0) {
+        const t = bitboard.popLsbUnchecked(&affected);
+        updateThreatTarget(T, self, net, pos, @intFromEnum(t), &cu, changes, wflip, bflip, &wpend, &bpend, &wpsqt, &bpsqt);
     }
     wpend.flush(&self.white, net.hidden);
     bpend.flush(&self.black, net.hidden);
@@ -2783,15 +3116,13 @@ pub fn evaluateThreatsIncremental(net: *const Net, acc: *const Accumulator, pos:
 }
 
 /// ZQB9 full-threats eval from the search's incrementally-maintained accumulator:
-/// the HalfKA halves (white/black) and the SEPARATE threat halves (ftw/ftb) are
-/// combined lane-wise INSIDE the activation pass (fillPairwiseU8Split — no
-/// hidden-wide stm/ntm temporaries), then fed to the shared layerstack readout;
-/// the PSQT head is read from the maintained per-colour scalars (HalfKA
-/// psqt_hw/hb + threat psqt_tw/tb) exactly like evaluateThreatsIncremental. Must
-/// equal `evaluateFull9` (the refresh reference) bit-for-bit — the Debug
-/// cross-check in backend.evaluate and the ZQB9 tree tests assert it (the
-/// in-register wrapping half-sum is the refresh path's sequential row adds'
-/// exact value: the combined accumulator is i16-safe for any legal net).
+/// the combined halves (white/black: HalfKA + threat rows) feed the activation
+/// pass, then the shared layerstack readout; the PSQT head is read from the
+/// maintained per-colour scalars (HalfKA psqt_hw/hb + threat psqt_tw/tb)
+/// exactly like evaluateThreatsIncremental. Must equal `evaluateFull9` (the
+/// refresh reference) bit-for-bit — the Debug cross-check in backend.evaluate
+/// and the ZQB9 tree tests assert it (the wrapping combined half is the refresh
+/// path's sequential row adds' exact value: it is i16-safe for any legal net).
 pub fn evaluateFull9Incremental(net: *const Net, acc: *const Accumulator, pos: *const position.Position, scale_percent: u16) i32 {
     const stm = pos.side_to_move;
     const pc: usize = @popCount(pos.occupancy());
@@ -2800,11 +3131,11 @@ pub fn evaluateFull9Incremental(net: *const Net, acc: *const Accumulator, pos: *
     psqt += if (stm == .white) acc.psqt_hw[pbkt] else acc.psqt_hb[pbkt];
     psqt += if (stm == .white) acc.psqt_tw[pbkt] else acc.psqt_tb[pbkt];
     if (stm == .white) {
-        if (evalFusedVnni(net, &acc.white, &acc.ftw, &acc.black, &acc.ftb, pc, psqt, scale_percent)) |v| return v;
-        if (evalFusedAvx2(net, &acc.white, &acc.ftw, &acc.black, &acc.ftb, pc, psqt, scale_percent)) |v| return v;
+        if (evalFusedVnni(net, &acc.white, &acc.black, pc, psqt, scale_percent)) |v| return v;
+        if (evalFusedAvx2(net, &acc.white, &acc.black, pc, psqt, scale_percent)) |v| return v;
     } else {
-        if (evalFusedVnni(net, &acc.black, &acc.ftb, &acc.white, &acc.ftw, pc, psqt, scale_percent)) |v| return v;
-        if (evalFusedAvx2(net, &acc.black, &acc.ftb, &acc.white, &acc.ftw, pc, psqt, scale_percent)) |v| return v;
+        if (evalFusedVnni(net, &acc.black, &acc.white, pc, psqt, scale_percent)) |v| return v;
+        if (evalFusedAvx2(net, &acc.black, &acc.white, pc, psqt, scale_percent)) |v| return v;
     }
     return evaluateFull9Unfused(net, acc, stm, pc, psqt, scale_percent);
 }
@@ -2817,11 +3148,11 @@ noinline fn evaluateFull9Unfused(net: *const Net, acc: *const Accumulator, stm: 
     const half = h / 2;
     var p_u8: [MAX_HIDDEN]u8 align(64) = undefined;
     if (stm == .white) {
-        fillPairwiseU8Split(p_u8[0..half], acc.white[0..h], acc.ftw[0..h], net.qa);
-        fillPairwiseU8Split(p_u8[half..h], acc.black[0..h], acc.ftb[0..h], net.qa);
+        fillPairwiseU8(p_u8[0..half], acc.white[0..h], net.qa);
+        fillPairwiseU8(p_u8[half..h], acc.black[0..h], net.qa);
     } else {
-        fillPairwiseU8Split(p_u8[0..half], acc.black[0..h], acc.ftb[0..h], net.qa);
-        fillPairwiseU8Split(p_u8[half..h], acc.white[0..h], acc.ftw[0..h], net.qa);
+        fillPairwiseU8(p_u8[0..half], acc.black[0..h], net.qa);
+        fillPairwiseU8(p_u8[half..h], acc.white[0..h], net.qa);
     }
     // ZQB9 is always a layerstack net (same body as ZQB8).
     return finishMultiActivated(net, &p_u8, pc, psqt, scale_percent);
@@ -2831,15 +3162,16 @@ noinline fn evaluateFull9Unfused(net: *const Net, acc: *const Accumulator, stm: 
 // v6 FULL-THREATS incremental state (docs/V6_INCREMENTAL_DESIGN.md, Block B;
 // direct delta: artifacts/research/perf-lane2-20261007/SPEC-direct-threat-delta.md).
 //
-// The per-ply Accumulator carries the threat VALUES (ftw/ftb threat halves +
-// psqt_tw/tb scalars), written child-from-parent at materialization time. The
+// The per-ply Accumulator carries the threat VALUES (threat rows inside the
+// combined white/black halves + psqt_tw/tb scalars), written child-from-parent
+// at materialization time together with the HalfKA rows. The
 // move's feature changes are generated DIRECTLY from the post-move board and
 // the decoded change list (fullthreats.emitMoveDelta), each with its
 // direction, so the search path keeps no 60,144-bit feature sets, no undo
 // records and nothing to unwind: ensureMaterialized's unwind/reset calls are
 // bookkeeping only (depth), and any walk start `top` is valid.
 //
-// The accumulator threat halves rebuild across a flip crossing (~1.4% of
+// A perspective's threat part rebuilds across a flip crossing (~1.4-4% of
 // moves) via a 2-slot flip cache per perspective (slot = mirror flip on/off):
 // each slot holds a threat half + the bitset it sums + its PSQT scalars,
 // diff-applied against a fresh enumeration of the board exactly like
@@ -2851,12 +3183,16 @@ noinline fn evaluateFull9Unfused(net: *const Net, acc: *const Accumulator, stm: 
 /// comptime in eval/backend.zig — the two constants cannot import each other).
 pub const FT_MAX_PLY: usize = 128;
 
-/// One flip-cache slot: `acc` = Σ threat rows over `bits`, `psqt` their PSQT sums.
+/// One flip-cache slot: `acc` = Σ threat rows over `feats`, `psqt` their PSQT sums.
 /// ZQBA: `acc`/`psqt` also hold the pawn-pair rows of the raw pawn sets `pawns`
 /// (white, black) under the slot's flip.
 const FtFlipSlot = struct {
     acc: [MAX_HIDDEN]i16 align(64),
-    bits: fullthreats_mod.PerspBits,
+    /// The active threat features, as a list: about a dozen in searched
+    /// positions (at most MAX_ACTIVE), where a 940-word set cost a 15 KB clear,
+    /// a 2 x 7.5 KB diff scan and a 7.5 KB copy per rebuild.
+    feats: [fullthreats_mod.MAX_ACTIVE]u16,
+    nfeats: usize,
     psqt: [MAX_BUCKETS]i64,
     pawns: [2]u64,
 };
@@ -2917,12 +3253,12 @@ fn pawnRowDelta(net: *const Net, changes: []const Change, board: *const position
 }
 
 pub const FullThreatState = struct {
-    /// Scratch for barrier re-enumerations (white/black COLOUR perspective);
-    /// only meaningful inside one advanceMove. Since the direct delta (lane 2
-    /// #4) the search path keeps NO feature bitsets: each materialized move's
-    /// toggles come from (post-move board, change list) alone.
-    wbits: fullthreats_mod.PerspBits = undefined,
-    bbits: fullthreats_mod.PerspBits = undefined,
+    /// Membership scratch of the flip-cache rebuild: all zero between uses
+    /// (rebuildFromSlot sets and clears only the words of its two lists).
+    /// Since the direct delta (lane 2 #4) the search path keeps NO feature
+    /// bitsets: each materialized move's toggles come from (post-move board,
+    /// change list) alone.
+    mark: fullthreats_mod.PerspBits = [_]u64{0} ** fullthreats_mod.WORDS,
     /// Ply of the materialized path the threat state was last advanced to
     /// (bookkeeping for ensureMaterialized's unwind contract only).
     depth: usize = 0,
@@ -2936,6 +3272,7 @@ pub const FullThreatState = struct {
         _ = pos;
         self.depth = 0;
         self.cache_valid = .{ .{ false, false }, .{ false, false } };
+        @memset(&self.mark, 0);
     }
 
     /// Re-anchor at path depth `target` (ensureMaterialized's walk start):
@@ -2951,189 +3288,329 @@ pub const FullThreatState = struct {
         self.depth += 1;
     }
 
-    /// Write the child's threat halves + PSQT scalars from the parent's across
-    /// one materialized move (board = POST-move position, `changes` = the SAME
-    /// decoded piece feature list the HalfKA path consumed). A perspective whose
-    /// mirror flip is unchanged takes the direct delta (fullthreats.emitMoveDelta
-    /// -> rows pushed into its fused flush); a flip-changed one (a king crossing
-    /// the d/e boundary, ~1.4% of moves; one side at most) rebuilds through its
-    /// flip-cache slot from a fresh enumeration of the board.
-    pub fn advanceMove(
+    /// Write the child's accumulator halves and PSQT scalars from the parent's
+    /// across one materialized move (board = POST-move position, `changes` =
+    /// the move's decoded piece feature list). ZQB9/ZQBA keep ONE accumulator
+    /// half per perspective holding HalfKA + threat (+ pawn-pair) rows, so a
+    /// move writes each child half in ONE fused pass: parent half + the move's
+    /// HalfKA rows + its directly generated threat rows
+    /// (fullthreats.emitMoveDelta). A king move that changes the mover's frame
+    /// takes one of two rebuilds:
+    ///  - king bucket changed, threat mirror unchanged: the threat part rides
+    ///    along as parent half - old-bucket HalfKA (finny entry brought to the
+    ///    parent's pieces), onto the new bucket's finny entry (crossFlush);
+    ///  - threat mirror changed (a king crossing the d/e boundary): new-frame
+    ///    finny entry + the threat flip-cache slot, both rebuilt from the board.
+    pub inline fn advanceMove(
         self: *FullThreatState,
         net: *const Net,
         child: *Accumulator,
         parent: *const Accumulator,
         changes: []const Change,
         board: *const position.Position,
+        finny: *FinnyTable,
     ) void {
+        advanceMoveImpl(self, net, child, parent, changes.ptr, changes.len, board, finny);
+    }
+
+    /// advanceMove's body behind a kernel_cc entry.
+    fn advanceMoveImpl(self: *FullThreatState, net: *const Net, child: *Accumulator, parent: *const Accumulator, chg_ptr: [*]const Change, chg_len: usize, board: *const position.Position, finny: *FinnyTable) align(64) callconv(kernel_cc) void { // align(64): pins hot entry placement (layout stability, not call speed)
         std.debug.assert(self.depth + 1 < FT_MAX_PLY);
-        var sqbuf: [4]fullthreats_mod.SquareChange = undefined;
-        const nsq = squareChangesFrom(changes, &sqbuf);
+        const changes = chg_ptr[0..chg_len];
+        const h = net.hidden;
+        const pb = net.psqt_buckets;
+        const ctx = [2]PerspCtx{ Accumulator.perspCtx(net, .white, board), Accumulator.perspCtx(net, .black, board) };
         const new_flips = fullthreats_mod.kingFlips(board);
-        // A perspective's flip changes iff its king crossed the d/e boundary:
-        // read off the change list (old king square = the king's removal).
-        var wflip_changed = false;
-        var bflip_changed = false;
+        // Only the mover's king can change a frame; read it off the change list
+        // (old king square = the king's removal). tflip: threat mirror changed;
+        // cross: HalfKA bucket/flip changed with the threat mirror unchanged.
+        var tflip = [2]bool{ false, false };
+        var cross = [2]bool{ false, false };
+        var pre_ctx: PerspCtx = undefined;
         for (changes) |c| {
             if (c.pt == .king and !c.add) {
+                const pi = @intFromEnum(c.color);
                 const old_flip: u6 = if ((c.sq & 7) > 3) 7 else 0;
-                if (c.color == .white) wflip_changed = old_flip != new_flips.w else bflip_changed = old_flip != new_flips.b;
+                tflip[pi] = old_flip != (if (c.color == .white) new_flips.w else new_flips.b);
+                pre_ctx = if (c.color == .white) Accumulator.kingCtx(net, .white, c.sq) else Accumulator.kingCtx(net, .black, c.sq);
+                cross[pi] = !tflip[pi] and (pre_ctx.bucket != ctx[pi].bucket or pre_ctx.flip != ctx[pi].flip);
             }
         }
-        // ZQBA: the move's pawn-pair row delta (empty unless a pawn changed).
-        // Built under the post-move flips; a perspective whose flip changed
-        // ignores it and rebuilds through its flip-cache slot instead.
+        // The move's HalfKA rows per perspective (same counts for both), gathered
+        // and prefetched before the threat walk so the loads overlap it.
+        var hadd: [2][2][*]const i16 = undefined;
+        var hsub: [2][2][*]const i16 = undefined;
+        var na: usize = 0;
+        var ns: usize = 0;
+        for (changes) |c| {
+            const wr = featureRow(net, .white, ctx[0], c.color, c.pt, c.sq);
+            const br = featureRow(net, .black, ctx[1], c.color, c.pt, c.sq);
+            if (!tflip[0] and !cross[0]) @prefetch(wr.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+            if (!tflip[1] and !cross[1]) @prefetch(br.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+            if (c.add) {
+                hadd[0][na] = wr.ptr;
+                hadd[1][na] = br.ptr;
+                na += 1;
+            } else {
+                hsub[0][ns] = wr.ptr;
+                hsub[1][ns] = br.ptr;
+                ns += 1;
+            }
+        }
+        var sqbuf: [4]fullthreats_mod.SquareChange = undefined;
+        const nsq = squareChangesFrom(changes, &sqbuf);
+        // ZQBA: the move's pawn-pair row delta (empty unless a pawn changed),
+        // under the post-move flips; a flip-changed perspective ignores it.
         var pd: PawnRowDelta = undefined;
         pd.rows.n = .{ 0, 0 };
         if (net.pawn_inputs != 0) pawnRowDelta(net, changes, board, new_flips.w, new_flips.b, &pd);
-        if (!wflip_changed and !bflip_changed) {
-            self.applyDirect(net, child, parent, sqbuf[0..nsq], board, &pd, 3);
-        } else {
-            // One king moved, so exactly one perspective is flip-changed.
-            self.applyDirect(net, child, parent, sqbuf[0..nsq], board, &pd, if (wflip_changed) 2 else 1);
-            fullthreats_mod.enumerateColors(board, &self.wbits, &self.bbits);
-            if (wflip_changed) self.rebuildFromSlot(net, .white, child, new_flips.w, board);
-            if (bflip_changed) self.rebuildFromSlot(net, .black, child, new_flips.b, board);
-        }
-        self.depth += 1;
-    }
 
-    /// Direct-delta sink: each emitted (perspective, direction, feature) pushes
-    /// its threat row into that perspective's fused batch (copy-fused against
-    /// the parent half) and its PSQT weight into a local sum. Perspective bit
-    /// 0 = white, 1 = black in `mask` (the others' emissions are dropped).
-    const RowSink = struct {
-        net: *const Net,
-        h: usize,
-        psqt_base: usize,
-        mask: u2,
-        child: *Accumulator,
-        wpend: PendingThreatRowsT(i8),
-        bpend: PendingThreatRowsT(i8),
-        wsrc: *const [MAX_HIDDEN]i16,
-        bsrc: *const [MAX_HIDDEN]i16,
-        wpsqt: [MAX_BUCKETS]i64,
-        bpsqt: [MAX_BUCKETS]i64,
-        /// Single-bucket PSQT heads (every ZQB9/ZQBA net): the per-feature PSQT
-        /// weights are summed AFTER the emission walk (sumDeferredPsqt), when the
-        /// header/psqtw lines prefetched at emission have landed, instead of one
-        /// dependent miss per emission. Entry = idx | add << 31; a full queue
-        /// falls back to the immediate add (integer sums: order is free).
-        defer_psqt: bool,
-        wnq: usize,
-        bnq: usize,
-        wq: [PSQT_QUEUE]u32,
-        bq: [PSQT_QUEUE]u32,
-
-        const PSQT_QUEUE = 64;
-
-        inline fn sumDeferredPsqt(self: *const RowSink, q: []const u32) i64 {
-            var sum: i64 = 0;
-            for (q) |e| {
-                const idx: usize = e & 0x7FFF_FFFF;
-                const w: i64 = threatPsqtWeight(self.net, self.psqt_base, idx);
-                // +w for an add, -w for a removal, without a branch.
-                const neg: i64 = @as(i64, @intCast(e >> 31)) - 1; // 0 (add) or -1
-                sum += (w ^ neg) - neg;
-            }
-            return sum;
-        }
-
-        pub inline fn emit(self: *RowSink, comptime black: bool, comptime add: bool, idx: usize) void {
-            if (self.mask & (@as(u2, 1) << @intFromBool(black)) == 0) return;
-            // All threat-row addressing goes through threatRowT (row layout).
-            // Prefetch the row's PSQT header line (read after the walk by
-            // sumDeferredPsqt, or just below by addThreatPsqt when the queue is
-            // off or full; the row start itself when there is no header) and
-            // its first ROW_PREFETCH_BYTES of weights.
-            const row = threatRowT(i8, self.net, idx);
-            @prefetch(row.ptr - self.net.threat_row_header, .{ .rw = .read, .locality = 3, .cache = .data });
-            inline for (0..fullthreats_mod.ROW_PREFETCH_BYTES / 64) |l| @prefetch(row.ptr + 64 * l, .{ .rw = .read, .locality = 3, .cache = .data });
-            const entry: u32 = @as(u32, @intCast(idx)) | (@as(u32, @intFromBool(add)) << 31);
-            if (black) {
-                if (add) self.bpend.pushAddFrom(&self.child.ftb, &self.bsrc, self.h, row) else self.bpend.pushSubFrom(&self.child.ftb, &self.bsrc, self.h, row);
-                if (self.defer_psqt and self.bnq < PSQT_QUEUE) {
-                    self.bq[self.bnq] = entry;
-                    self.bnq += 1;
-                } else addThreatPsqt(&self.bpsqt, self.net, self.psqt_base, idx, add);
-            } else {
-                if (add) self.wpend.pushAddFrom(&self.child.ftw, &self.wsrc, self.h, row) else self.wpend.pushSubFrom(&self.child.ftw, &self.wsrc, self.h, row);
-                if (self.defer_psqt and self.wnq < PSQT_QUEUE) {
-                    self.wq[self.wnq] = entry;
-                    self.wnq += 1;
-                } else addThreatPsqt(&self.wpsqt, self.net, self.psqt_base, idx, add);
-            }
-        }
-    };
-
-    /// Child threat halves (perspectives in `mask`) = parent halves plus the
-    /// move's directly generated rows (and ZQBA pawn-pair rows), each half
-    /// written in ONE fused pass (read parent, add rows, write child).
-    fn applyDirect(self: *const FullThreatState, net: *const Net, child: *Accumulator, parent: *const Accumulator, sq_changes: []const fullthreats_mod.SquareChange, board: *const position.Position, pd: *const PawnRowDelta, mask: u2) void {
-        _ = self;
-        const h = net.hidden;
-        const pb = net.psqt_buckets;
         var sink: RowSink = undefined;
-        sink.net = net;
+        sink.rows = net.threat_w8.ptr;
         sink.h = h;
-        sink.psqt_base = net.king_buckets * INPUTS;
-        sink.mask = mask;
-        sink.child = child;
+        sink.psqt = net.psqtw.ptr + net.king_buckets * INPUTS;
+        sink.wdst = &child.white;
+        sink.bdst = &child.black;
         sink.wpend.initEmpty();
         sink.bpend.initEmpty();
         // Flush sources: the PARENT halves until a (cold) overflow flush
         // materializes a child half early — see pushAddFrom/pushSubFrom.
-        sink.wsrc = &parent.ftw;
-        sink.bsrc = &parent.ftb;
+        sink.wsrc = &parent.white;
+        sink.bsrc = &parent.black;
+        sink.nq = 0;
+        // Two changed squares (all but en passant and castling): the slot-space walk.
+        if (comptime fullthreats_mod.has_avx2) {
+            if (nsq == 2) fullthreats_mod.emitMoveDeltaRay2(board, sqbuf[0..2], &sink) else fullthreats_mod.emitMoveDelta(board, sqbuf[0..nsq], &sink);
+        } else fullthreats_mod.emitMoveDelta(board, sqbuf[0..nsq], &sink);
+        var wpsqt: [MAX_BUCKETS]i64 = undefined;
+        var bpsqt: [MAX_BUCKETS]i64 = undefined;
+        sink.sumPsqt(net, &wpsqt, &bpsqt);
+
+        var mover_h: ?*const [MAX_BUCKETS]i64 = null;
+        inline for (0..2) |pi| {
+            const persp: types.Color = @enumFromInt(pi);
+            const half = if (pi == 0) &child.white else &child.black;
+            const pend = if (pi == 0) &sink.wpend else &sink.bpend;
+            const src = if (pi == 0) &sink.wsrc else &sink.bsrc;
+            const tpsqt = if (pi == 0) &child.psqt_tw else &child.psqt_tb;
+            const ppsqt = if (pi == 0) &parent.psqt_tw else &parent.psqt_tb;
+            const spsqt = if (pi == 0) &wpsqt else &bpsqt;
+            if (tflip[pi]) {
+                // HalfKA: the new frame's finny entry, synced to the child's pieces
+                // in place; threats + pawn pairs: the flip slot for the new mirror,
+                // diffed against a fresh enumeration; the child half is their sum.
+                var pq: PendingThreatRowsT(i16) = undefined;
+                pq.initEmpty();
+                const entry = finnySync(finny, net, persp, ctx[pi], &board.mailbox, &pq);
+                pq.flush(&entry.acc, h);
+                self.rebuildFromSlot(net, persp, child, if (pi == 0) new_flips.w else new_flips.b, board, &entry.acc);
+                mover_h = &entry.psqt_h;
+            } else {
+                if (pb == 1) tpsqt[0] = ppsqt[0] else tpsqt.* = ppsqt.*;
+                // ZQBA: the move's pawn-pair rows join the same batch.
+                if (pd.rows.n[pi] != 0) pushPawnRows(net, pend, half, src, h, pd.slice(pi), spsqt);
+                for (0..pb) |b| tpsqt[b] += spsqt[b];
+                if (cross[pi]) {
+                    // The parent's mailbox: the child's with the change list
+                    // undone (added pieces lifted first, then the removed ones
+                    // put back, which also restores a captured piece).
+                    var mail_parent = board.mailbox;
+                    for (changes) |c| {
+                        if (c.add) mail_parent[c.sq] = .none;
+                    }
+                    for (changes) |c| {
+                        if (!c.add) mail_parent[c.sq] = piece.Piece.make(c.color, c.pt);
+                    }
+                    var qa: PendingThreatRowsT(i16) = undefined;
+                    var qb: PendingThreatRowsT(i16) = undefined;
+                    qa.initEmpty();
+                    qb.initEmpty();
+                    const fa = finnySync(finny, net, persp, pre_ctx, &mail_parent, &qa);
+                    const fb = finnySync(finny, net, persp, ctx[pi], &board.mailbox, &qb);
+                    crossFlush(pend, half, src.*, h, &fa.acc, &qa, &fb.acc, &qb);
+                    mover_h = &fb.psqt_h;
+                } else {
+                    switch (na) {
+                        inline 1, 2 => |cna| switch (ns) {
+                            inline 1, 2 => |cns| CombinedFlush(cna, cns).run(pend, half, src.*, h, &hadd[pi], &hsub[pi]),
+                            else => unreachable,
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        }
+
+        // HalfKA PSQT head: parent sums + the change list's delta (post-move
+        // frames); a rebuilt mover perspective takes its finny entry's sum
+        // instead (over exactly the child's pieces in the new frame).
         if (pb == 1) {
-            sink.wpsqt[0] = 0;
-            sink.bpsqt[0] = 0;
+            child.psqt_hw[0] = parent.psqt_hw[0];
+            child.psqt_hb[0] = parent.psqt_hb[0];
         } else {
-            @memset(&sink.wpsqt, 0);
-            @memset(&sink.bpsqt, 0);
+            child.psqt_hw = parent.psqt_hw;
+            child.psqt_hb = parent.psqt_hb;
         }
-        sink.defer_psqt = pb == 1;
-        sink.wnq = 0;
-        sink.bnq = 0;
-        fullthreats_mod.emitMoveDelta(board, sq_changes, &sink);
-        if (sink.defer_psqt) {
-            sink.wpsqt[0] += sink.sumDeferredPsqt(sink.wq[0..sink.wnq]);
-            sink.bpsqt[0] += sink.sumDeferredPsqt(sink.bq[0..sink.bnq]);
+        var hw_delta: [MAX_BUCKETS]i64 = undefined;
+        var hb_delta: [MAX_BUCKETS]i64 = undefined;
+        if (pb == 1) {
+            hw_delta[0] = 0;
+            hb_delta[0] = 0;
+        } else {
+            @memset(&hw_delta, 0);
+            @memset(&hb_delta, 0);
         }
-        if (mask & 1 != 0) {
-            if (pb == 1) child.psqt_tw[0] = parent.psqt_tw[0] else child.psqt_tw = parent.psqt_tw;
-            // ZQBA: the move's pawn-pair rows join the same batch.
-            if (pd.rows.n[0] != 0) pushPawnRows(net, &sink.wpend, &child.ftw, &sink.wsrc, h, pd.slice(0), &sink.wpsqt);
-            // Unconditional (unlike flush): with zero pending rows this is the copy.
-            sink.wpend.flushInto(&child.ftw, sink.wsrc, h);
-            for (0..pb) |b| child.psqt_tw[b] += sink.wpsqt[b];
+        for (changes) |c| {
+            const wi = halfkaIndex(.white, ctx[0], c.color, c.pt, c.sq);
+            const bi = halfkaIndex(.black, ctx[1], c.color, c.pt, c.sq);
+            if (c.add) {
+                addPsqtVecRaw(&hw_delta, net, wi, true);
+                addPsqtVecRaw(&hb_delta, net, bi, true);
+            } else {
+                addPsqtVecRaw(&hw_delta, net, wi, false);
+                addPsqtVecRaw(&hb_delta, net, bi, false);
+            }
         }
-        if (mask & 2 != 0) {
-            if (pb == 1) child.psqt_tb[0] = parent.psqt_tb[0] else child.psqt_tb = parent.psqt_tb;
-            if (pd.rows.n[1] != 0) pushPawnRows(net, &sink.bpend, &child.ftb, &sink.bsrc, h, pd.slice(1), &sink.bpsqt);
-            sink.bpend.flushInto(&child.ftb, sink.bsrc, h);
-            for (0..pb) |b| child.psqt_tb[b] += sink.bpsqt[b];
+        for (0..pb) |b| {
+            child.psqt_hw[b] += hw_delta[b];
+            child.psqt_hb[b] += hb_delta[b];
         }
+        if (mover_h) |mh| {
+            if (tflip[0] or cross[0]) child.psqt_hw = mh.* else child.psqt_hb = mh.*;
+        }
+        self.depth += 1;
     }
 
-    /// Barrier path, flip-changed perspective: the parent half is indexed
-    /// under the OLD mirror, so rebuild from the flip-cache slot for the NEW
-    /// flip (seeded empty on first use), diff-applied against the freshly
-    /// enumerated truth (wbits/bbits) like finnyRefresh, then copied to the
-    /// child. ZQBA: the slot's cached pawn sets are diffed against `board`'s
-    /// (the pawn analog of the slot's threat-bitset diff) — this also covers a
-    /// king capturing a pawn while crossing the d/e boundary.
-    noinline fn rebuildFromSlot(self: *FullThreatState, net: *const Net, comptime persp: types.Color, child: *Accumulator, flip: u6, board: *const position.Position) void {
+    /// Direct-delta sink: each changed feature pushes its two threat rows into
+    /// the perspectives' fused batches (copy-fused against the parent halves),
+    /// prefetches their heads and PSQT lines, and logs one PSQT entry (white |
+    /// black << 16 | add << 32), summed after the walk when the lines have
+    /// landed. A flip-changed perspective's batch is never flushed (its child
+    /// half is rebuilt from the flip cache), so its rows are simply dropped.
+    const RowSink = struct {
+        rows: [*]const i8,
+        h: usize,
+        psqt: [*]const i32,
+        wdst: *[MAX_HIDDEN]i16,
+        bdst: *[MAX_HIDDEN]i16,
+        wpend: PendingThreatRowsT(i8),
+        bpend: PendingThreatRowsT(i8),
+        wsrc: *const [MAX_HIDDEN]i16,
+        bsrc: *const [MAX_HIDDEN]i16,
+        nq: usize,
+        q: [2 * fullthreats_mod.MAX_MOVE_FEATURES]u64,
+
+        comptime {
+            std.debug.assert(fullthreats_mod.NUM_FULLTHREAT_FEATURES <= 1 << 16);
+        }
+
+        pub inline fn emitPair(self: *RowSink, comptime add: bool, iw: usize, ib: usize) void {
+            // All threat-row addressing goes through threatRowT's layout (row
+            // `idx` at idx * h); PSQT weights at psqtw[king_buckets * INPUTS + idx].
+            const rw = self.rows + iw * self.h;
+            const rb = self.rows + ib * self.h;
+            @prefetch(self.psqt + iw, .{ .rw = .read, .locality = 3, .cache = .data });
+            @prefetch(self.psqt + ib, .{ .rw = .read, .locality = 3, .cache = .data });
+            inline for (0..fullthreats_mod.ROW_PREFETCH_BYTES / 64) |l| {
+                @prefetch(rw + 64 * l, .{ .rw = .read, .locality = 3, .cache = .data });
+                @prefetch(rb + 64 * l, .{ .rw = .read, .locality = 3, .cache = .data });
+            }
+            if (add) {
+                self.wpend.pushAddFrom(self.wdst, &self.wsrc, self.h, rw[0..self.h]);
+                self.bpend.pushAddFrom(self.bdst, &self.bsrc, self.h, rb[0..self.h]);
+            } else {
+                self.wpend.pushSubFrom(self.wdst, &self.wsrc, self.h, rw[0..self.h]);
+                self.bpend.pushSubFrom(self.bdst, &self.bsrc, self.h, rb[0..self.h]);
+            }
+            if (std.debug.runtime_safety) std.debug.assert(self.nq < 2 * fullthreats_mod.MAX_MOVE_FEATURES);
+            self.q[self.nq] = iw | (ib << 16) | (@as(u64, @intFromBool(add)) << 32);
+            self.nq += 1;
+        }
+
+        /// The logged features' PSQT sums per perspective (sets `w`, `b`).
+        inline fn sumPsqt(self: *const RowSink, net: *const Net, w: *[MAX_BUCKETS]i64, b: *[MAX_BUCKETS]i64) void {
+            const base = net.king_buckets * INPUTS;
+            if (net.psqt_buckets == 1) {
+                var sw: i64 = 0;
+                var sb: i64 = 0;
+                for (self.q[0..self.nq]) |e| {
+                    // +weight for an add, -weight for a removal, without a branch.
+                    const neg: i64 = @as(i64, @intCast(e >> 32)) - 1; // 0 (add) or -1
+                    sw += (threatPsqtWeight(net, base, e & 0xFFFF) ^ neg) - neg;
+                    sb += (threatPsqtWeight(net, base, (e >> 16) & 0xFFFF) ^ neg) - neg;
+                }
+                w[0] = sw;
+                b[0] = sb;
+            } else {
+                @memset(w, 0);
+                @memset(b, 0);
+                for (self.q[0..self.nq]) |e| {
+                    if (e >> 32 != 0) {
+                        addThreatPsqt(w, net, base, e & 0xFFFF, true);
+                        addThreatPsqt(b, net, base, (e >> 16) & 0xFFFF, true);
+                    } else {
+                        addThreatPsqt(w, net, base, e & 0xFFFF, false);
+                        addThreatPsqt(b, net, base, (e >> 16) & 0xFFFF, false);
+                    }
+                }
+            }
+        }
+    };
+
+    /// slot.acc / slot.psqt += rows of `cur` not in the slot's list - rows of
+    /// the slot's list not in `cur` (+ the ZQBA pawn rows), in one in-place
+    /// flush. Membership goes through `mark` (set, tested, cleared word by word
+    /// for the two short lists). The same row set as the bitset XOR diff in
+    /// another order: wrapping i16 and i64 sums commute, so bit-exact.
+    fn applyFeatureListDelta(self: *FullThreatState, net: *const Net, slot: *FtFlipSlot, cur: []const u16, pawn: PawnRows) void {
         const h = net.hidden;
-        const new_bits = if (persp == .white) &self.wbits else &self.bbits;
-        const child_half = if (persp == .white) &child.ftw else &child.ftb;
+        const base = net.king_buckets * INPUTS;
+        const old = slot.feats[0..slot.nfeats];
+        const mark = &self.mark;
+        var pending: PendingThreatRowsT(i8) = undefined;
+        pending.initEmpty();
+        var src: *const [MAX_HIDDEN]i16 = &slot.acc;
+        var psqt_local: [MAX_BUCKETS]i64 = [_]i64{0} ** MAX_BUCKETS;
+        for (cur) |f| mark[f >> 6] |= @as(u64, 1) << @as(u6, @intCast(f & 63));
+        for (old) |f| {
+            if ((mark[f >> 6] >> @as(u6, @intCast(f & 63))) & 1 == 0) {
+                pending.pushSubFrom(&slot.acc, &src, h, threatRowT(i8, net, f));
+                addPsqtVecRaw(&psqt_local, net, base + f, false);
+            }
+        }
+        for (cur) |f| mark[f >> 6] = 0;
+        for (old) |f| mark[f >> 6] |= @as(u64, 1) << @as(u6, @intCast(f & 63));
+        for (cur) |f| {
+            if ((mark[f >> 6] >> @as(u6, @intCast(f & 63))) & 1 == 0) {
+                pending.pushAddFrom(&slot.acc, &src, h, threatRowT(i8, net, f));
+                addPsqtVecRaw(&psqt_local, net, base + f, true);
+            }
+        }
+        for (old) |f| mark[f >> 6] = 0;
+        if (pawn.idx.len != 0) pushPawnRows(net, &pending, &slot.acc, &src, h, pawn, &psqt_local);
+        if (pending.na != 0 or pending.ns != 0) pending.flushInto(&slot.acc, src, h);
+        for (0..net.psqt_buckets) |b| slot.psqt[b] += psqt_local[b];
+    }
+
+    /// Flip-changed perspective: the parent's threat part is indexed under the
+    /// OLD mirror, so rebuild it from the flip-cache slot for the NEW flip
+    /// (seeded empty on first use), diff-applied in place against the freshly
+    /// enumerated truth (a feature list, diffed against the slot's list through
+    /// the sparse `mark` set) like finnyRefresh; the child half is
+    /// then `hk` (the perspective's HalfKA half for the child, from its finny
+    /// entry) plus the slot. ZQBA: the slot's cached pawn sets are diffed
+    /// against `board`'s (the pawn analog of the slot's threat-list diff) —
+    /// this also covers a king capturing a pawn while crossing the d/e boundary.
+    noinline fn rebuildFromSlot(self: *FullThreatState, net: *const Net, comptime persp: types.Color, child: *Accumulator, flip: u6, board: *const position.Position, hk: *const [MAX_HIDDEN]i16) void {
+        const h = net.hidden;
+        const child_half = if (persp == .white) &child.white else &child.black;
         const child_psqt = if (persp == .white) &child.psqt_tw else &child.psqt_tb;
         const pi = @intFromEnum(persp);
         const si = @as(usize, @intFromBool(flip != 0));
         const slot = &self.cache[pi][si];
         if (!self.cache_valid[pi][si]) {
             @memset(slot.acc[0..h], 0);
-            slot.bits = [_]u64{0} ** fullthreats_mod.WORDS;
+            slot.nfeats = 0;
             slot.psqt = [_]i64{0} ** MAX_BUCKETS;
             slot.pawns = .{ 0, 0 };
             self.cache_valid[pi][si] = true;
@@ -3161,10 +3638,17 @@ pub const FullThreatState = struct {
             pawn_rows = .{ .idx = pawn_idx[0..n], .add = pawn_add[0..n] };
             slot.pawns = sets;
         }
-        // Slot update (in place) and slot -> child copy from ONE fused pass.
-        applyThreatBitsetDeltaInto(i8, &slot.acc, &slot.acc, child_half, net, &slot.bits, new_bits, &slot.psqt, pawn_rows);
-        slot.bits = new_bits.*;
+        var cur: [fullthreats_mod.MAX_ACTIVE]u16 = undefined;
+        const ncur = fullthreats_mod.enumeratePerspList(board, persp, &cur);
+        self.applyFeatureListDelta(net, slot, cur[0..ncur], pawn_rows);
+        @memcpy(slot.feats[0..ncur], cur[0..ncur]);
+        slot.nfeats = ncur;
         child_psqt.* = slot.psqt;
+        var i: usize = 0;
+        while (i + VEC16 <= h) : (i += VEC16) {
+            child_half[i..][0..VEC16].* = @as(@Vector(VEC16, i16), hk[i..][0..VEC16].*) +% @as(@Vector(VEC16, i16), slot.acc[i..][0..VEC16].*);
+        }
+        while (i < h) : (i += 1) child_half[i] = hk[i] +% slot.acc[i];
     }
 };
 
@@ -3193,9 +3677,8 @@ fn finishMultiHalves(net: *const Net, us: *const [MAX_HIDDEN]i16, them: *const [
 
 /// The layerstack forward from the ACTIVATED u8 products (l1 -> screlu -> l2 ->
 /// screlu -> l3, plus the PSQT combine) — factored out of finishMultiHalves so
-/// the ZQB9 incremental path (fillPairwiseU8Split, no combined-half temps)
-/// shares the body bit-for-bit.
-fn finishMultiActivated(net: *const Net, p_u8: *[MAX_HIDDEN]u8, piece_count: usize, psqt: i64, scale_percent: u16) align(64) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
+/// the ZQB9 incremental path shares the body bit-for-bit.
+fn finishMultiActivated(net: *const Net, p_u8: *[MAX_HIDDEN]u8, piece_count: usize, psqt: i64, scale_percent: u16) align(64) callconv(kernel_cc) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
     // Material-bucketed stacks (bucket 0 for single-stack nets): bucket-major slices.
     const bucket = net.bucketOf(piece_count);
     const z3 = finishHotBucket(net, bucket, p_u8) orelse finishGeneralZ3(net, bucket, p_u8);
@@ -3546,41 +4029,6 @@ inline fn fillPairwiseU8(out: []u8, acc: []const i16, qa: i32) void {
     }
 }
 
-/// Split-input fillPairwiseU8 for the ZQB9 incremental eval: the perspective's
-/// accumulator lives as SEPARATE HalfKA (`ha`) and threat (`ta`) halves; each
-/// lane's value is their wrapping i16 sum, formed IN-REGISTER inside the
-/// activation pass instead of staging combined stm/ntm temporaries first
-/// (which cost 2 extra hidden-wide passes per eval). The +% is the exact
-/// lane-wise op the old sumHalvesInto staging performed, and the combined
-/// accumulator is i16-safe for any legal net, so the clamp/mul sees identical
-/// values -> bit-exact with the staged path.
-inline fn fillPairwiseU8Split(out: []u8, ha: []const i16, ta: []const i16, qa: i32) void {
-    const V = ACT_LANES;
-    const half = out.len;
-    const qa16: @Vector(V, i16) = @splat(@intCast(qa));
-    const zero16: @Vector(V, i16) = @splat(0);
-    var i: usize = 0;
-    while (i + V <= half) : (i += V) {
-        const lo_h: @Vector(V, i16) = ha[i..][0..V].*;
-        const lo_t: @Vector(V, i16) = ta[i..][0..V].*;
-        const hi_h: @Vector(V, i16) = ha[i + half ..][0..V].*;
-        const hi_t: @Vector(V, i16) = ta[i + half ..][0..V].*;
-        const a = @min(@max(lo_h +% lo_t, zero16), qa16);
-        const b = @min(@max(hi_h +% hi_t, zero16), qa16);
-        // Same exact-u16 low-multiply argument as fillPairwiseU8.
-        const au: @Vector(V, u16) = @bitCast(a);
-        const bu: @Vector(V, u16) = @bitCast(b);
-        const pu: @Vector(V, u16) = (au *% bu) >> @splat(8);
-        const ov: @Vector(V, u8) = @intCast(pu);
-        out[i..][0..V].* = ov;
-    }
-    while (i < half) : (i += 1) {
-        const a: i32 = std.math.clamp(@as(i32, ha[i] +% ta[i]), 0, qa);
-        const b: i32 = std.math.clamp(@as(i32, ha[i + half] +% ta[i + half]), 0, qa);
-        out[i] = @intCast((a * b) >> 8);
-    }
-}
-
 /// True at comptime when the build target has AVX-512 VNNI (this native Zen5 build
 /// does; falls back to the scalar path elsewhere, keeping the engine portable).
 const has_avx512vnni = blk: {
@@ -3729,30 +4177,27 @@ inline fn l1DotsVnni16(wb: [*]const i8, x: []const u8) @Vector(16, i32) {
 
 /// AVX-512 VNNI, the activation pass fused into the 16-row l1: for each 64-byte
 /// chunk of the l1 input (the stm half's products, then the ntm half's), the
-/// pairwise products are formed with fillPairwiseU8Split's lane-wise ops at 64
-/// lanes (wrapping half sum, clamp to [0, qa], exact u16 product >> 8, narrow;
+/// pairwise products are formed with fillPairwiseU8's lane-wise ops at 64
+/// lanes (clamp to [0, qa], exact u16 product >> 8, narrow;
 /// elementwise, so any width gives the same bytes) and feed the chunk's 16
 /// `vpdpbusd` straight from the register, in
 /// l1DotsVnni16's chunk and row order. No activation buffer is stored or
 /// reloaded, and each chunk's weight loads issue next to its activation work.
 /// Every returned lane is l1DotsVnni16's exact integer dot.
-inline fn l1DotsFusedVnni16(wb: [*]const i8, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, half: usize, qa: i32) @Vector(16, i32) {
+inline fn l1DotsFusedVnni16(wb: [*]const i8, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, half: usize, qa: i32) @Vector(16, i32) {
     const V = 64;
     const qa16: @Vector(V, i16) = @splat(@intCast(qa));
     const zero16: @Vector(V, i16) = @splat(0);
     var acc: [16]@Vector(16, i32) = @splat(@splat(0));
     var p = wb;
     inline for (0..2) |side| {
-        const ha = if (side == 0) us_h else them_h;
-        const ta = if (side == 0) us_t else them_t;
+        const acc_half = if (side == 0) us else them;
         var i: usize = 0;
         while (i < half) : (i += V) {
-            const lo_h: @Vector(V, i16) = ha[i..][0..V].*;
-            const lo_t: @Vector(V, i16) = ta[i..][0..V].*;
-            const hi_h: @Vector(V, i16) = ha[i + half ..][0..V].*;
-            const hi_t: @Vector(V, i16) = ta[i + half ..][0..V].*;
-            const a = @min(@max(lo_h +% lo_t, zero16), qa16);
-            const b = @min(@max(hi_h +% hi_t, zero16), qa16);
+            const lo: @Vector(V, i16) = acc_half[i..][0..V].*;
+            const hi: @Vector(V, i16) = acc_half[i + half ..][0..V].*;
+            const a = @min(@max(lo, zero16), qa16);
+            const b = @min(@max(hi, zero16), qa16);
             const au: @Vector(V, u16) = @bitCast(a);
             const bu: @Vector(V, u16) = @bitCast(b);
             const pu: @Vector(V, u16) = (au *% bu) >> @splat(8);
@@ -3774,19 +4219,19 @@ inline fn l1DotsFusedVnni16(wb: [*]const i8, us_h: *const [MAX_HIDDEN]i16, us_t:
 /// The fused VNNI evaluation (activation + l1 + l2 + l3 + output) for the hot
 /// shape; null when it does not apply (then the caller runs the activation pass
 /// and finishMultiActivated, which give the identical result).
-inline fn evalFusedVnni(net: *const Net, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, piece_count: usize, psqt: i64, scale_percent: u16) ?i32 {
+inline fn evalFusedVnni(net: *const Net, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, piece_count: usize, psqt: i64, scale_percent: u16) ?i32 {
     if (comptime !(L1_BLOCK_ROWS == 16 and builtin.zig_backend == .stage2_llvm and has_avx512bw_512)) return null;
     const h = net.hidden;
     if (net.l1_blocked.len == 0 or net.l2_size != HOT_L2 or net.l3_size != HOT_L3 or h % 128 != 0) return null;
-    return finishFusedVnni(net, us_h, us_t, them_h, them_t, piece_count, psqt, scale_percent);
+    return finishFusedVnni(net, us, them, piece_count, psqt, scale_percent);
 }
 
-fn finishFusedVnni(net: *const Net, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, piece_count: usize, psqt: i64, scale_percent: u16) align(64) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
+fn finishFusedVnni(net: *const Net, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, piece_count: usize, psqt: i64, scale_percent: u16) align(64) callconv(kernel_cc) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
     const h = net.hidden;
     const bucket = net.bucketOf(piece_count);
     const wb = net.l1_blocked[bucket * HOT_L2 * h ..].ptr;
     const l1b = net.l1_bias[bucket * HOT_L2 ..][0..HOT_L2];
-    const hv = screluRows(16, l1DotsFusedVnni16(wb, us_h, us_t, them_h, them_t, h / 2, net.qa), l1b.*, l1Dequant(net));
+    const hv = screluRows(16, l1DotsFusedVnni16(wb, us, them, h / 2, net.qa), l1b.*, l1Dequant(net));
     const z3 = hotTailZ3(hv, net.l2_weights_t[bucket * HOT_L3 * HOT_L2 ..][0 .. HOT_L2 * HOT_L3], net.l2_bias[bucket * HOT_L3 ..][0..HOT_L3], net.l3_weights[bucket * HOT_L3 ..][0..HOT_L3], net.l3_bias[bucket]);
     return combineOutput(net, z3, psqt, scale_percent);
 }
@@ -3795,14 +4240,20 @@ fn finishFusedVnni(net: *const Net, us_h: *const [MAX_HIDDEN]i16, us_t: *const [
 /// row and step: two `vpmaddubsw` with memory weight operands, their i16
 /// lane-wise sum (proven overflow-free at load), one `vpmaddwd` widening.
 inline fn l1DotsGroup8(wb: [*]const i8, x: []const u8) @Vector(8, i32) {
-    var acc: [8]@Vector(8, i32) = @splat(@splat(0));
+    return l1DotsGroupRows(8, wb, x);
+}
+
+/// l1DotsGroup8 over an `R`-row blocked group (R = 4 or 8; the group's weights
+/// are blockL1Weights(R) blocked): lane r < R = row r's exact dot, lanes >= R = 0.
+inline fn l1DotsGroupRows(comptime R: usize, wb: [*]const i8, x: []const u8) @Vector(8, i32) {
+    var acc: [R]@Vector(8, i32) = @splat(@splat(0));
     const ones: @Vector(16, i16) = @splat(1);
     var p = wb;
     var i: usize = 0;
     while (i < x.len) : (i += L1_BLOCK_SPAN) {
         const xlo: @Vector(32, u8) = x[i..][0..32].*;
         const xhi: @Vector(32, u8) = x[i + 32 ..][0..32].*;
-        inline for (0..8) |r| {
+        inline for (0..R) |r| {
             // AT&T: `vpmaddubsw m256(i8), ymm(u8), dst` (x unsigned, weights signed).
             const plo = asm (std.fmt.comptimePrint("vpmaddubsw {d}(%[p]), %[x], %[pairs]", .{r * L1_BLOCK_SPAN})
                 : [pairs] "=v" (-> @Vector(16, i16)),
@@ -3816,50 +4267,48 @@ inline fn l1DotsGroup8(wb: [*]const i8, x: []const u8) @Vector(8, i32) {
             );
             acc[r] += madd16(plo +% phi, ones);
         }
-        p += 8 * L1_BLOCK_SPAN;
+        p += R * L1_BLOCK_SPAN;
     }
-    return reduceRows8(acc);
+    return reduceRowsUpTo8(R, acc);
 }
 
-/// AVX2 activation of one 32-byte chunk: fillPairwiseU8Split's per-lane ops at
-/// ACT_LANES = 32 for l1 input bytes [i, i + 32) of the side whose halves are
-/// (ha, ta) (wrapping half sum, clamp to [0, qa], exact u16 product >> 8, narrow).
-inline fn act32(ha: *const [MAX_HIDDEN]i16, ta: *const [MAX_HIDDEN]i16, i: usize, half: usize, qa16: @Vector(32, i16)) @Vector(32, u8) {
+/// AVX2 activation of one 32-byte chunk: fillPairwiseU8's per-lane ops at
+/// ACT_LANES = 32 for l1 input bytes [i, i + 32) of the side whose accumulator
+/// half is `acc_half` (clamp to [0, qa], exact u16 product >> 8, narrow).
+inline fn act32(acc_half: *const [MAX_HIDDEN]i16, i: usize, half: usize, qa16: @Vector(32, i16)) @Vector(32, u8) {
     const zero16: @Vector(32, i16) = @splat(0);
-    const lo_h: @Vector(32, i16) = ha[i..][0..32].*;
-    const lo_t: @Vector(32, i16) = ta[i..][0..32].*;
-    const hi_h: @Vector(32, i16) = ha[i + half ..][0..32].*;
-    const hi_t: @Vector(32, i16) = ta[i + half ..][0..32].*;
-    const a = @min(@max(lo_h +% lo_t, zero16), qa16);
-    const b = @min(@max(hi_h +% hi_t, zero16), qa16);
+    const lo: @Vector(32, i16) = acc_half[i..][0..32].*;
+    const hi: @Vector(32, i16) = acc_half[i + half ..][0..32].*;
+    const a = @min(@max(lo, zero16), qa16);
+    const b = @min(@max(hi, zero16), qa16);
     const au: @Vector(32, u16) = @bitCast(a);
     const bu: @Vector(32, u16) = @bitCast(b);
     const pu: @Vector(32, u16) = (au *% bu) >> @splat(8);
     return @intCast(pu);
 }
 
-/// AVX2 fused l1, rows 0-7: for each 64-byte step of the l1 input (stm side,
-/// then ntm side) the two activation chunks are formed in registers (act32),
-/// stored to `x` for the second pass, and fed to l1DotsGroup8's per-row grouped
-/// multiply (two vpmaddubsw, i16 lane add, one vpmaddwd) on the fused copy's
-/// rows 0-7. The copy's residual groups are zero, so every lane group is within
-/// the grouped bound (no saturation, no i16 overflow): each lane is exact.
-inline fn l1FusedAvx2Pass1(wb: [*]const i8, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, half: usize, qa: i32, x: *[MAX_HIDDEN]u8) @Vector(8, i32) {
+/// AVX2 fused l1, rows 0 to R-1 (R = 4 or 8): for each 64-byte step of the l1
+/// input (stm side, then ntm side) the two activation chunks are formed in
+/// registers (act32), stored to `x` for the second pass, and fed to
+/// l1DotsGroupRows's per-row grouped multiply (two vpmaddubsw, i16 lane add,
+/// one vpmaddwd) on the fused copy's first row group. The copy's residual
+/// groups are zero, so every lane group is within the grouped bound (no
+/// saturation, no i16 overflow): each lane is exact (lanes >= R are 0).
+inline fn l1FusedAvx2Pass1(comptime R: usize, wb: [*]const i8, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, half: usize, qa: i32, x: *[MAX_HIDDEN]u8) @Vector(8, i32) {
     const qa16: @Vector(32, i16) = @splat(@intCast(qa));
-    var acc: [8]@Vector(8, i32) = @splat(@splat(0));
+    var acc: [R]@Vector(8, i32) = @splat(@splat(0));
     const ones: @Vector(16, i16) = @splat(1);
     var p = wb;
     var o: usize = 0;
     inline for (0..2) |side| {
-        const ha = if (side == 0) us_h else them_h;
-        const ta = if (side == 0) us_t else them_t;
+        const acc_half = if (side == 0) us else them;
         var i: usize = 0;
         while (i < half) : (i += 64) {
-            const xlo = act32(ha, ta, i, half, qa16);
-            const xhi = act32(ha, ta, i + 32, half, qa16);
+            const xlo = act32(acc_half, i, half, qa16);
+            const xhi = act32(acc_half, i + 32, half, qa16);
             x[o..][0..32].* = xlo;
             x[o + 32 ..][0..32].* = xhi;
-            inline for (0..8) |r| {
+            inline for (0..R) |r| {
                 const plo = asm (std.fmt.comptimePrint("vpmaddubsw {d}(%[p]), %[x], %[pairs]", .{r * L1_BLOCK_SPAN})
                     : [pairs] "=v" (-> @Vector(16, i16)),
                     : [p] "r" (p),
@@ -3872,11 +4321,11 @@ inline fn l1FusedAvx2Pass1(wb: [*]const i8, us_h: *const [MAX_HIDDEN]i16, us_t: 
                 );
                 acc[r] += madd16(plo +% phi, ones);
             }
-            p += 8 * L1_BLOCK_SPAN;
+            p += R * L1_BLOCK_SPAN;
             o += 64;
         }
     }
-    return reduceRows8(acc);
+    return reduceRowsUpTo8(R, acc);
 }
 
 /// AVX-VNNI (VEX) `vpdpbusd` on ymm: acc += u8(x) . i8(w) per 4-byte lane, exact
@@ -3894,49 +4343,50 @@ inline fn vpdpbusdYmm(acc: @Vector(8, i32), p: [*]const i8, x: @Vector(32, u8), 
 /// pass 2) and the same fused copy, multiplied with two vpdpbusd per row and
 /// step. vpdpbusd neither saturates nor narrows, so each lane is the exact sum
 /// of the same u8*i8 products as the grouped kernel's.
-inline fn l1FusedAvxVnniPass1(wb: [*]const i8, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, half: usize, qa: i32, x: *[MAX_HIDDEN]u8) @Vector(8, i32) {
+inline fn l1FusedAvxVnniPass1(comptime R: usize, wb: [*]const i8, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, half: usize, qa: i32, x: *[MAX_HIDDEN]u8) @Vector(8, i32) {
     const qa16: @Vector(32, i16) = @splat(@intCast(qa));
-    var acc: [8]@Vector(8, i32) = @splat(@splat(0));
+    var acc: [R]@Vector(8, i32) = @splat(@splat(0));
     var p = wb;
     var o: usize = 0;
     inline for (0..2) |side| {
-        const ha = if (side == 0) us_h else them_h;
-        const ta = if (side == 0) us_t else them_t;
+        const acc_half = if (side == 0) us else them;
         var i: usize = 0;
         while (i < half) : (i += 64) {
-            const xlo = act32(ha, ta, i, half, qa16);
-            const xhi = act32(ha, ta, i + 32, half, qa16);
+            const xlo = act32(acc_half, i, half, qa16);
+            const xhi = act32(acc_half, i + 32, half, qa16);
             x[o..][0..32].* = xlo;
             x[o + 32 ..][0..32].* = xhi;
-            inline for (0..8) |r| {
+            inline for (0..R) |r| {
                 acc[r] = vpdpbusdYmm(acc[r], p, xlo, r * L1_BLOCK_SPAN);
                 acc[r] = vpdpbusdYmm(acc[r], p, xhi, r * L1_BLOCK_SPAN + 32);
             }
-            p += 8 * L1_BLOCK_SPAN;
+            p += R * L1_BLOCK_SPAN;
             o += 64;
         }
     }
-    return reduceRows8(acc);
+    return reduceRowsUpTo8(R, acc);
 }
 
-/// l1DotsGroup8 on an AVX-VNNI CPU (rows 8-15 over the stored activations).
-inline fn l1DotsAvxVnni8(wb: [*]const i8, x: []const u8) @Vector(8, i32) {
-    var acc: [8]@Vector(8, i32) = @splat(@splat(0));
+/// l1DotsGroupRows on an AVX-VNNI CPU (the second row group over the stored
+/// activations).
+inline fn l1DotsAvxVnniRows(comptime R: usize, wb: [*]const i8, x: []const u8) @Vector(8, i32) {
+    var acc: [R]@Vector(8, i32) = @splat(@splat(0));
     var p = wb;
     var i: usize = 0;
     while (i < x.len) : (i += L1_BLOCK_SPAN) {
         const xlo: @Vector(32, u8) = x[i..][0..32].*;
         const xhi: @Vector(32, u8) = x[i + 32 ..][0..32].*;
-        inline for (0..8) |r| {
+        inline for (0..R) |r| {
             acc[r] = vpdpbusdYmm(acc[r], p, xlo, r * L1_BLOCK_SPAN);
             acc[r] = vpdpbusdYmm(acc[r], p, xhi, r * L1_BLOCK_SPAN + 32);
         }
-        p += 8 * L1_BLOCK_SPAN;
+        p += R * L1_BLOCK_SPAN;
     }
-    return reduceRows8(acc);
+    return reduceRowsUpTo8(R, acc);
 }
 
-/// The exact contribution of a bucket's residual groups to rows [8*part, 8*part+8):
+/// The exact contribution of a bucket's residual groups to fused-copy rows
+/// (slots) [8*part, 8*part+8):
 /// per group and column pair, the two activation bytes widened to an i16 pair,
 /// broadcast, and `vpmaddwd`ed against the pair's i16 weights for the 8 rows
 /// (x <= 254, |w| <= 128: every pair sum is exact in i32).
@@ -3957,15 +4407,61 @@ inline fn l1ResidualRows(info: *const L1Residual, rw: [*]const i16, x: *const [M
 /// The fused AVX2 evaluation (activation + l1 + l2 + l3 + output) for the hot
 /// shape on buckets whose fused copy is valid; null otherwise (then the caller
 /// runs the activation pass and finishMultiActivated: identical result).
-inline fn evalFusedAvx2(net: *const Net, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, piece_count: usize, psqt: i64, scale_percent: u16) ?i32 {
+inline fn evalFusedAvx2(net: *const Net, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, piece_count: usize, psqt: i64, scale_percent: u16) ?i32 {
     if (comptime !L1_FUSED_AVX2) return null;
     if (net.l1_fused.len == 0) return null;
     const bucket = net.bucketOf(piece_count);
-    if (!net.l1_residual[bucket].ok) return null;
-    return finishFusedAvx2(net, bucket, us_h, us_t, them_h, them_t, psqt, scale_percent);
+    const info = &net.l1_residual[bucket];
+    if (!info.ok) return null;
+    return switch (info.rows) {
+        inline 4, 8, 12 => |r| FusedAvx2Entry(r).finish(net, bucket, us, them, psqt, scale_percent),
+        else => FusedAvx2Entry(HOT_L2).finish(net, bucket, us, them, psqt, scale_percent),
+    };
 }
 
-fn finishFusedAvx2(net: *const Net, bucket: usize, us_h: *const [MAX_HIDDEN]i16, us_t: *const [MAX_HIDDEN]i16, them_h: *const [MAX_HIDDEN]i16, them_t: *const [MAX_HIDDEN]i16, psqt: i64, scale_percent: u16) align(64) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
+/// The out-of-line kernel_cc entry of finishFusedAvx2 for one row count
+/// (kernel_cc functions cannot take comptime parameters).
+fn FusedAvx2Entry(comptime rows: usize) type {
+    return struct {
+        fn finish(net: *const Net, bucket: usize, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, psqt: i64, scale_percent: u16) align(64) callconv(kernel_cc) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
+            return finishFusedAvx2(rows, net, bucket, us, them, psqt, scale_percent);
+        }
+    };
+}
+
+/// `vpermd`: lane j = v[idx[j] & 7].
+inline fn permLanes8(v: @Vector(8, i32), idx: @Vector(8, i32)) @Vector(8, i32) {
+    // AT&T: `vpermd src, idx, dst`.
+    return asm ("vpermd %[v], %[idx], %[out]"
+        : [out] "=v" (-> @Vector(8, i32)),
+        : [v] "v" (v),
+          [idx] "v" (idx),
+    );
+}
+
+/// The fused copy's row-order dots (lo = slots 0-7, hi = slots 8-15) back in l1
+/// row order: row j takes slot[j]. When `rows` <= 8, hi is all zero (slots 8-15
+/// are all-zero rows) and is not read.
+inline fn l1RowOrder(comptime rows: usize, lo: @Vector(8, i32), hi: @Vector(8, i32), slot: *const [HOT_L2]i32) [2]@Vector(8, i32) {
+    const eight: @Vector(8, i32) = @splat(8);
+    const zero: @Vector(8, i32) = @splat(0);
+    var out: [2]@Vector(8, i32) = undefined;
+    inline for (0..2) |half| {
+        const idx: @Vector(8, i32) = slot[half * 8 ..][0..8].*;
+        const from_hi = if (rows <= 8) zero else permLanes8(hi, idx);
+        out[half] = @select(i32, idx < eight, permLanes8(lo, idx), from_hi);
+    }
+    return out;
+}
+
+/// The fused AVX2 finisher for a bucket whose fused copy has `rows` leading
+/// rows (L1Residual): the kernels multiply only those rows, every later row's
+/// dot is exactly 0 (all-zero weights, residual pairs included), and the dots
+/// return to l1 row order before the unchanged dequant/screlu/l2/l3 tail, so
+/// every l1 dot, and hence the result, equals the 16-row computation.
+inline fn finishFusedAvx2(comptime rows: usize, net: *const Net, bucket: usize, us: *const [MAX_HIDDEN]i16, them: *const [MAX_HIDDEN]i16, psqt: i64, scale_percent: u16) i32 {
+    comptime std.debug.assert(rows == 4 or rows == 8 or rows == 12 or rows == HOT_L2);
+    const first = if (rows == 4) 4 else 8;
     const h = net.hidden;
     const wb = net.l1_fused[bucket * HOT_L2 * h ..].ptr;
     const l1b = net.l1_bias[bucket * HOT_L2 ..][0..HOT_L2];
@@ -3974,13 +4470,18 @@ fn finishFusedAvx2(net: *const Net, bucket: usize, us_h: *const [MAX_HIDDEN]i16,
     const l1_dequant = l1Dequant(net);
     var x: [MAX_HIDDEN]u8 align(64) = undefined;
     var lo: @Vector(8, i32) = undefined;
-    var hi: @Vector(8, i32) = undefined;
+    var hi: @Vector(8, i32) = @splat(0);
     if (net.l1_avxvnni) {
-        lo = l1FusedAvxVnniPass1(wb, us_h, us_t, them_h, them_t, h / 2, net.qa, &x) +% l1ResidualRows(info, rw, &x, 0);
-        hi = l1DotsAvxVnni8(wb + 8 * h, x[0..h]) +% l1ResidualRows(info, rw, &x, 1);
+        lo = l1FusedAvxVnniPass1(first, wb, us, them, h / 2, net.qa, &x) +% l1ResidualRows(info, rw, &x, 0);
+        if (rows > 8) hi = l1DotsAvxVnniRows(rows - 8, wb + 8 * h, x[0..h]) +% l1ResidualRows(info, rw, &x, 1);
     } else {
-        lo = l1FusedAvx2Pass1(wb, us_h, us_t, them_h, them_t, h / 2, net.qa, &x) +% l1ResidualRows(info, rw, &x, 0);
-        hi = l1DotsGroup8(wb + 8 * h, x[0..h]) +% l1ResidualRows(info, rw, &x, 1);
+        lo = l1FusedAvx2Pass1(first, wb, us, them, h / 2, net.qa, &x) +% l1ResidualRows(info, rw, &x, 0);
+        if (rows > 8) hi = l1DotsGroupRows(rows - 8, wb + 8 * h, x[0..h]) +% l1ResidualRows(info, rw, &x, 1);
+    }
+    if (rows < HOT_L2) {
+        const ordered = l1RowOrder(rows, lo, hi, &info.slot);
+        lo = ordered[0];
+        hi = ordered[1];
     }
     const hv: @Vector(HOT_L2, f32) = @shuffle(f32, screluRows(8, lo, l1b[0..8].*, l1_dequant), screluRows(8, hi, l1b[8..16].*, l1_dequant), laneMask(16, struct {
         fn f(j: usize) i32 {
@@ -4095,6 +4596,16 @@ inline fn reduceRows8(a: [8]@Vector(8, i32)) @Vector(8, i32) {
     const m3lo = [8]i32{ 0, 1, 2, 3, ~@as(i32, 0), ~@as(i32, 1), ~@as(i32, 2), ~@as(i32, 3) };
     const m3hi = [8]i32{ 4, 5, 6, 7, ~@as(i32, 4), ~@as(i32, 5), ~@as(i32, 6), ~@as(i32, 7) };
     return @shuffle(i32, u[0], u[1], m3lo) +% @shuffle(i32, u[0], u[1], m3hi);
+}
+
+/// reduceRows8 for R <= 8 row accumulators: lane k < R = total of row k, lanes
+/// >= R = 0 (the missing rows reduce as zero accumulators).
+inline fn reduceRowsUpTo8(comptime R: usize, a: [R]@Vector(8, i32)) @Vector(8, i32) {
+    comptime std.debug.assert(R >= 1 and R <= 8);
+    if (R == 8) return reduceRows8(a);
+    var full: [8]@Vector(8, i32) = @splat(@splat(0));
+    inline for (0..R) |r| full[r] = a[r];
+    return reduceRows8(full);
 }
 
 const L1BlockKind = enum { vnni16, group8 };
@@ -4446,10 +4957,10 @@ test "nnue768 evaluates a material imbalance from the side to move" {
     net.full_threats = false;
     net.multilayer = false;
     net.threat_w8 = &.{};
-    net.threat_row_header = 0;
     net.pawn_inputs = 0;
     net.pawn_w8 = &.{};
     net.weight_methods = .{}; // plain heap allocs below
+    net.shared_blob = null;
     net.feature_weights = try allocator.alignedAlloc(i16, .@"64", INPUTS * H);
     net.feature_bias = try allocator.alloc(i16, H);
     net.output_weights = try allocator.alignedAlloc(i16, .@"64", 2 * H);
@@ -4595,7 +5106,7 @@ test "nnue768 ZQB7 bucketed-psqt incremental matches refresh over a game tree" {
     defer net.destroy(allocator);
     try std.testing.expect(net.threats);
     try std.testing.expectEqual(@as(usize, B), net.psqt_buckets);
-    try std.testing.expectEqual(@as(usize, THREAT * (H + net.threat_row_header)), net.threat_w8.len);
+    try std.testing.expectEqual(@as(usize, THREAT * H), net.threat_w8.len);
 
     const finny = try allocator.create(FinnyTable);
     defer allocator.destroy(finny);
@@ -4697,7 +5208,7 @@ test "nnue768 ZQB8 layerstack incremental matches refresh over a game tree" {
     try std.testing.expect(net.multilayer);
     try std.testing.expectEqual(@as(usize, L2S), net.l2_size);
     try std.testing.expectEqual(@as(usize, L3S), net.l3_size);
-    try std.testing.expectEqual(@as(usize, THREAT * (H + net.threat_row_header)), net.threat_w8.len);
+    try std.testing.expectEqual(@as(usize, THREAT * H), net.threat_w8.len);
 
     const finny = try allocator.create(FinnyTable);
     defer allocator.destroy(finny);
@@ -5084,8 +5595,6 @@ test "nnue768 ZQBA with a zero pawn block evaluates bit-identically to its ZQB9"
         b.refresh(net, &pos);
         try std.testing.expectEqualSlices(i16, a.white[0..h], b.white[0..h]);
         try std.testing.expectEqualSlices(i16, a.black[0..h], b.black[0..h]);
-        try std.testing.expectEqualSlices(i16, a.ftw[0..h], b.ftw[0..h]);
-        try std.testing.expectEqualSlices(i16, a.ftb[0..h], b.ftb[0..h]);
         try std.testing.expectEqual(a.psqt_tw[0], b.psqt_tw[0]);
         try std.testing.expectEqual(a.psqt_tb[0], b.psqt_tb[0]);
         try std.testing.expectEqual(evaluateFull9Incremental(base, &a, &pos, 48), evaluateFull9Incremental(net, &b, &pos, 48));
@@ -5164,6 +5673,20 @@ test "nnue768 ZQBA loader rejects foreign pawn blocks" {
     (try loadFromBytes(allocator, blob)).destroy(allocator);
 }
 
+test "nnue768 ZQB9 loader requires the mirrored frame" {
+    // Audit B (E-ZQB9-MIRROR): a ZQB9 with mirror = 0 loaded, unlike ZQB5-8 and ZQBA.
+    const allocator = std.testing.allocator;
+    const blob = try buildZqb9TestBlob(allocator);
+    defer allocator.free(blob);
+    const mirror_field = 20;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, blob[mirror_field..][0..4], .little));
+    (try loadFromBytes(allocator, blob)).destroy(allocator);
+    std.mem.writeInt(u32, blob[mirror_field..][0..4], 0, .little);
+    try std.testing.expectError(error.UnsupportedShape, loadFromBytes(allocator, blob));
+    std.mem.writeInt(u32, blob[mirror_field..][0..4], 1, .little);
+    (try loadFromBytes(allocator, blob)).destroy(allocator);
+}
+
 test "nnue768 ZQB9 full-threats refresh eval" {
     // Synthetic ZQB9 (buildZqb9TestBlob). Gates: the ZQB9 loader (full_threats flag +
     // exact-threat_inputs check), the evaluateFull9 full-refresh path (determinism +
@@ -5186,7 +5709,7 @@ test "nnue768 ZQB9 full-threats refresh eval" {
     try std.testing.expect(net.multilayer);
     try std.testing.expectEqual(@as(usize, H), net.hidden);
     try std.testing.expectEqual(MAX_FULL_THREAT_INPUTS, net.threat_inputs);
-    try std.testing.expectEqual(@as(usize, THREAT * (H + net.threat_row_header)), net.threat_w8.len);
+    try std.testing.expectEqual(@as(usize, THREAT * H), net.threat_w8.len);
     try std.testing.expectEqual(@as(usize, HALFKA * H), net.feature_weights.len);
 
     // (b)+(c): deterministic, sanely bounded, colour-mirror symmetric.
@@ -5362,10 +5885,10 @@ fn buildTestNet(allocator: std.mem.Allocator, hidden: usize, king_buckets: usize
     net.full_threats = false;
     net.multilayer = false;
     net.threat_w8 = &.{};
-    net.threat_row_header = 0;
     net.pawn_inputs = 0;
     net.pawn_w8 = &.{};
     net.weight_methods = .{}; // plain heap allocs below
+    net.shared_blob = null;
     net.feature_weights = try allocator.alignedAlloc(i16, .@"64", inputs * hidden);
     errdefer allocator.free(net.feature_weights);
     net.feature_bias = try allocator.alloc(i16, hidden);
@@ -5454,8 +5977,8 @@ fn referenceAccums(net: *const Net, pos: *const position.Position, us: []i64, th
     const h = net.hidden;
     const stm = pos.side_to_move;
     const ntm = stm.other();
-    const ourk = ownFrame(stm, pos.kingSquare(stm).?.index());
-    const oppk = ownFrame(ntm, pos.kingSquare(ntm).?.index());
+    const ourk = ownFrame(stm, @intFromEnum(pos.kingSquare(stm).?));
+    const oppk = ownFrame(ntm, @intFromEnum(pos.kingSquare(ntm).?));
     const stm_bucket: usize = net.table[ourk];
     const ntm_bucket: usize = net.table[oppk];
     const stm_flip: u6 = if (net.mirror and (ourk & 7) > 3) 7 else 0;
@@ -5465,11 +5988,12 @@ fn referenceAccums(net: *const Net, pos: *const position.Position, us: []i64, th
         them[i] = net.feature_bias[i];
     }
     var occ = pos.occupancy();
-    while (bitboard.popLsb(&occ)) |sq| {
+    while (occ != 0) {
+        const sq = bitboard.popLsbUnchecked(&occ);
         const p = pos.pieceAt(sq);
         const c = p.color() orelse continue;
         const ptn: usize = @intFromEnum(p.pieceType());
-        const orsq = ownFrame(stm, sq.index()); // piece square in stm's frame
+        const orsq = ownFrame(stm, @intFromEnum(sq)); // piece square in stm's frame
         const c_is_stm = (c == stm);
         const us_local: usize = (if (c_is_stm) @as(usize, 0) else 384) + 64 * ptn + @as(usize, orsq ^ stm_flip);
         const them_local: usize = (if (c_is_stm) @as(usize, 384) else 0) + 64 * ptn + @as(usize, (orsq ^ 56) ^ ntm_flip);
@@ -5750,7 +6274,7 @@ test "fused VNNI activation+l1 evaluation equals the activation pass + finisher 
     defer net.destroy(allocator);
     const h = net.hidden;
     var rng: u32 = 0xF00DF00D;
-    var halves: [4][MAX_HIDDEN]i16 align(64) = undefined;
+    var halves: [2][MAX_HIDDEN]i16 align(64) = undefined;
     const edge = [_]i16{ -32768, -1, 0, 1, 127, 128, 254, 255, 256, 32767 };
     for (0..400) |trial| {
         for (&halves) |*hv| for (hv[0..h]) |*v| {
@@ -5760,10 +6284,10 @@ test "fused VNNI activation+l1 evaluation equals the activation pass + finisher 
         const pc: usize = 2 + trial % 31;
         const psqt: i64 = @as(i64, @intCast(testRand(&rng) % 4_000_000)) - 2_000_000;
         const sp: u16 = if (trial % 5 == 0) 44 else 100;
-        const fused = evalFusedVnni(net, &halves[0], &halves[1], &halves[2], &halves[3], pc, psqt, sp) orelse return error.TestUnexpectedResult;
+        const fused = evalFusedVnni(net, &halves[0], &halves[1], pc, psqt, sp) orelse return error.TestUnexpectedResult;
         var p_u8: [MAX_HIDDEN]u8 align(64) = undefined;
-        fillPairwiseU8Split(p_u8[0 .. h / 2], halves[0][0..h], halves[1][0..h], net.qa);
-        fillPairwiseU8Split(p_u8[h / 2 .. h], halves[2][0..h], halves[3][0..h], net.qa);
+        fillPairwiseU8(p_u8[0 .. h / 2], halves[0][0..h], net.qa);
+        fillPairwiseU8(p_u8[h / 2 .. h], halves[1][0..h], net.qa);
         try std.testing.expectEqual(finishMultiActivated(net, &p_u8, pc, psqt, sp), fused);
     }
 }
@@ -5782,7 +6306,7 @@ test "fused AVX2 activation+l1 evaluation equals the activation pass + finisher 
     }
     try std.testing.expect(residual_groups > 0);
     var rng: u32 = 0xA5A5F00D;
-    var halves: [4][MAX_HIDDEN]i16 align(64) = undefined;
+    var halves: [2][MAX_HIDDEN]i16 align(64) = undefined;
     const edge = [_]i16{ -32768, -1, 0, 1, 127, 128, 254, 255, 256, 32767 };
     for (0..400) |trial| {
         for (&halves) |*hv| for (hv[0..h]) |*v| {
@@ -5792,15 +6316,15 @@ test "fused AVX2 activation+l1 evaluation equals the activation pass + finisher 
         // Every fourth trial saturates whole halves so residual columns see 254s.
         if (trial % 4 == 3) for (0..h) |i| {
             halves[0][i] = 255;
-            halves[2][i] = 255;
+            halves[1][i] = 255;
         };
         const pc: usize = 2 + trial % 31;
         const psqt: i64 = @as(i64, @intCast(testRand(&rng) % 4_000_000)) - 2_000_000;
         const sp: u16 = if (trial % 5 == 0) 44 else 100;
-        const fused = evalFusedAvx2(net, &halves[0], &halves[1], &halves[2], &halves[3], pc, psqt, sp) orelse return error.TestUnexpectedResult;
+        const fused = evalFusedAvx2(net, &halves[0], &halves[1], pc, psqt, sp) orelse return error.TestUnexpectedResult;
         var p_u8: [MAX_HIDDEN]u8 align(64) = undefined;
-        fillPairwiseU8Split(p_u8[0 .. h / 2], halves[0][0..h], halves[1][0..h], net.qa);
-        fillPairwiseU8Split(p_u8[h / 2 .. h], halves[2][0..h], halves[3][0..h], net.qa);
+        fillPairwiseU8(p_u8[0 .. h / 2], halves[0][0..h], net.qa);
+        fillPairwiseU8(p_u8[h / 2 .. h], halves[1][0..h], net.qa);
         const want = finishMultiActivated(net, &p_u8, pc, psqt, sp);
         try std.testing.expectEqual(want, fused);
         // Both multiply kernels of the fused path: the vpmaddubsw one always, the
@@ -5809,10 +6333,87 @@ test "fused AVX2 activation+l1 evaluation equals the activation pass + finisher 
         var other = net.*;
         other.l1_avxvnni = !net.l1_avxvnni;
         if (!other.l1_avxvnni or cpuHasAvxVnni()) {
-            const alt = evalFusedAvx2(&other, &halves[0], &halves[1], &halves[2], &halves[3], pc, psqt, sp) orelse return error.TestUnexpectedResult;
+            const alt = evalFusedAvx2(&other, &halves[0], &halves[1], pc, psqt, sp) orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(want, alt);
         }
     }
+}
+
+test "fused AVX2 l1 with all-zero rows skipped equals the activation pass + finisher bit-for-bit" {
+    if (comptime !L1_FUSED_AVX2) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var rng: u32 = 0x0D15EA5E;
+    var seen = [_]bool{false} ** (HOT_L2 + 1);
+    for (0..6) |variant| {
+        // The embedded net with random l1 rows zeroed per bucket (0-16 rows,
+        // some with a positive bias, so their constant screlu output must survive),
+        // then the load-time copies built exactly as loadFromBytes builds them.
+        const net = try loadFromBytesInner(allocator, default_net_bytes);
+        defer net.destroy(allocator);
+        const h = net.hidden;
+        var live = [_]usize{0} ** MAX_BUCKETS;
+        for (0..net.buckets) |b| {
+            // Variant 0 keeps the net's own rows (its widest buckets take 16 rows).
+            const zeroed = if (variant == 0) 0 else (testRand(&rng) + variant * 5 + b) % (HOT_L2 + 1);
+            var mask: u32 = 0;
+            while (@popCount(mask) < zeroed) mask |= @as(u32, 1) << @intCast(testRand(&rng) % HOT_L2);
+            for (0..HOT_L2) |r| {
+                if (mask & (@as(u32, 1) << @intCast(r)) == 0) continue;
+                @memset(net.l1_weights[(b * HOT_L2 + r) * h ..][0..h], 0);
+                if (testRand(&rng) % 2 == 0) net.l1_bias[b * HOT_L2 + r] = 0.25;
+            }
+            // The net's own all-zero rows count too.
+            for (0..HOT_L2) |r| live[b] += @intFromBool(!std.mem.allEqual(i8, net.l1_weights[(b * HOT_L2 + r) * h ..][0..h], 0));
+        }
+        initL1BytePairs(net, allocator);
+        initL1Blocked(net, allocator);
+        initL1Fused(net, allocator);
+        if (net.l1_fused.len == 0) return error.TestUnexpectedResult;
+        for (0..net.buckets) |b| {
+            const info = &net.l1_residual[b];
+            try std.testing.expect(info.ok);
+            try std.testing.expectEqual(fusedRowCount(live[b]), info.rows);
+            seen[info.rows] = true;
+            // slot is a permutation: the identity at 16 rows, else the rows with a
+            // nonzero weight sit in the first `live` slots.
+            var used: u32 = 0;
+            for (0..HOT_L2) |r| {
+                const sl: usize = @intCast(info.slot[r]);
+                used |= @as(u32, 1) << @intCast(sl);
+                const nonzero = !std.mem.allEqual(i8, net.l1_weights[(b * HOT_L2 + r) * h ..][0..h], 0);
+                if (info.rows == HOT_L2) try std.testing.expectEqual(r, sl) else if (nonzero) try std.testing.expect(sl < live[b]);
+            }
+            try std.testing.expectEqual(@as(u32, 0xFFFF), used);
+        }
+        var halves: [2][MAX_HIDDEN]i16 align(64) = undefined;
+        const edge = [_]i16{ -32768, -1, 0, 1, 127, 128, 254, 255, 256, 32767 };
+        for (0..124) |trial| {
+            for (&halves) |*hv| for (hv[0..h]) |*v| {
+                const r = testRand(&rng);
+                v.* = if (r % 7 == 0) edge[(r >> 8) % edge.len] else @intCast(@as(i32, @intCast((r >> 8) % 600)) - 300);
+            };
+            if (trial % 4 == 3) for (0..h) |i| {
+                halves[0][i] = 255;
+                halves[1][i] = 255;
+            };
+            const pc: usize = 2 + trial % 31;
+            const psqt: i64 = @as(i64, @intCast(testRand(&rng) % 4_000_000)) - 2_000_000;
+            const sp: u16 = if (trial % 5 == 0) 44 else 100;
+            var p_u8: [MAX_HIDDEN]u8 align(64) = undefined;
+            fillPairwiseU8(p_u8[0 .. h / 2], halves[0][0..h], net.qa);
+            fillPairwiseU8(p_u8[h / 2 .. h], halves[1][0..h], net.qa);
+            const want = finishMultiActivated(net, &p_u8, pc, psqt, sp);
+            var other = net.*;
+            for ([_]bool{ false, true }) |vnni| {
+                if (vnni and !cpuHasAvxVnni()) continue;
+                other.l1_avxvnni = vnni;
+                const got = evalFusedAvx2(&other, &halves[0], &halves[1], pc, psqt, sp) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(want, got);
+            }
+        }
+    }
+    // Every kernel shape was exercised.
+    for ([_]usize{ 4, 8, 12, 16 }) |r| try std.testing.expect(seen[r]);
 }
 
 test "bucket table equals bucketIndex for every piece count and bucket count" {
@@ -5895,7 +6496,7 @@ test "VEC16-wide accumulator and activation kernels equal their scalar definitio
                     try std.testing.expectEqual(b, bchild[i]);
                 }
             }
-            // Activation: split and combined pairwise products, clamp edges forced.
+            // Activation: pairwise products of a wrapped half sum, clamp edges forced.
             if (h % 2 == 0) {
                 var ha: [MAX_HIDDEN]i16 align(64) = undefined;
                 var ta: [MAX_HIDDEN]i16 align(64) = undefined;
@@ -5904,7 +6505,6 @@ test "VEC16-wide accumulator and activation kernels equal their scalar definitio
                     ha[i] = if (testRand(&rng) % 4 == 0) edge[testRand(&rng) % 8] else @intCast(@as(i32, @intCast(testRand(&rng) % 700)) - 200);
                     ta[i] = if (testRand(&rng) % 4 == 0) edge[testRand(&rng) % 8] else @intCast(@as(i32, @intCast(testRand(&rng) % 500)) - 250);
                 }
-                var out_split: [MAX_HIDDEN]u8 = undefined;
                 var out_comb: [MAX_HIDDEN]u8 = undefined;
                 var comb: [MAX_HIDDEN]i16 = undefined;
                 for (0..h) |i| comb[i] = ha[i] +% ta[i];
@@ -5912,13 +6512,11 @@ test "VEC16-wide accumulator and activation kernels equal their scalar definitio
                 // @min narrow the clamp's result type inside the inline kernel).
                 var qa: i32 = 255;
                 _ = &qa;
-                fillPairwiseU8Split(out_split[0 .. h / 2], ha[0..h], ta[0..h], qa);
                 fillPairwiseU8(out_comb[0 .. h / 2], comb[0..h], qa);
                 for (0..h / 2) |i| {
                     const a: i32 = std.math.clamp(@as(i32, comb[i]), 0, 255);
                     const b: i32 = std.math.clamp(@as(i32, comb[i + h / 2]), 0, 255);
                     const want: u8 = @intCast((a * b) >> 8);
-                    try std.testing.expectEqual(want, out_split[i]);
                     try std.testing.expectEqual(want, out_comb[i]);
                 }
             }

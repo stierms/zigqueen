@@ -4,7 +4,7 @@
 wins, a speed pass, a retune of the pruning constants and a continuation of
 the network's head with quantization-aware training. On the anchored
 gauntlet it lands at ~3672 against ~3644 for 6.1.0; method, per-opponent
-results and caveats in [STRENGTH.md](STRENGTH.md).
+results and caveats in [STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/STRENGTH.md).
 
 ## Search
 

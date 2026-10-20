@@ -82,8 +82,10 @@ pub fn scoreMoves(
     const counter_raw: u32 = if (countermove) |m| @as(u16, @bitCast(m)) else NO_MOVE_SENTINEL;
     const stm = pos.side_to_move;
     const quiet_rows = history.quietPlane(stm);
+    // The node's pins for capture SEE, taken at the first capture.
+    var see_pins: ?see.Pins = null;
     for (list.slice(), 0..) |mv, idx| {
-        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows, attacked);
+        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows, attacked, &see_pins);
         scores[idx] = scored.score;
         if (capture_see_scores) |see_scores| see_scores[idx] = scored.capture_see;
     }
@@ -96,6 +98,7 @@ pub fn scoreTacticalMoves(
     scores: *[move_mod.MAX_MOVES]i32,
     capture_see_scores: *[move_mod.MAX_MOVES]i32,
 ) void {
+    var see_pins: ?see.Pins = null;
     for (list.slice(), 0..) |mv, idx| {
         if (tt_move) |candidate| {
             if (candidate == mv) {
@@ -116,7 +119,7 @@ pub fn scoreTacticalMoves(
         const moving_type = moving_piece.pieceType();
         const captured_piece = capturedPiece(pos, mv, moving_piece);
         const tactical_score = 16 * piece_values.value(captured_piece.pieceType()) - piece_values.value(moving_type);
-        const see_score = see.captureScore(pos, mv);
+        const see_score = see.captureScoreWith(pos, mv, see.lazyPins(&see_pins, pos));
         capture_see_scores[idx] = see_score;
         scores[idx] = if (see_score >= 0)
             500_000 + tactical_score + @min(see_score, 1024)
@@ -150,6 +153,11 @@ inline fn bestScoredIndex(scores: *const [move_mod.MAX_MOVES]i32, start: usize, 
     const W = 8;
     const V = @Vector(W, i32);
     const LANE: V = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+
+    // Lists of at most W moves (most of qsearch's) take one masked chunk: no
+    // scalar loop with a data-dependent branch per element and a variable
+    // exit.
+    if (count <= W) return bestScoredIndexSmall(scores, start, count);
 
     var index = start;
     var best_index = start;
@@ -210,6 +218,27 @@ inline fn bestScoredIndex(scores: *const [move_mod.MAX_MOVES]i32, start: usize, 
     return best_index;
 }
 
+/// `bestScoredIndex` for `start < count <= 8`: the first chunk of `scores`,
+/// the lanes outside `[start, count)` masked off before they are compared
+/// (slots past `count` hold no score; only their masked-off lanes read them).
+/// The maximum's lowest lane is the first index of the maximum: the scalar
+/// answer.
+inline fn bestScoredIndexSmall(scores: *const [move_mod.MAX_MOVES]i32, start: usize, count: usize) usize {
+    const W = 8;
+    const V = @Vector(W, i32);
+    const U = @Vector(W, u32);
+    const LANE: U = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    std.debug.assert(start < count and count <= W);
+
+    // start <= lane < count, as one unsigned compare.
+    const live = (LANE -% @as(U, @splat(@intCast(start)))) < @as(U, @splat(@intCast(count - start)));
+    const chunk: V = scores[0..W].*;
+    const values = @select(i32, live, chunk, @as(V, @splat(std.math.minInt(i32))));
+    const best_score = @reduce(.Max, values);
+    const at_best = @select(bool, live, values == @as(V, @splat(best_score)), @as(@Vector(W, bool), @splat(false)));
+    return @reduce(.Min, @select(u32, at_best, LANE, @as(U, @splat(std.math.maxInt(u32)))));
+}
+
 pub fn pickNext(
     list: *move_mod.MoveList,
     scores: *[move_mod.MAX_MOVES]i32,
@@ -220,23 +249,23 @@ pub fn pickNext(
 
     const best_index = bestScoredIndex(scores, start_index, list.count);
 
-    if (best_index != start_index) {
-        const best_move = list.moves[best_index];
-        list.moves[best_index] = list.moves[start_index];
-        list.moves[start_index] = best_move;
+    // Unconditional swap (a self-swap when the best is already in place): the
+    // in-place test was a data-dependent branch on every pick.
+    const best_move = list.moves[best_index];
+    list.moves[best_index] = list.moves[start_index];
+    list.moves[start_index] = best_move;
 
-        const best_score_value = scores[best_index];
-        scores[best_index] = scores[start_index];
-        scores[start_index] = best_score_value;
+    const best_score_value = scores[best_index];
+    scores[best_index] = scores[start_index];
+    scores[start_index] = best_score_value;
 
-        if (capture_see_scores) |see_scores| {
-            const best_see_score = see_scores[best_index];
-            see_scores[best_index] = see_scores[start_index];
-            see_scores[start_index] = best_see_score;
-        }
+    if (capture_see_scores) |see_scores| {
+        const best_see_score = see_scores[best_index];
+        see_scores[best_index] = see_scores[start_index];
+        see_scores[start_index] = best_see_score;
     }
 
-    return list.moves[start_index];
+    return best_move;
 }
 
 const ScoredMove = struct {
@@ -255,6 +284,7 @@ inline fn scoreMove(
     quiet_rows: *const [4][6][64]i16,
     cont_rows: *const history_mod.ContRows,
     attacked: u64,
+    see_pins: *?see.Pins,
 ) ScoredMove {
     // Move equality on the packed(u16) Move is bit equality, so the raw-vs-raw
     // compares below are identical to the previous `?Move` unwrap + `==`.
@@ -272,7 +302,7 @@ inline fn scoreMove(
         const moving_type = moving_piece.pieceType();
         const captured_piece = capturedPiece(pos, mv, moving_piece);
         const tactical_score = 16 * piece_values.value(captured_piece.pieceType()) - piece_values.value(moving_type);
-        const see_score = see.captureScore(pos, mv);
+        const see_score = see.captureScoreWith(pos, mv, see.lazyPins(see_pins, pos));
         if (see_score >= 0) {
             return .{ .score = 500_000 + tactical_score + @min(see_score, 1024), .capture_see = see_score };
         }
@@ -287,7 +317,7 @@ inline fn scoreMove(
     std.debug.assert(moving_piece.color().? == stm);
     const bucket = history_mod.quietBucket(attacked, mv);
     const quiet_row: *const [64]i16 = &quiet_rows[bucket][@intFromEnum(moving_piece.pieceType())];
-    const history_score: i32 = quiet_row[mv.to.index()];
+    const history_score: i32 = quiet_row[@intFromEnum(mv.to)];
     if (mv_raw == counter_raw) return .{ .score = COUNTERMOVE_SCORE + @divTrunc(@max(history_score, 0), 4) };
     // Plain quiet: main history + continuation history. The combined magnitude
     // stays well under the bad-capture floor, so quiets keep their ordering tier.

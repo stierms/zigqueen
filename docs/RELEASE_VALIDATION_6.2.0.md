@@ -44,4 +44,4 @@ tool defaults. No search or evaluation change was made after the gauntlets.
   checks the replay, not the upstream teacher labels.
 
 `SHA256SUMS` covers the six zips, two APKs and the data archive. Match
-results are in [STRENGTH.md](STRENGTH.md).
+results are in [STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/STRENGTH.md).

@@ -133,10 +133,17 @@ pub const TranspositionTable = struct {
     pub inline fn lookup(self: *const TranspositionTable, key: u64) ?Entry {
         if (self.entries.len == 0) return null;
         const cluster = &self.entries[index(self.mask, key)];
-        for (&cluster.entries) |*entry| {
-            if (entry.key == key and entry.depth >= 0) return entry.*;
-        }
-        return null;
+        // Both slots tested without a branch per slot (the key compares wait on
+        // the cluster's cache miss, so a per-slot branch resolves late), then
+        // the first match is selected: the same entry the slot-order scan
+        // returned.
+        comptime std.debug.assert(CLUSTER_SIZE == 2);
+        const first = &cluster.entries[0];
+        const second = &cluster.entries[1];
+        const hit_first = @intFromBool(first.key == key) & @intFromBool(first.depth >= 0);
+        const hit_second = @intFromBool(second.key == key) & @intFromBool(second.depth >= 0);
+        if (hit_first | hit_second == 0) return null;
+        return (if (hit_first != 0) first else second).*;
     }
 
     pub fn bestMove(self: *const TranspositionTable, key: u64) ?move_mod.Move {
@@ -157,31 +164,30 @@ pub const TranspositionTable = struct {
         if (self.entries.len == 0) return outcome;
 
         const cluster = &self.entries[index(self.mask, key)];
-        var replacement: *Entry = &cluster.entries[0];
-
-        for (&cluster.entries) |*entry| {
-            if (entry.key == key) {
-                if (entry.generation == self.generation and entry.depth > depth) {
-                    outcome.skipped_same_generation_deeper = true;
-                    outcome.same_key = true;
-                    outcome.victim_generation = entry.generation;
-                    outcome.victim_depth = entry.depth;
-                    outcome.victim_bound = entry.bound;
-                    outcome.victim_had_move = entry.move_bits != 0;
-                    return outcome;
-                }
-                replacement = entry;
-                break;
-            }
-            if (entry.depth < 0) {
-                replacement = entry;
-                break;
-            }
-            if (entry.generation != self.generation) {
-                if (replacement.generation == self.generation or entry.depth < replacement.depth) replacement = entry;
-            } else if (replacement.generation == self.generation and entry.depth < replacement.depth) {
-                replacement = entry;
-            }
+        // The slot-order scan as data, not branches: slot 0 when it carries
+        // `key` or is empty; else slot 1 when it carries `key`, is empty, or
+        // is the better victim (older generation first, then shallower; slot
+        // 0 on a tie). A slot carrying `key` is chosen only by that test, so
+        // the same-generation-deeper skip below sees the same entry the scan
+        // stopped at.
+        comptime std.debug.assert(CLUSTER_SIZE == 2);
+        const e0 = &cluster.entries[0];
+        const e1 = &cluster.entries[1];
+        const current0 = e0.generation == self.generation;
+        const current1 = e1.generation == self.generation;
+        const take0 = @intFromBool(e0.key == key) | @intFromBool(e0.depth < 0);
+        const older1 = @intFromBool(!current1) & (@intFromBool(current0) | @intFromBool(e1.depth < e0.depth));
+        const shallower1 = @intFromBool(current1) & @intFromBool(current0) & @intFromBool(e1.depth < e0.depth);
+        const take1 = @intFromBool(e1.key == key) | @intFromBool(e1.depth < 0) | older1 | shallower1;
+        const replacement = if (take0 == 0 and take1 != 0) e1 else e0;
+        if (replacement.key == key and replacement.generation == self.generation and replacement.depth > depth) {
+            outcome.skipped_same_generation_deeper = true;
+            outcome.same_key = true;
+            outcome.victim_generation = replacement.generation;
+            outcome.victim_depth = replacement.depth;
+            outcome.victim_bound = replacement.bound;
+            outcome.victim_had_move = replacement.move_bits != 0;
+            return outcome;
         }
 
         const victim = replacement.*;

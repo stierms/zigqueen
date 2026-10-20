@@ -16,6 +16,14 @@ pub const Options = struct {
     // Draw contempt in engine cp: in-tree draws score -contempt for the root
     // side. 0 (default) = classical draws, bit-identical to pre-contempt play.
     contempt_cp: i16 = 0,
+    // One machine-wide read-only copy of the net weights for every zigqueen
+    // process of this user that loads the same net (eval/net_share.zig).
+    // Search output is identical either way. OFF by default (operator decision
+    // 2026-10-15): our SPRTs and gauntlets run without it, since sharing only
+    // between copies of the NEW version would inflate a new-vs-old test. Turn
+    // it on where many copies of the same engine run on purpose (parallel
+    // lichess bots, self-play datagen); among foreign engines it gains nothing.
+    shared_weights: bool = false,
     eval_file_storage: [max_string_option_len]u8 = [_]u8{0} ** max_string_option_len,
     eval_file_len: usize = 0,
     syzygy_path_storage: [max_string_option_len]u8 = [_]u8{0} ** max_string_option_len,
@@ -51,6 +59,11 @@ pub const Options = struct {
         const eval_file_line = try std.fmt.bufPrint(&eval_file_buffer, "option name EvalFile type string default {s}\n", .{self.evalFilePath()});
         try sink.writeAll(eval_file_line);
 
+        try sink.writeAll(if (self.shared_weights)
+            "option name NNUE Shared Weights type check default true\n"
+        else
+            "option name NNUE Shared Weights type check default false\n");
+
         // Runtime-tunable search params are a development-only UCI surface.
         // Their defaults remain the shipped search values in both flavours.
         if (comptime build_options.tuning) {
@@ -68,41 +81,9 @@ pub const Options = struct {
     }
 
     pub fn applySetOptionLine(self: *Options, line: []const u8) ApplyOptionError!ApplyOptionResult {
-        var tokens = std.mem.tokenizeScalar(u8, line, ' ');
-        if (!std.mem.eql(u8, tokens.next() orelse return error.InvalidCommand, "setoption")) {
-            return error.InvalidCommand;
-        }
-        if (!std.mem.eql(u8, tokens.next() orelse return error.InvalidCommand, "name")) {
-            return error.InvalidCommand;
-        }
-
-        var name_buffer: [64]u8 = undefined;
-        var name_len: usize = 0;
-        var saw_value = false;
-        while (tokens.next()) |token| {
-            if (std.mem.eql(u8, token, "value")) {
-                saw_value = true;
-                break;
-            }
-            if (name_len != 0) {
-                if (name_len >= name_buffer.len) return error.InvalidOption;
-                name_buffer[name_len] = ' ';
-                name_len += 1;
-            }
-            if (name_len + token.len > name_buffer.len) return error.InvalidOption;
-            @memcpy(name_buffer[name_len..][0..token.len], token);
-            name_len += token.len;
-        }
-
-        if (name_len == 0) return error.InvalidOption;
-        const name = name_buffer[0..name_len];
-
-        // The value is everything after the `value` token, byte for byte apart
-        // from surrounding whitespace: a path may contain repeated spaces.
-        const raw_value = if (saw_value) std.mem.trim(u8, tokens.rest(), " \t\r\n") else "";
-        // `<empty>` is how UCI spells the empty string, as in our own
-        // `option name SyzygyPath type string default <empty>`.
-        const value = if (std.mem.eql(u8, raw_value, "<empty>")) "" else raw_value;
+        const option_line = try parseSetOptionLine(line);
+        const name = option_line.name();
+        const value = option_line.value;
 
         if (std.ascii.eqlIgnoreCase(name, "Hash")) {
             if (value.len == 0) return error.InvalidValue;
@@ -156,6 +137,15 @@ pub const Options = struct {
             return .applied;
         }
 
+        if (std.ascii.eqlIgnoreCase(name, "NNUE Shared Weights")) {
+            if (std.ascii.eqlIgnoreCase(value, "true")) {
+                self.shared_weights = true;
+            } else if (std.ascii.eqlIgnoreCase(value, "false")) {
+                self.shared_weights = false;
+            } else return error.InvalidValue;
+            return .applied;
+        }
+
         // Runtime-tunable search params (SPSA scaffold) -> global tunables.active.
         // The whole dispatch path is absent from the default release flavour.
         if (comptime build_options.tuning) {
@@ -191,6 +181,7 @@ pub const Options = struct {
         return .{
             .nnue_scale_percent = self.nnue_scale_percent,
             .eval_file_path = self.evalFilePath(),
+            .share_weights = self.shared_weights,
         };
     }
 
@@ -215,6 +206,77 @@ pub const ApplyOptionResult = enum {
     applied,
     ignored,
 };
+
+/// A `setoption name <id> [value <x>]` line split into the option name, its
+/// tokens joined by single spaces, and the value text. This is the one place
+/// an option name is canonicalized: `applySetOptionLine` dispatches on it, and
+/// the protocol asks it which option a line named (audit D, U-SCALE-WS: a raw
+/// substring test missed `NNUE  Scale  Percent` with doubled spaces).
+pub const SetOptionLine = struct {
+    name_buffer: [64]u8 = undefined,
+    name_len: usize = 0,
+    value: []const u8 = "",
+
+    pub fn name(self: *const SetOptionLine) []const u8 {
+        return self.name_buffer[0..self.name_len];
+    }
+
+    /// Whether the line names `option`, matched as `applySetOptionLine` matches it.
+    pub fn names(self: *const SetOptionLine, option: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(self.name(), option);
+    }
+};
+
+pub fn parseSetOptionLine(line: []const u8) ApplyOptionError!SetOptionLine {
+    var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    if (!std.mem.eql(u8, tokens.next() orelse return error.InvalidCommand, "setoption")) {
+        return error.InvalidCommand;
+    }
+    if (!std.mem.eql(u8, tokens.next() orelse return error.InvalidCommand, "name")) {
+        return error.InvalidCommand;
+    }
+
+    var parsed = SetOptionLine{};
+    var saw_value = false;
+    while (tokens.next()) |token| {
+        if (std.mem.eql(u8, token, "value")) {
+            saw_value = true;
+            break;
+        }
+        if (parsed.name_len != 0) {
+            if (parsed.name_len >= parsed.name_buffer.len) return error.InvalidOption;
+            parsed.name_buffer[parsed.name_len] = ' ';
+            parsed.name_len += 1;
+        }
+        if (parsed.name_len + token.len > parsed.name_buffer.len) return error.InvalidOption;
+        @memcpy(parsed.name_buffer[parsed.name_len..][0..token.len], token);
+        parsed.name_len += token.len;
+    }
+
+    if (parsed.name_len == 0) return error.InvalidOption;
+
+    // The value is everything after the `value` token, byte for byte apart
+    // from surrounding whitespace: a path may contain repeated spaces.
+    const raw_value = if (saw_value) std.mem.trim(u8, tokens.rest(), " \t\r\n") else "";
+    // `<empty>` is how UCI spells the empty string, as in our own
+    // `option name SyzygyPath type string default <empty>`.
+    parsed.value = if (std.mem.eql(u8, raw_value, "<empty>")) "" else raw_value;
+    return parsed;
+}
+
+test "setoption names are canonicalized whatever the token spacing" {
+    const parsed = try parseSetOptionLine("setoption  name  NNUE   Scale  Percent   value  44 ");
+    try std.testing.expectEqualStrings("NNUE Scale Percent", parsed.name());
+    try std.testing.expect(parsed.names("nnue scale percent"));
+    try std.testing.expectEqualStrings("44", parsed.value);
+    const bare = try parseSetOptionLine("setoption name Clear Hash");
+    try std.testing.expect(bare.names("Clear Hash"));
+    try std.testing.expectEqualStrings("", bare.value);
+    try std.testing.expectError(error.InvalidOption, parseSetOptionLine("setoption name value 1"));
+    var options = Options{};
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption  name NNUE  Scale Percent value 75"));
+    try std.testing.expectEqual(@as(u16, 75), options.nnue_scale_percent);
+}
 
 pub const ApplyOptionError = error{
     InvalidCommand,
@@ -284,6 +346,19 @@ test "setoption updates EvalFile and builtin sentinel" {
     try std.testing.expectEqualStrings("/tmp/model.zqnnue", options.evalFilePath());
     try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name EvalFile value <builtin>"));
     try std.testing.expectEqualStrings(eval_backend.builtin_eval_file, options.evalFilePath());
+}
+
+test "setoption toggles NNUE Shared Weights (default off)" {
+    var options = Options{};
+    try std.testing.expect(!options.shared_weights);
+    try std.testing.expect(!options.evalOptions().share_weights);
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name nnue shared weights value TRUE"));
+    try std.testing.expect(options.shared_weights);
+    try std.testing.expect(options.evalOptions().share_weights);
+    try std.testing.expectError(error.InvalidValue, options.applySetOptionLine("setoption name NNUE Shared Weights value 0"));
+    try std.testing.expect(options.shared_weights);
+    try std.testing.expectEqual(ApplyOptionResult.applied, try options.applySetOptionLine("setoption name NNUE Shared Weights value false"));
+    try std.testing.expect(!options.shared_weights);
 }
 
 test "tuning setoption dispatch follows the build flavour" {

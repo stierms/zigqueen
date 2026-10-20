@@ -259,6 +259,8 @@ fn parseLine(line: []const u8) ?Parsed {
     const score_text = it.next() orelse return null;
     const result_text = it.next() orelse return null;
     const pos = fen.parse(fen_text) catch return null;
+    // Skipped like a malformed row (Position.hasBackRankPawn).
+    if (pos.hasBackRankPawn()) return null;
     const score = std.fmt.parseInt(i32, std.mem.trim(u8, score_text, " "), 10) catch return null;
     return .{ .pos = pos, .old_score = score, .result = result_text };
 }
@@ -293,4 +295,6 @@ test "relabel parses a datagen line" {
 test "relabel rejects malformed lines" {
     try std.testing.expect(parseLine("garbage") == null);
     try std.testing.expect(parseLine("4k3/8/8/4P3/8/8/8/4K3 w - - 0 20 | notanumber | 1.0") == null);
+    // A pawn on rank 1 or 8 (E-BACKRANK-PAWN) is skipped the same way.
+    try std.testing.expect(parseLine("r3k3/8/8/8/8/8/1n6/P3K2R w - - 0 20 | 123 | 1.0") == null);
 }

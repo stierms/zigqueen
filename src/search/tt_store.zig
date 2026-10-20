@@ -1,6 +1,7 @@
 const std = @import("std");
 const context_mod = @import("context.zig");
 const move_mod = @import("../core/move.zig");
+const score_mod = @import("score.zig");
 const tt = @import("tt.zig");
 const types = @import("../core/types.zig");
 
@@ -31,8 +32,10 @@ pub inline fn storeWindowResult(
     mv: ?move_mod.Move,
     static_eval: i16,
     was_pv: bool,
+    ply: usize,
 ) void {
-    noteStore(ctx, table.storeWithOutcome(key, depth, score, boundForWindow(alpha_orig, beta, score), mv, static_eval, was_pv));
+    // The bound is decided in the caller's frame; the stored score is the TT's (score.toTt).
+    noteStore(ctx, table.storeWithOutcome(key, depth, score_mod.toTt(score, ply), boundForWindow(alpha_orig, beta, score), mv, static_eval, was_pv));
 }
 
 pub inline fn storeLowerBound(
@@ -44,8 +47,9 @@ pub inline fn storeLowerBound(
     mv: ?move_mod.Move,
     static_eval: i16,
     was_pv: bool,
+    ply: usize,
 ) void {
-    noteStore(ctx, table.storeWithOutcome(key, depth, beta, .lower, mv, static_eval, was_pv));
+    noteStore(ctx, table.storeWithOutcome(key, depth, score_mod.toTt(beta, ply), .lower, mv, static_eval, was_pv));
 }
 
 test "boundForWindow classifies upper exact and lower results" {
@@ -62,7 +66,7 @@ test "storeLowerBound publishes the proven beta score" {
 
     const key: u64 = 0x1234;
     const mv = move_mod.Move.init(.e2, .e4, .double_push);
-    storeLowerBound(null, &table, key, 3, 51, mv, tt.STATIC_EVAL_NONE, false);
+    storeLowerBound(null, &table, key, 3, 51, mv, tt.STATIC_EVAL_NONE, false, 5);
 
     const entry = table.lookup(key).?;
     try std.testing.expectEqual(tt.Bound.lower, entry.bound);
@@ -78,9 +82,9 @@ test "storeWindowResult stores the searched score with the matching bound" {
     const upper_key: u64 = 0x2001;
     const lower_key: u64 = 0x2002;
 
-    storeWindowResult(null, &table, exact_key, 4, 20, 40, 30, null, tt.STATIC_EVAL_NONE, true);
-    storeWindowResult(null, &table, upper_key, 4, 20, 40, 10, null, tt.STATIC_EVAL_NONE, false);
-    storeWindowResult(null, &table, lower_key, 4, 20, 40, 45, null, tt.STATIC_EVAL_NONE, false);
+    storeWindowResult(null, &table, exact_key, 4, 20, 40, 30, null, tt.STATIC_EVAL_NONE, true, 3);
+    storeWindowResult(null, &table, upper_key, 4, 20, 40, 10, null, tt.STATIC_EVAL_NONE, false, 3);
+    storeWindowResult(null, &table, lower_key, 4, 20, 40, 45, null, tt.STATIC_EVAL_NONE, false, 3);
 
     try std.testing.expectEqual(tt.Bound.exact, table.lookup(exact_key).?.bound);
     try std.testing.expectEqual(@as(i32, 30), table.lookup(exact_key).?.score);

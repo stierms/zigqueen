@@ -14,6 +14,9 @@ const position = @import("../core/position.zig");
 const move_mod = @import("../core/move.zig");
 const make_unmake = @import("../movegen/make_unmake.zig");
 const search_stack = @import("../search/stack.zig");
+const score_mod = @import("../search/score.zig");
+const net_share = @import("net_share.zig");
+const shared_blob = @import("../util/shared_blob.zig");
 
 pub const builtin_eval_file = "<builtin>";
 
@@ -86,6 +89,11 @@ pub const Options = struct {
     /// inference); the CLI passes true whenever a scale was given, so a scale equal to
     /// the default still pins a ZQBA net (B3 review finding 4).
     scale_explicit: ?bool = null,
+    /// Map the loaded net's weights from one machine-wide read-only copy
+    /// shared with every other zigqueen process of this user that loaded the
+    /// same bytes (net_share.zig). Off by default; the UCI engine turns it on
+    /// only through the option `NNUE Shared Weights` (default off).
+    share_weights: bool = false,
 
     fn explicitScale(self: Options) bool {
         return self.scale_explicit orelse (self.nnue_scale_percent != builtin_nnue_scale_percent);
@@ -119,6 +127,12 @@ pub const EngineState = struct {
     owned_net: ?*nnue768.Net = null,
     /// Owned path of a file-loaded net; null when using the embedded default.
     net_path: ?[]u8 = null,
+    /// Whether loads publish/attach the weights to a shared blob.
+    share_weights: bool = false,
+    /// How the owned net's weights are held (shared or private, and why).
+    weights: net_share.Status = .{},
+    /// Shared-blob namespace (tests use their own; the engine the default).
+    share_config: shared_blob.Config = .{},
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !EngineState {
         var state = EngineState{
@@ -126,6 +140,7 @@ pub const EngineState = struct {
             .nnue_scale_percent = options.nnue_scale_percent,
             // An explicit caller-supplied scale must survive the load-time adoption below.
             .scale_explicit = options.explicitScale(),
+            .share_weights = options.share_weights,
         };
         errdefer state.deinit();
         try state.loadModelFile(options.eval_file_path orelse builtin_eval_file);
@@ -180,9 +195,13 @@ pub const EngineState = struct {
         if (trimmed.len == 0 or std.mem.eql(u8, trimmed, builtin_eval_file)) {
             const net = try nnue768.loadDefault(self.allocator);
             errdefer net.destroy(self.allocator);
+            // Share before the previous net goes: reloading the same bytes
+            // attaches to the blob this process already holds.
+            const weights = self.shareLoaded(net);
             self.unload();
             self.net = net;
             self.owned_net = net;
+            self.weights = weights;
             self.adoptNetScale();
             return;
         }
@@ -191,11 +210,21 @@ pub const EngineState = struct {
         errdefer net.destroy(self.allocator);
         const stored_path = try self.allocator.dupe(u8, trimmed);
         errdefer self.allocator.free(stored_path);
+        const weights = self.shareLoaded(net);
         self.unload();
         self.net = net;
         self.owned_net = net;
         self.net_path = stored_path;
+        self.weights = weights;
         self.adoptNetScale();
+    }
+
+    /// Move a freshly loaded net's weights into the shared blob when enabled.
+    /// Infallible: on any failure the private weights stay and the status
+    /// says why.
+    fn shareLoaded(self: *const EngineState, net: *nnue768.Net) net_share.Status {
+        if (!self.share_weights) return .{};
+        return net_share.share(net, self.allocator, self.share_config);
     }
 
     pub fn evalFilePath(self: *const EngineState) []const u8 {
@@ -260,7 +289,9 @@ pub const EngineState = struct {
     /// bit-identical to the eager path's, just computed only on the paths that
     /// actually evaluate. The common single-pending case touches no scratch board
     /// at all: `pos` is already the board applyMove needs.
-    fn ensureMaterialized(self: *const EngineState, stack: *search_stack.SearchStack, ply: usize, pos: *const position.Position, finny: *nnue768.FinnyTable, ft: *nnue768.FullThreatState) void {
+    /// noinline: kept out of `evaluate` (layout: inlined, the materialization
+    /// body made evaluate ~27 KB and cost front-end time, speed loop r3).
+    noinline fn ensureMaterialized(self: *const EngineState, stack: *search_stack.SearchStack, ply: usize, pos: *const position.Position, finny: *nnue768.FinnyTable, ft: *nnue768.FullThreatState) void {
         const net = self.net orelse return;
         // The contiguous clean prefix is tracked, not rediscovered: `ply <=
         // clean_depth` means this entry is already this ply's accumulator, and
@@ -313,8 +344,10 @@ pub const EngineState = struct {
                     // that showed as ~2% of total cycles across the two sites).
                     var chg: [nnue768.MAX_MOVE_CHANGES]nnue768.Change = undefined;
                     const nchg = nnue768.decodeMoveChanges(e.pending_mv, &parent.state, &chg);
-                    e.acc.applyMove(&parent.acc, net, e.pending_mv, &parent.state, board, finny, chg[0..nchg]);
-                    if (net.full_threats) ft.advanceMove(net, &e.acc, &parent.acc, chg[0..nchg], board);
+                    if (net.full_threats)
+                        ft.advanceMove(net, &e.acc, &parent.acc, chg[0..nchg], board, finny)
+                    else
+                        e.acc.applyMove(&parent.acc, net, e.pending_mv, &parent.state, board, finny, chg[0..nchg]);
                 },
             }
             e.acc_state = .clean;
@@ -333,7 +366,9 @@ pub const EngineState = struct {
     }
 
     /// Evaluate from the maintained accumulator at `ply` (output layer only),
-    /// materializing any deferred updates first.
+    /// materializing any deferred updates first. The search's raw evaluation:
+    /// clamped below the tablebase band at any NNUE scale
+    /// (score.ORDINARY_SCORE_LIMIT).
     pub fn evaluate(self: *const EngineState, stack: *search_stack.SearchStack, ply: usize, pos: *const position.Position, finny: *nnue768.FinnyTable, ft: *nnue768.FullThreatState) align(64) i32 { // align(64): pins hot entry placement (layout stability, not call speed)
         const net = self.net orelse return 0;
         self.ensureMaterialized(stack, ply, pos, finny, ft);
@@ -345,7 +380,7 @@ pub const EngineState = struct {
             const inc = nnue768.evaluateFull9Incremental(net, &stack.entry(ply).acc, pos, self.nnue_scale_percent);
             if (builtin.mode == .Debug and verify_threats_incremental)
                 std.debug.assert(inc == nnue768.evaluate(net, pos, self.nnue_scale_percent));
-            return inc;
+            return score_mod.clampOrdinary(inc);
         }
         // ZQB5 threats: the accumulator is maintained incrementally (HalfKA + threats via
         // applyMove), so eval is just the readout + PSQT — no per-node copy or row-adds.
@@ -354,9 +389,9 @@ pub const EngineState = struct {
             const inc = nnue768.evaluateThreatsIncremental(net, &stack.entry(ply).acc, pos, self.nnue_scale_percent);
             if (builtin.mode == .Debug and verify_threats_incremental)
                 std.debug.assert(inc == nnue768.evaluate(net, pos, self.nnue_scale_percent));
-            return inc;
+            return score_mod.clampOrdinary(inc);
         }
-        return nnue768.evaluateAcc(net, &stack.entry(ply).acc, pos.side_to_move, @popCount(pos.occupancy()), self.nnue_scale_percent);
+        return score_mod.clampOrdinary(nnue768.evaluateAcc(net, &stack.entry(ply).acc, pos.side_to_move, @popCount(pos.occupancy()), self.nnue_scale_percent));
     }
 
     pub fn hiddenSize(self: *const EngineState) usize {
@@ -379,6 +414,7 @@ pub const EngineState = struct {
         }
         self.net = null;
         self.owned_net = null;
+        self.weights = .{};
         if (self.net_path) |p| {
             self.allocator.free(p);
             self.net_path = null;
@@ -425,6 +461,39 @@ test "nnue scale percent rescales the evaluation magnitude" {
     var state = try EngineState.init(std.testing.allocator, .{});
     defer state.deinit();
     try std.testing.expect(nnue768.evaluate(state.net.?, &up_queen, 100) > nnue768.evaluate(state.net.?, &up_queen, 50));
+}
+
+test "search evaluations stay below the tablebase band at NNUE Scale Percent 360" {
+    // Review round (S-TB-PLY, Astra judge A finding 4): at scale 360 this legal
+    // five-queen position evaluated to 27,396, inside the tablebase band.
+    const fen = @import("../core/fen.zig");
+    const a = std.testing.allocator;
+    var state = try EngineState.init(a, .{});
+    defer state.deinit();
+    state.setNnueScalePercent(360);
+    const stack = try a.create(search_stack.SearchStack);
+    defer a.destroy(stack);
+    const finny = try a.create(nnue768.FinnyTable);
+    defer a.destroy(finny);
+    const ft = try a.create(nnue768.FullThreatState);
+    defer a.destroy(ft);
+    // Both signs: the witness with the queens to move (27,396), and with a
+    // sixth queen and the bare king to move (-27,939; the witness itself
+    // gives -23,698 that way).
+    const cases = .{
+        .{ "7k/8/8/8/Q7/8/Q1Q1Q1Q1/K7 w - - 0 1", @as(i32, 1) },
+        .{ "7k/8/8/8/Q7/8/Q1Q1Q1Q1/K1Q5 b - - 0 1", @as(i32, -1) },
+    };
+    inline for (cases) |case| {
+        const pos = try fen.parse(case[0]);
+        stack.* = .{};
+        finny.* = .{};
+        ft.* = .{};
+        state.prepareRoot(stack, &pos, finny, ft);
+        const unclamped = nnue768.evaluate(state.net.?, &pos, 360);
+        try std.testing.expect(case[1] * unclamped > score_mod.ORDINARY_SCORE_LIMIT);
+        try std.testing.expectEqual(case[1] * score_mod.ORDINARY_SCORE_LIMIT, state.evaluate(stack, 0, &pos, finny, ft));
+    }
 }
 
 /// ZQB9 walk harness: drives legal-move trees through the REAL backend plumbing —
@@ -624,8 +693,10 @@ const FuzzWalker = struct {
     ft: *nnue768.FullThreatState,
     rng: u64,
     checks: u32 = 0,
-    /// Scratch for the accumulator-level check (threat halves + PSQT vs refresh).
+    /// Scratch for the accumulator-level check (combined halves + PSQT vs refresh).
     fresh: *nnue768.Accumulator,
+    /// Scratch for the split-layout check: [0] HalfKA halves, [1] threat halves.
+    split: *[2][2][nnue768.MAX_HIDDEN]i16,
 
     fn next(self: *FuzzWalker) u64 {
         self.rng = self.rng *% 6364136223846793005 +% 1442695040888963407;
@@ -638,14 +709,22 @@ const FuzzWalker = struct {
             const net = self.state.net.?;
             const inc = self.state.evaluate(self.stack, ply, pos, self.finny, self.ft);
             try std.testing.expectEqual(nnue768.evaluate(net, pos, self.state.nnue_scale_percent), inc);
-            // Stricter than the eval: the maintained threat halves and threat
-            // PSQT scalars (both perspectives, incl. flip-cache rebuilds after a
-            // d/e king crossing) equal a full refresh lane for lane.
+            // Stricter than the eval: the maintained combined halves and threat
+            // PSQT scalars (both perspectives, incl. finny bucket crossings and
+            // flip-cache rebuilds after a d/e king crossing) equal a full
+            // refresh lane for lane.
             const acc = &self.stack.entry(ply).acc;
             self.fresh.refresh(net, pos);
             const h = net.hidden;
-            try std.testing.expectEqualSlices(i16, self.fresh.ftw[0..h], acc.ftw[0..h]);
-            try std.testing.expectEqualSlices(i16, self.fresh.ftb[0..h], acc.ftb[0..h]);
+            try std.testing.expectEqualSlices(i16, self.fresh.white[0..h], acc.white[0..h]);
+            try std.testing.expectEqualSlices(i16, self.fresh.black[0..h], acc.black[0..h]);
+            // And against the former SPLIT layout (separate HalfKA and threat
+            // halves, built from scratch): each combined lane is their wrapping
+            // sum, the value the split eval formed in-register before clamping.
+            nnue768.splitReferenceHalves(net, pos, &self.split[0], &self.split[1]);
+            inline for (.{ &acc.white, &acc.black }, 0..) |half, pi| {
+                for (half[0..h], 0..) |v, i| try std.testing.expectEqual(self.split[0][pi][i] +% self.split[1][pi][i], v);
+            }
             try std.testing.expectEqualSlices(i64, self.fresh.psqt_tw[0..net.psqt_buckets], acc.psqt_tw[0..net.psqt_buckets]);
             try std.testing.expectEqualSlices(i64, self.fresh.psqt_tb[0..net.psqt_buckets], acc.psqt_tb[0..net.psqt_buckets]);
             self.checks += 1;
@@ -678,12 +757,14 @@ fn fuzzNet(allocator: std.mem.Allocator, blob: []const u8, games: usize, depth: 
     defer fx.deinit();
     const fresh = try allocator.create(nnue768.Accumulator);
     defer allocator.destroy(fresh);
+    const split = try allocator.create([2][2][nnue768.MAX_HIDDEN]i16);
+    defer allocator.destroy(split);
     var checks: u32 = 0;
     for (0..games) |g| {
         var pos = try fen.parse(zqba_walk_fens[g % zqba_walk_fens.len]);
         fx.stack.* = .{};
         fx.state.prepareRoot(fx.stack, &pos, fx.finny, fx.ft);
-        var w = FuzzWalker{ .state = &fx.state, .stack = fx.stack, .finny = fx.finny, .ft = fx.ft, .rng = 0x5eed_0000 + g, .fresh = fresh };
+        var w = FuzzWalker{ .state = &fx.state, .stack = fx.stack, .finny = fx.finny, .ft = fx.ft, .rng = 0x5eed_0000 + g, .fresh = fresh, .split = split };
         try w.walk(&pos, 0, depth);
         checks += w.checks;
     }
@@ -836,4 +917,79 @@ test "net ownership failed load preserves owned and borrowed states" {
         try std.testing.expectEqual(before.nnue_scale_percent, state.nnue_scale_percent);
         try std.testing.expectEqual(before.scale_explicit, state.scale_explicit);
     }
+}
+
+test "shared weights follow EvalFile changes, keep their mapping across scale changes and release on unload" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
+    const fen = @import("../core/fen.zig");
+    const allocator = std.testing.allocator;
+    var ns_buf: [64]u8 = undefined;
+    const ns = shared_blob.test_support.namespace(&ns_buf, "evalfile");
+    defer shared_blob.test_support.removeRegistry(ns);
+
+    // Two small distinct nets: a synthetic ZQB9 and a copy with its first
+    // HalfKA weight bumped (the HalfKA rows are stored untransformed).
+    const blob_a = try nnue768.buildZqb9TestBlob(allocator);
+    defer allocator.free(blob_a);
+    const private_a = try nnue768.loadFromBytes(allocator, blob_a);
+    defer private_a.destroy(allocator);
+    const blob_b = try allocator.dupe(u8, blob_a);
+    defer allocator.free(blob_b);
+    const fw_off = std.mem.indexOf(u8, blob_b, std.mem.sliceAsBytes(private_a.feature_weights[0..8])) orelse return error.TestUnexpectedResult;
+    blob_b[fw_off] +%= 1;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.zqb", .data = blob_a });
+    try tmp.dir.writeFile(.{ .sub_path = "b.zqb", .data = blob_b });
+    const path_a = try tmp.dir.realpathAlloc(allocator, "a.zqb");
+    defer allocator.free(path_a);
+    const path_b = try tmp.dir.realpathAlloc(allocator, "b.zqb");
+    defer allocator.free(path_b);
+
+    const config = shared_blob.Config{ .namespace = ns };
+    var s1 = EngineState{ .allocator = allocator, .share_weights = true, .share_config = config };
+    defer s1.deinit();
+    var s2 = EngineState{ .allocator = allocator, .share_weights = true, .share_config = config };
+    defer s2.deinit();
+
+    try s1.loadModelFile(path_a);
+    try std.testing.expectEqual(net_share.Mode.created, s1.weights.mode);
+    const key_a = s1.weights.key;
+    try s2.loadModelFile(path_a);
+    try std.testing.expectEqual(net_share.Mode.attached, s2.weights.mode);
+    try std.testing.expectEqual(key_a, s2.weights.key);
+
+    // EvalFile change: a different net never attaches to A's blob.
+    try s1.loadModelFile(path_b);
+    try std.testing.expectEqual(net_share.Mode.created, s1.weights.mode);
+    try std.testing.expect(s1.weights.key != key_a);
+    // ... and back: attaches to the A blob s2 still holds.
+    try s1.loadModelFile(path_a);
+    try std.testing.expectEqual(net_share.Mode.attached, s1.weights.mode);
+    try std.testing.expectEqual(key_a, s1.weights.key);
+
+    // A scale change is applied at evaluation time: same net, same mapping.
+    const net_before = s1.net.?;
+    s1.setNnueScalePercent(57);
+    try std.testing.expectEqual(net_before, s1.net.?);
+    try std.testing.expectEqual(net_share.Mode.attached, s1.weights.mode);
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bq1rk1/pp2bppp/2n1pn2/3p4/2PP4/2N1PN2/PP3PPP/R2QKB1R w KQ - 0 8",
+        "8/5k2/3p4/1p1Pp2p/pP2Pp1P/P4P1K/8/8 b - - 99 50",
+    };
+    for (fens) |f| {
+        const pos = try fen.parse(f);
+        try std.testing.expectEqual(nnue768.evaluate(private_a, &pos, 57), nnue768.evaluate(s1.net.?, &pos, 57));
+        try std.testing.expectEqual(nnue768.evaluate(private_a, &pos, 44), nnue768.evaluate(s2.net.?, &pos, 44));
+    }
+
+    // Sharing switched off: the next load is private and drops its record.
+    s2.share_weights = false;
+    try s2.loadModelFile(path_a);
+    try std.testing.expectEqual(net_share.Mode.private, s2.weights.mode);
+    try std.testing.expectEqualStrings("disabled", s2.weights.reason);
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(@as(usize, 1), shared_blob.test_support.recordCount(ns));
+    s1.deinit();
+    try std.testing.expectEqual(@as(usize, 0), shared_blob.test_support.recordCount(ns));
 }

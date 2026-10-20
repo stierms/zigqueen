@@ -156,12 +156,12 @@ pub const BISHOP_ATTACKS = attack_tables.BISHOP_ATTACKS;
 pub const ROOK_ATTACKS = attack_tables.ROOK_ATTACKS;
 
 pub inline fn bishopAttacks(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
-    const entry = BISHOP_MAGICS[sq.index()];
+    const entry = BISHOP_MAGICS[@intFromEnum(sq)];
     return BISHOP_ATTACKS[@as(usize, entry.offset) + magicIndex(entry, occupied)];
 }
 
 pub inline fn rookAttacks(sq: square.Square, occupied: bitboard.Bitboard) bitboard.Bitboard {
-    const entry = ROOK_MAGICS[sq.index()];
+    const entry = ROOK_MAGICS[@intFromEnum(sq)];
     return ROOK_ATTACKS[@as(usize, entry.offset) + magicIndex(entry, occupied)];
 }
 

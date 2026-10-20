@@ -66,11 +66,17 @@ pub const SearchDiagnostics = struct {
     /// The legal root set remains protected; published scores use that oracle.
     /// Compiled out with other search diagnostics; preserves the production ABI.
     root_tb_conflicts: if (build_options.search_stats) u32 else void = if (build_options.search_stats) 0 else {},
+    /// TM v2 C1: an interrupted iteration supplied the played move (a
+    /// challenger proven against the previous iteration's best move).
+    interrupted_challenger: bool = false,
 };
 
 pub const SearchResult = struct {
     best_move: ?move_mod.Move = null,
     score: i32 = 0,
+    /// `.lower` when the result comes from an interrupted iteration: the root
+    /// value is at least `score` at `depth`, other moves were not all searched.
+    score_bound: search_info.ScoreBound = .exact,
     depth: u16 = 0,
     seldepth: u16 = 0,
     nodes: u64 = 0,
@@ -104,10 +110,12 @@ pub const Engine = struct {
     /// 1024-wide net, too large for the call stack (overflows smaller worker /
     /// test threads), so it lives on the heap and is reset per search.
     ctx: *context_mod.SearchContext = undefined,
-    /// How `ctx` is backed. The context is ~2.4 MB (128 plies of ~18.5 KB
-    /// stack entries, each spanning five 4 KB pages), touched at random plies
-    /// by every accumulator materialization; hugealloc maps it on 2 MB pages
-    /// where the OS grants them. Frees go through hugealloc with this.
+    /// How `ctx` is backed. The context is ~1.8 MB since the combined
+    /// accumulator (128 plies of stack entries, each spanning several 4 KB
+    /// pages), touched at random plies by every accumulator materialization;
+    /// hugealloc maps it on one whole 2 MB page where the OS grants it (below
+    /// 2 MB the plain ladder would leave it on 4 KB heap pages). Frees go
+    /// through hugealloc with this.
     ctx_method: hugealloc.Method = .heap,
     record_static_search_outcomes: bool = false,
     record_move_order_outcomes: bool = false,
@@ -179,7 +187,7 @@ pub const Engine = struct {
         // learned from window-pinned bounds; see the A3 diagnosis.
         if (comptime build_options.correction_history) try history.initCorrection(allocator);
         errdefer if (comptime build_options.correction_history) history.deinitCorrection(allocator);
-        const ctx_backed = try hugealloc.alloc(context_mod.SearchContext, allocator, 1);
+        const ctx_backed = try hugealloc.allocWholePages(context_mod.SearchContext, allocator, 1);
         errdefer hugealloc.free(context_mod.SearchContext, allocator, ctx_backed);
         const ctx = &ctx_backed.items[0];
         return .{
@@ -218,6 +226,8 @@ pub const Engine = struct {
         self.reset();
     }
 
+    /// Caller has stopped every search (no Job is live), so the replaced
+    /// tables are freed here, on the caller's thread.
     pub fn setSyzygyPath(self: *Engine, path: []const u8) bool {
         // TB availability changes what searches return -> cached scores stale.
         self.reset();
@@ -225,11 +235,7 @@ pub const Engine = struct {
             syzygy.disable();
             return true;
         }
-        var buf: [520]u8 = undefined;
-        if (path.len >= buf.len) return false;
-        @memcpy(buf[0..path.len], path);
-        buf[path.len] = 0;
-        return syzygy.init(buf[0..path.len :0]);
+        return syzygy.init(path);
     }
 
     pub fn setContempt(self: *Engine, contempt_cp: types.Score) void {
@@ -276,10 +282,7 @@ pub const Engine = struct {
         errdefer new_tt.deinit();
         var new_hint = try factory.create(rfp_hint_mod.HintTable, self.rfp_hint.allocator, hint_mb);
         errdefer new_hint.deinit();
-        var new_eval = try factory.create(eval_cache_mod.EvalCache, self.eval_cache.allocator, eval_mb);
-        // resize previously preserved runtime associativity and did not re-read
-        // stats-build environment overrides. Keep that contract here as well.
-        new_eval.assoc = self.eval_cache.assoc;
+        const new_eval = try factory.create(eval_cache_mod.EvalCache, self.eval_cache.allocator, eval_mb);
 
         self.tt.deinit();
         self.rfp_hint.deinit();
@@ -419,30 +422,31 @@ pub const Engine = struct {
         var root_policy: ?syzygy.RootPolicy = if (helper or limits.node_limit == 0 or fallback == null or stop_flag.load(.acquire))
             null
         else
-            tablebase_job.probeRootMoves(&working, root_moves);
+            tablebase_job.probeRootMoves(&working, root_moves, &ctx.repetition);
         const safe_root_moves = if (root_policy) |*p| &p.moves else root_moves;
-        const root_wdl = if (root_policy) |p| p.wdl else if (helper) execution.job.root_wdl else null;
+        // Only a proven outcome replaces searched scores (here, in the
+        // fallback, interrupted results, info lines and helpers); a ranked
+        // but unproven win leaves the score to the search (U-TB-DTZ100).
+        const root_wdl = if (root_policy) |*p| p.authoritativeWdl() else if (helper) execution.job.root_wdl else null;
         if (root_policy) |*p| {
             fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock), &p.moves);
             best.best_move = fallback;
-            best.score = syzygy.wdlScore(p.wdl, 0);
-            if (p.wdl == .win) {
-                if (matchLegalMove(&working, p.suggested)) |mv| {
-                    if (rootMoveAllowed(&p.moves, mv)) {
-                        if (comptime parallel) {
-                            if (!execution.job.control.count(true, execution.account)) return best;
-                            ctx.nodes = 1;
-                        }
-                        best.best_move = mv;
-                        best.score = syzygy.TB_WIN_SCORE - @as(types.Score, @intCast(@min(p.suggested.dtz, 1000)));
-                        best.depth = 1;
-                        best.seldepth = 1;
-                        best.nodes = 1;
-                        best.pv.push(mv);
-                        best.diagnostics.stats = ctx.stats;
-                        return best;
-                    }
+            if (root_wdl) |wdl| best.score = syzygy.wdlScore(wdl, 0);
+            // A certain, non-repeating win is played at once; any other TB
+            // root is searched inside its outcome-preserving move set.
+            if (p.instant) |mv| {
+                if (comptime parallel) {
+                    if (!execution.job.control.count(true, execution.account)) return best;
+                    ctx.nodes = 1;
                 }
+                best.best_move = mv;
+                best.score = syzygy.TB_WIN_SCORE - @as(types.Score, @intCast(@min(p.dtz, 1000)));
+                best.depth = 1;
+                best.seldepth = 1;
+                best.nodes = 1;
+                best.pv.push(mv);
+                best.diagnostics.stats = ctx.stats;
+                return best;
             }
         }
 
@@ -473,6 +477,24 @@ pub const Engine = struct {
         const tm_cfg = time.tmConfig();
         const tm_signals_enabled = tm_cfg.signalsEnabled();
         var best_move_streak: u32 = 0;
+        // TM v2: a forced root move gets a fraction of the soft target.
+        // C3 (graded urgency) keeps the plan's target T for every other root.
+        var c3_target_ns: ?u64 = null;
+        var c3_capped = false;
+        if (!helper and ctx.control.softMode()) {
+            if (rootMoveCount(&working, safe_root_moves) == 1) {
+                ctx.control.scaleSoftTarget(tm_cfg.v2_forced_pct);
+            } else if (tm_cfg.v2_c3) {
+                c3_target_ns = ctx.control.limits.optimum_budget_ns;
+                // Low-clock guard, decided with the plan (time.c3LowClock).
+                c3_capped = ctx.control.limits.soft == .low_clock;
+            }
+        }
+        if (!helper and tm_cfg.trace) traceSearchStart(ctx);
+        // Only stop/quit and node limits may interrupt depth 1; the clock waits
+        // for its completion, up to the hold's node budget
+        // (time.Controller.holdClockUntilFirstIteration).
+        ctx.control.holdClockUntilFirstIteration();
         var depth: u16 = 1;
         search_loop: while (depth <= max_depth) : (depth += 1) {
             if (comptime parallel) {
@@ -495,9 +517,17 @@ pub const Engine = struct {
             // instead of fabricating deeper iterations with frozen counters.
             if (shouldStopOnTablebaseDecision(ctx.control.limits, tb_decision_streak, previous_trace)) break;
 
+            // TM v2 C1 (anytime root): the incumbent is the last completed
+            // iteration's move. Each aspiration pass that finished it and kept a
+            // real score gives a verdict; an interruption plays the latest
+            // proven challenger instead of discarding the whole depth.
+            const incumbent: ?move_mod.Move = if (previous_trace != null) best.best_move else null;
+            var depth_challenger: ?ProvenChallenger = null;
+
             while (true) {
                 const reused_root_hints = if (previous_root_hints) |*hints| hints else null;
                 var iteration_timer: ?runtime.Timer = if (helper) null else runtime.Timer.start() catch null;
+                const pass_alpha = alpha;
                 iteration = root.searchDepthWindow(
                     ctx,
                     resources,
@@ -507,12 +537,23 @@ pub const Engine = struct {
                     beta,
                     reused_root_hints,
                     safe_root_moves,
+                    incumbent,
                 );
                 iteration_elapsed_ns = if (iteration_timer) |*timer|
                     @max(@as(i128, std.time.ns_per_ms), @as(i128, @intCast(timer.read())))
                 else
                     std.time.ns_per_ms;
-                if (ctx.stopped) break :search_loop;
+                switch (passVerdict(incumbent, pass_alpha, &iteration)) {
+                    .none => {},
+                    .incumbent => depth_challenger = null,
+                    .challenger => depth_challenger = .{ .move = iteration.best_move.?, .score = iteration.score },
+                }
+                if (ctx.stopped) {
+                    if (!helper) {
+                        if (depth_challenger) |challenger| adoptInterruptedChallenger(ctx, &working, table, &best, challenger, depth, root_wdl);
+                    }
+                    break :search_loop;
+                }
                 if (!shouldResearchAspiration(guess, alpha, beta, iteration.score)) break;
                 if (iteration.score <= alpha) {
                     ctx.noteAspirationFailLow();
@@ -544,6 +585,9 @@ pub const Engine = struct {
                 widenAspirationWindow(guess.?, &alpha, &beta, &delta, iteration.score);
             }
 
+            // A completed iteration: the clock is live again (U-STOP-D1),
+            // before any stop decision below.
+            ctx.control.releaseClockHold();
             best.best_move = iteration.best_move orelse fallback;
             if (root_wdl) |wdl| {
                 if (comptime build_options.search_stats) {
@@ -617,7 +661,27 @@ pub const Engine = struct {
                 best.diagnostics.soft_scale_pct = soft_policy.scale_pct;
             }
 
-            if (if (helper) null else iterationStopReasonWithPolicy(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns, soft_policy)) |reason| {
+            const iteration_stable = isStableIteration(previous_trace, current_trace);
+            // TM v2 C3: every completed iteration arms the deadline of its
+            // urgency class instead of step 2's stable-only arm.
+            const urgency: ?u32 = if (c3_target_ns) |target|
+                ctx.control.armUrgency(target, tm_cfg.v2_c3_k_pct, urgencyStreak(stable_iteration_streak), c3_capped)
+            else
+                null;
+            const soft_armed = iteration_stable or urgency != null;
+            if (!helper) ctx.control.setSoftArmed(soft_armed);
+            if (!helper and tm_cfg.trace) traceIteration(ctx, current_trace, iteration_stable, bestMoveNodePermille(&iteration.root_hints, current_trace.best_move), urgency, c3_capped);
+
+            // TM v2: no projection. A stable completed iteration arms the soft
+            // deadline (it then also fires inside the next iteration); an
+            // unstable one keeps searching until stable or the hard budget.
+            const stop_reason: ?IterationStopReason = if (helper)
+                null
+            else if (ctx.control.softMode())
+                softIterationStopReason(&ctx.control, soft_armed, ctx.control.elapsedNs())
+            else
+                iterationStopReasonWithPolicy(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns, soft_policy);
+            if (stop_reason) |reason| {
                 best.diagnostics.iteration_stop_reason = reason;
                 switch (reason) {
                     .maximum_elapsed => ctx.noteIterationStopMaximumElapsed(),
@@ -636,6 +700,13 @@ pub const Engine = struct {
             best.nodes = ctx.nodes;
             if (best.best_move) |mv| best.pv.push(mv);
         }
+        // TM v2 stops inside iterations by design: report the move's real
+        // time and nodes (single-thread; the SMP worker writes its own final
+        // line). An adopted challenger already emitted its line.
+        if (comptime !parallel) {
+            if (ctx.stopped and ctx.control.softMode() and best.depth > 0 and !best.diagnostics.interrupted_challenger) emitInterruptedFinal(ctx, table, &best);
+        }
+        if (!helper and tm_cfg.trace) traceSearchStop(ctx, &best, tm_cfg.v2);
         // Depth 64 is the engine's structural ID ceiling, not permission for
         // `go infinite` to emit bestmove. If it is ever reached, remain in the
         // search until the GUI sends `stop`.
@@ -745,31 +816,6 @@ fn widenAspirationWindow(guess: i32, alpha: *i32, beta: *i32, delta: *i32, score
     beta.* = if (capped) qsearch.INF else @min(qsearch.INF, guess + delta.*);
 }
 
-/// Find the legal move matching a Fathom root-probe verdict (from/to squares
-/// plus promotion piece). Null if no legal move matches — the caller then
-/// falls through to the normal search rather than trusting the probe.
-fn matchLegalMove(pos: *const position.Position, tbv: syzygy.RootVerdict) ?move_mod.Move {
-    var moves = move_mod.MoveList.init();
-    legal.generate(pos, &moves);
-    for (moves.slice()) |mv| {
-        if (mv.from.index() != tbv.from or mv.to.index() != tbv.to) continue;
-        const want_promo: ?piece.PieceType = switch (tbv.promo) {
-            1 => .queen,
-            2 => .rook,
-            3 => .bishop,
-            4 => .knight,
-            else => null,
-        };
-        const have_promo = mv.promotionPieceType();
-        if ((want_promo == null) != (have_promo == null)) continue;
-        if (want_promo) |wp| {
-            if (have_promo.? != wp) continue;
-        }
-        return mv;
-    }
-    return null;
-}
-
 fn rootMoveAllowed(root_moves: ?*const move_mod.MoveList, mv: move_mod.Move) bool {
     const allowed = root_moves orelse return true;
     for (allowed.slice()) |candidate| {
@@ -831,6 +877,180 @@ fn moveWouldChangeCastlingRights(pos: *const position.Position, moving_piece: pi
         .black_rook => (mv.from == .h8 and pos.castling_rights.black_king_side) or (mv.from == .a8 and pos.castling_rights.black_queen_side),
         else => false,
     };
+}
+
+/// TM v2 C3 streak: completed iterations since the best move last changed or
+/// the score jumped >= 80 cp. The legacy stable count starts at 1 there.
+fn urgencyStreak(stable_iteration_streak: u8) u32 {
+    return stable_iteration_streak -| 1;
+}
+
+/// TM v2 step 2 stop at a completed iteration: re-arm (or keep disarmed) the
+/// soft deadline from the legacy stability gate (C3: from the urgency class,
+/// always armed) and stop once an armed search has used its deadline, or the
+/// hard budget is gone.
+fn softIterationStopReason(control: *time.Controller, stable: bool, elapsed_ns: u64) ?IterationStopReason {
+    control.setSoftArmed(stable);
+    if (control.limits.maximum_budget_ns) |maximum| {
+        if (elapsed_ns >= maximum) return .maximum_elapsed;
+    }
+    if (stable) {
+        if (control.limits.optimum_budget_ns) |optimum| {
+            if (elapsed_ns >= optimum) return .optimum_elapsed;
+        }
+    }
+    return null;
+}
+
+/// Legal root moves the search may choose from (the searchmoves/TB-safe set
+/// when one applies).
+noinline fn rootMoveCount(pos: *const position.Position, allowed: ?*const move_mod.MoveList) usize {
+    if (allowed) |moves| return moves.count;
+    var moves = move_mod.MoveList.init();
+    legal.generate(pos, &moves);
+    return moves.count;
+}
+
+/// ZQ_TM_TRACE output: one `info string tm ...` line, formatted out of line
+/// so the iterative-deepening frame does not grow.
+noinline fn emitTrace(ctx: *context_mod.SearchContext, comptime fmt: []const u8, args: anytype) void {
+    const emitter = ctx.info_emitter orelse return;
+    var buffer: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, fmt, args) catch return;
+    emitter.emit(.{ .text = text });
+}
+
+noinline fn emitInterruptedFinal(ctx: *context_mod.SearchContext, table: anytype, best: *const SearchResult) void {
+    const emitter = ctx.info_emitter orelse return;
+    emitter.emit(.{ .iteration = .{
+        .depth = best.depth,
+        .seldepth = best.seldepth,
+        .score = best.score,
+        .bound = best.score_bound,
+        .nodes = ctx.nodes,
+        .time_ms = ctx.control.elapsedNs() / std.time.ns_per_ms,
+        .hashfull = table.hashfullPermille(),
+        .best_move = best.best_move,
+        .pv = best.pv.slice(),
+    } });
+}
+
+/// Why an interrupted search stopped. An armed soft deadline always fires
+/// before the hard budget (hard >= soft), so `soft` identifies it.
+fn interruptKind(ctx: *context_mod.SearchContext) []const u8 {
+    if (!ctx.stopped) return "none";
+    if (ctx.control.stop_flag.load(.acquire)) return "external";
+    if (ctx.control.limits.node_limit) |limit| {
+        if (ctx.nodes >= limit) return "node_limit";
+    }
+    return if (ctx.control.limits.soft == .armed) "soft_budget" else "maximum_budget";
+}
+
+noinline fn traceSearchStart(ctx: *context_mod.SearchContext) void {
+    const limits = ctx.control.limits;
+    // mode: legacy (ZQ_TM_V2 off), v2 (clock search with the soft deadline),
+    // v2-legacy-plan (ZQ_TM_V2 on but movetime/depth/nodes/infinite or the
+    // low-clock regime: the legacy plan applies).
+    emitTrace(ctx, "tm plan mode {s} soft_ms {d} hard_ms {d}", .{
+        if (limits.soft != .off) "v2" else if (time.tmConfig().v2) "v2-legacy-plan" else "legacy",
+        (limits.optimum_budget_ns orelse 0) / std.time.ns_per_ms,
+        (limits.maximum_budget_ns orelse 0) / std.time.ns_per_ms,
+    });
+}
+
+noinline fn traceIteration(ctx: *context_mod.SearchContext, trace: IterationTrace, stable: bool, effort_permille: ?u32, urgency_permille: ?u32, c3_capped: bool) void {
+    var move_text: [8]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&move_text);
+    if (trace.best_move) |mv| mv.writeUci(&writer) catch {} else writer.writeAll("none") catch {};
+    const fmt = "tm iter depth {d} time_ms {d} nodes {d} score {d} best {s} stable {d} effort_permille {d} soft {s}";
+    const args = .{
+        trace.depth,
+        ctx.control.elapsedNs() / std.time.ns_per_ms,
+        trace.nodes,
+        trace.score,
+        writer.buffered(),
+        @intFromBool(stable),
+        effort_permille orelse 0,
+        @tagName(ctx.control.limits.soft),
+    };
+    // TM v2 C3: the urgency class, the deadline it armed, and the low-clock cap.
+    if (urgency_permille) |u| {
+        emitTrace(ctx, fmt ++ " u {d} soft_ms {d} cap {d}", args ++ .{ u, (ctx.control.limits.optimum_budget_ns orelse 0) / std.time.ns_per_ms, @intFromBool(c3_capped) });
+    } else {
+        emitTrace(ctx, fmt, args);
+    }
+}
+
+noinline fn traceSearchStop(ctx: *context_mod.SearchContext, best: *const SearchResult, v2_enabled: bool) void {
+    emitTrace(ctx, "tm stop time_ms {d} depth {d} interrupted {d} interrupt {s} v2 {d} soft {s} reason {s} adopted {d}", .{
+        ctx.control.elapsedNs() / std.time.ns_per_ms,
+        best.depth,
+        @intFromBool(ctx.stopped),
+        interruptKind(ctx),
+        @intFromBool(v2_enabled),
+        @tagName(ctx.control.limits.soft),
+        if (best.diagnostics.iteration_stop_reason) |reason| @tagName(reason) else "none",
+        @intFromBool(best.diagnostics.interrupted_challenger),
+    });
+}
+
+/// TM v2 C1: a move proven at the current depth to score strictly above the
+/// incumbent's result there (exact or fail-high), from a pass that may later
+/// be interrupted.
+const ProvenChallenger = struct {
+    move: move_mod.Move,
+    score: types.Score,
+};
+
+const PassVerdict = enum { none, incumbent, challenger };
+
+/// What one aspiration pass (complete or interrupted) proves about the
+/// incumbent. Only a pass that finished the incumbent and whose best score
+/// beat its lower window bound is evidence: then its best move is at least as
+/// good as every move it finished, the incumbent included. A fail-low pass
+/// only bounds the moves from above and proves nothing.
+fn passVerdict(incumbent: ?move_mod.Move, pass_alpha: types.Score, pass: *const root.IterationResult) PassVerdict {
+    const incumbent_move = incumbent orelse return .none;
+    if (!pass.incumbent_completed) return .none;
+    const pass_best = pass.best_move orelse return .none;
+    if (pass.score <= pass_alpha) return .none;
+    return if (pass_best == incumbent_move) .incumbent else .challenger;
+}
+
+/// Plays a proven challenger from an interrupted iteration: the root value is
+/// at least its score at `depth` (a lowerbound unless the root is TB-scored).
+/// Kept out of line so the iterative-deepening frame does not grow.
+noinline fn adoptInterruptedChallenger(
+    ctx: *context_mod.SearchContext,
+    working: *position.Position,
+    table: anytype,
+    best: *SearchResult,
+    challenger: ProvenChallenger,
+    depth: u16,
+    root_wdl: ?syzygy.Wdl,
+) void {
+    best.best_move = challenger.move;
+    best.score = if (root_wdl) |wdl| rootOutcomeScore(wdl, challenger.score) else challenger.score;
+    best.score_bound = if (root_wdl == null) .lower else .exact;
+    best.depth = depth;
+    best.seldepth = ctx.seldepth;
+    best.nodes = ctx.nodes;
+    pv.reconstructFromRootMoveLimited(working, &ctx.repetition, table, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
+    best.diagnostics.interrupted_challenger = true;
+    ctx.noteInterruptedChallenger();
+    if (ctx.info_emitter) |emitter| {
+        emitter.emit(.{ .iteration = .{
+            .depth = best.depth,
+            .seldepth = best.seldepth,
+            .score = best.score,
+            .bound = best.score_bound,
+            .nodes = best.nodes,
+            .time_ms = ctx.control.elapsedNs() / std.time.ns_per_ms,
+            .hashfull = table.hashfullPermille(),
+            .best_move = best.best_move,
+            .pv = best.pv.slice(),
+        } });
+    }
 }
 
 /// TM arc r1: how the optimum (soft) budget check is shaped by the enabled
@@ -998,6 +1218,39 @@ test "iteration stability treats first completed iteration as stable enough" {
     try std.testing.expectEqual(@as(u8, 1), nextStableIterationStreak(0, null, trace));
 }
 
+test "TM v2 C3 streak restarts on a best-move change or a score jump of 80" {
+    const e4 = move_mod.Move.init(.e2, .e4, .double_push);
+    const d4 = move_mod.Move.init(.d2, .d4, .double_push);
+    const Case = struct { trace: IterationTrace, streak: u32, u: u32 };
+    const cases = [_]Case{
+        .{ .trace = .{ .score = 0, .best_move = e4 }, .streak = 0, .u = 5540 }, // first iteration
+        .{ .trace = .{ .score = 10, .best_move = e4 }, .streak = 1, .u = 2870 },
+        .{ .trace = .{ .score = 89, .best_move = e4 }, .streak = 2, .u = 2870 }, // +79: kept
+        .{ .trace = .{ .score = 89, .best_move = e4 }, .streak = 3, .u = 2870 },
+        .{ .trace = .{ .score = 89, .best_move = e4 }, .streak = 4, .u = 1410 },
+        .{ .trace = .{ .score = 89, .best_move = d4 }, .streak = 0, .u = 5540 }, // move change
+        .{ .trace = .{ .score = 89, .best_move = d4 }, .streak = 1, .u = 2870 },
+        .{ .trace = .{ .score = 9, .best_move = d4 }, .streak = 0, .u = 5540 }, // -80: jump
+        .{ .trace = .{ .score = 89, .best_move = d4 }, .streak = 0, .u = 5540 }, // +80: jump
+    };
+    var previous: ?IterationTrace = null;
+    var stable_streak: u8 = 0;
+    for (cases) |case| {
+        stable_streak = nextStableIterationStreak(stable_streak, previous, case.trace);
+        try std.testing.expectEqual(case.streak, urgencyStreak(stable_streak));
+        try std.testing.expectEqual(case.u, time.c3UrgencyPermille(urgencyStreak(stable_streak)));
+        previous = case.trace;
+    }
+    // Further stable iterations walk down the long-streak classes: 12, 20, 30.
+    const long_classes = [_]struct { more: usize, u: u32 }{ .{ .more = 12, .u = 640 }, .{ .more = 8, .u = 360 }, .{ .more = 10, .u = 80 } };
+    for (long_classes) |step| {
+        for (0..step.more) |_| stable_streak = nextStableIterationStreak(stable_streak, previous, previous.?);
+        try std.testing.expectEqual(step.u, time.c3UrgencyPermille(urgencyStreak(stable_streak)));
+    }
+    // The legacy count saturates; the class stays put.
+    try std.testing.expectEqual(@as(u32, 80), time.c3UrgencyPermille(urgencyStreak(std.math.maxInt(u8))));
+}
+
 test "tablebase decision reuse requires two matching decisive iterations" {
     const best = move_mod.Move.init(.e2, .e4, .double_push);
     const other = move_mod.Move.init(.d2, .d4, .double_push);
@@ -1065,26 +1318,44 @@ test "tablebase decision stop requires a finite limit and completed depth floor"
 
 test "iterative deepening searches through an early TB decision to a short mate" {
     const fen = @import("../core/fen.zig");
-    const path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return;
+    const path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return error.SkipZigTest;
     defer std.testing.allocator.free(path);
 
     var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
     defer engine.deinit();
     try std.testing.expect(engine.setSyzygyPath(path));
     defer _ = engine.setSyzygyPath("");
+    // Six men: the root stays outside 3-4-5 tables (with 6-man tables it would
+    // be a tablebase root, decided before iterative deepening).
+    if (syzygy.pieceLimit() != 5) return error.SkipZigTest;
 
-    const pos = try fen.parse("k7/8/1P6/K7/p1P5/1p4Q1/8/8 w - - 2 40");
+    // Fixture repaired 2026-10-14 (the old one, k7/8/1P6/K7/p1P5/1p4Q1/8/8 w,
+    // now finds its mate at depth 5 before any TB score). Here depths 4-7 agree
+    // on a tablebase win with d6d7 (d7h7 then reaches 3-4-5 tables), a streak
+    // that alone would end iterative deepening; the mate in 2 (e8e7) appears
+    // at depth 8. Only the completed-depth floor (13) keeps the search going:
+    // without it the search ends after depth 5 with a TB score and this fails.
+    const pos = try fen.parse("4R3/k6p/3R4/p7/8/8/8/2K5 w - - 0 1");
     var history = repetition.History{};
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(false);
     const result = engine.search(&pos, &history, .{ .depth = 14 }, &stop_flag);
 
-    var saw_tb_decision = false;
-    for (result.diagnostics.trace[0..result.diagnostics.trace_len]) |trace| {
-        if (score_mod.isTablebaseDecisive(trace.score)) saw_tb_decision = true;
+    const traces = result.diagnostics.trace[0..result.diagnostics.trace_len];
+    const first_mate = for (traces, 0..) |trace, i| {
+        if (score_mod.isMateLike(trace.score)) break i;
+    } else traces.len;
+    var streak: u8 = 0;
+    var longest_streak_before_mate: u8 = 0;
+    var previous: ?IterationTrace = null;
+    for (traces[0..first_mate]) |trace| {
+        streak = nextTablebaseDecisionStreak(streak, previous, trace);
+        longest_streak_before_mate = @max(longest_streak_before_mate, streak);
+        previous = trace;
     }
-    try std.testing.expect(saw_tb_decision);
-    try std.testing.expect(score_mod.isMateLike(result.score));
+    try std.testing.expect(longest_streak_before_mate >= 2);
+    try std.testing.expect(first_mate < TB_DECISION_MIN_COMPLETED_DEPTH);
+    try std.testing.expect(score_mod.isMateLike(result.score) and result.score > 0);
     try std.testing.expectEqual(@as(u16, 14), result.depth);
     try std.testing.expectEqual(@as(usize, 14), result.diagnostics.trace_len);
 }
@@ -1367,6 +1638,66 @@ test "engine respects node limit and still returns a legal move" {
     try std.testing.expectEqual(@as(u64, 1), result.nodes);
 }
 
+test "pass verdict needs a finished incumbent and a real score" {
+    const incumbent = move_mod.Move.init(.e2, .e4, .double_push);
+    const other = move_mod.Move.init(.d2, .d4, .double_push);
+    const alpha: types.Score = 10;
+
+    // No incumbent (first iteration) or an unfinished incumbent proves nothing.
+    try std.testing.expectEqual(PassVerdict.none, passVerdict(null, alpha, &.{ .best_move = other, .score = 50, .incumbent_completed = true }));
+    try std.testing.expectEqual(PassVerdict.none, passVerdict(incumbent, alpha, &.{ .best_move = other, .score = 50, .incumbent_completed = false }));
+    // A fail-low pass only bounds every move from above.
+    try std.testing.expectEqual(PassVerdict.none, passVerdict(incumbent, alpha, &.{ .best_move = other, .score = 10, .incumbent_completed = true }));
+    try std.testing.expectEqual(PassVerdict.none, passVerdict(incumbent, alpha, &.{ .best_move = null, .score = 50, .incumbent_completed = true }));
+    // Above the window's lower bound the pass ranks the incumbent.
+    try std.testing.expectEqual(PassVerdict.incumbent, passVerdict(incumbent, alpha, &.{ .best_move = incumbent, .score = 11, .incumbent_completed = true }));
+    try std.testing.expectEqual(PassVerdict.challenger, passVerdict(incumbent, alpha, &.{ .best_move = other, .score = 11, .incumbent_completed = true }));
+}
+
+test "interrupted iterations only replace the move with a proven challenger" {
+    const fen = @import("../core/fen.zig");
+    // Middlegame/endgame roots whose best move changes between depths under
+    // small node budgets (game 16 of the 6.4.0 CCRL gauntlet).
+    const fens = [_][]const u8{
+        "r2r2k1/1pp2ppp/6b1/4p3/p3N3/bPPBPP2/P5PP/R2R2K1 w - - 0 20",
+        "8/1pp2bp1/2k4p/4p3/2P1N2b/1K2PP2/P3B2P/8 w - - 36 47",
+        "rn1qk2r/ppp2ppp/3b4/3npb2/8/1P2PP2/PB1PN1PP/RN1QKB1R w KQkq - 1 8",
+    };
+    const limits = [_]u64{ 5_000, 10_000, 20_000, 35_000, 50_000, 75_000 };
+
+    var engine = try Engine.init(std.testing.allocator, 16);
+    defer engine.deinit();
+    var adopted: usize = 0;
+    for (fens) |text| {
+        const pos = try fen.parse(text);
+        for (limits) |node_limit| {
+            engine.reset();
+            var history = repetition.History{};
+            history.push(pos.zobrist_key);
+            var stop_flag = std.atomic.Value(bool).init(false);
+            const result = engine.search(&pos, &history, .{ .node_limit = node_limit }, &stop_flag);
+            try std.testing.expect(result.best_move != null);
+            try std.testing.expect(result.diagnostics.trace_len > 0);
+            const last = result.diagnostics.trace[result.diagnostics.trace_len - 1];
+            if (result.diagnostics.interrupted_challenger) {
+                adopted += 1;
+                try std.testing.expectEqual(search_info.ScoreBound.lower, result.score_bound);
+                try std.testing.expectEqual(last.depth + 1, result.depth);
+                try std.testing.expect(result.best_move.? != last.best_move.?);
+                try std.testing.expect(pv.isLegal(&pos, &history, &result.pv));
+                try std.testing.expectEqual(result.best_move.?, result.pv.slice()[0]);
+            } else {
+                try std.testing.expectEqual(search_info.ScoreBound.exact, result.score_bound);
+                try std.testing.expectEqual(last.best_move, result.best_move);
+                try std.testing.expectEqual(last.depth, result.depth);
+            }
+        }
+    }
+    // The sweep must exercise the adoption path; if a search change moves
+    // every proof off these budgets, pick new budgets rather than drop this.
+    try std.testing.expect(adopted > 0);
+}
+
 test "engine finds a mate in one at depth one" {
     const fen = @import("../core/fen.zig");
 
@@ -1636,6 +1967,123 @@ test "engine stops after a finite movetime and returns completed iteration" {
     try std.testing.expect(result.nodes > 0);
 }
 
+test "a clock that is gone before depth 1 still plays a searched depth-1 move" {
+    // Audit D (U-STOP-D1): an expired deadline used to stop at node 0 and play
+    // the first generated move. The clock now waits for depth 1; an external
+    // stop still ends the search at once (the stopped-before-iteration tests).
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+
+    const pos = try fen.startpos();
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    // A 1 ns deadline has always passed at the first clock check (node 0), so
+    // this is the deterministic witness: exactly depth 1, searched.
+    const expired = engine.search(&pos, &history, .{ .optimum_budget_ns = 1, .maximum_budget_ns = 1 }, &stop_flag);
+    try std.testing.expectEqual(@as(u16, 1), expired.depth);
+    try std.testing.expect(expired.nodes > 0);
+    try std.testing.expectEqual(expired.best_move.?, expired.pv.slice()[0]);
+    // The UCI shapes of the same situation (a 1 ms plan).
+    for ([_]time.GoLimits{
+        .{ .wtime_ms = 0, .btime_ms = 60_000 },
+        .{ .movetime_ms = 0 },
+    }) |go| {
+        const result = engine.search(&pos, &history, go.toControllerLimits(.white, time.DEFAULT_MOVE_OVERHEAD_MS, 1), &stop_flag);
+        try std.testing.expect(result.depth >= 1);
+        try std.testing.expect(result.nodes > 0);
+        try std.testing.expectEqual(result.best_move.?, result.pv.slice()[0]);
+    }
+}
+
+test "after the held depth 1 only the hard budget can stop the search, and it does" {
+    // Judge D finding A: the depth-1 hold must leave the planned hard deadline
+    // in place. In both limits nothing but the hard budget can end the search
+    // before depth 6; it expired at node 0, so the search stops at depth 1.
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+
+    const pos = try fen.startpos();
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    for ([_]time.Limits{
+        .{ .maximum_budget_ns = 1, .depth = 6 },
+        // Clock-shaped: soft stopping disarmed and an hour of optimum (C3's
+        // deadline is capped by the hard budget, so only that budget counts).
+        .{ .optimum_budget_ns = std.time.ns_per_hour, .maximum_budget_ns = 1, .soft = .disarmed, .depth = 6 },
+    }) |limits| {
+        const result = engine.search(&pos, &history, limits, &stop_flag);
+        try std.testing.expectEqual(@as(u16, 1), result.depth);
+        try std.testing.expectEqual(IterationStopReason.maximum_elapsed, result.diagnostics.iteration_stop_reason.?);
+    }
+}
+
+test "a first iteration that cannot finish answers at the hold's node budget" {
+    // Judge B J2: on impossible dense-queen boards depth 1 takes 159k or 2.4M
+    // nodes (48 queens: it never ends). The hold ends after
+    // FIRST_ITERATION_CLOCK_HOLD_NODES; then the planned deadline applies.
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    for ([_][]const u8{
+        "rrbbkbnn/qqqqqqqq/8/8/8/8/QQQQQQQQ/RRBBKBNN w - - 0 1",
+        "rn2k3/qqqqqqqq/8/8/8/8/QQQQQQQQ/RN2K3 w - - 0 1",
+    }) |text| {
+        const pos = try fen.parse(text);
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+
+        // An expired deadline: the first clock check after the hold stops.
+        // (Depth 1 only, so that a hold without a backstop fails, not hangs.)
+        const expired = engine.search(&pos, &history, .{ .maximum_budget_ns = 1, .depth = 1 }, &stop_flag);
+        try std.testing.expectEqual(@as(u16, 0), expired.depth);
+        try std.testing.expectEqual(time.FIRST_ITERATION_CLOCK_HOLD_NODES, expired.nodes);
+        try std.testing.expect(expired.best_move != null);
+
+        // A 500 ms clock (hard budget 28 ms): the move comes well inside what
+        // the clock can afford, the remaining time less the move overhead.
+        const clock = (time.GoLimits{ .wtime_ms = 500, .btime_ms = 500 }).toControllerLimits(.white, time.DEFAULT_MOVE_OVERHEAD_MS, 1);
+        var timer = try runtime.Timer.start();
+        const timed = engine.search(&pos, &history, clock, &stop_flag);
+        try std.testing.expect(timer.read() < (500 - time.DEFAULT_MOVE_OVERHEAD_MS) * std.time.ns_per_ms);
+        try std.testing.expect(timed.best_move != null);
+    }
+}
+
+test "stop and node limits still end a held depth 1 at once" {
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+
+    const pos = try fen.startpos();
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+
+    // An expired clock on top of each limit changes nothing.
+    var go_flag = std.atomic.Value(bool).init(false);
+    const one = engine.search(&pos, &history, .{ .node_limit = 1, .maximum_budget_ns = 1 }, &go_flag);
+    try std.testing.expectEqual(@as(u64, 1), one.nodes);
+    try std.testing.expect(one.best_move != null);
+    const zero = engine.search(&pos, &history, .{ .node_limit = 0, .maximum_budget_ns = 1 }, &go_flag);
+    try std.testing.expectEqual(@as(u64, 0), zero.nodes);
+    try std.testing.expect(zero.best_move != null);
+    var stopped = std.atomic.Value(bool).init(true);
+    const halted = engine.search(&pos, &history, .{ .maximum_budget_ns = 1 }, &stopped);
+    try std.testing.expectEqual(@as(u64, 0), halted.nodes);
+    try std.testing.expect(halted.best_move != null);
+}
+
 test "lazy accumulator reconstruction matches full refresh across real searches" {
     const fen = @import("../core/fen.zig");
 
@@ -1726,7 +2174,7 @@ test "hash resize failure at every preparation stage preserves live resources" {
     defer engine.deinit();
     engine.tt.entries[0].entries[0] = .{ .key = 17, .depth = 7, .score = 31 };
     engine.rfp_hint.entries[0].entries[0] = .{ .key = 19, .depth = 5, .score = 37 };
-    engine.eval_cache.entries[0] = .{ .key = 23, .eval = 41 };
+    engine.eval_cache.sets[0].slots[0] = 23 << 16 | 41;
     engine.history.quiet[0][0][0][0] = 43;
     engine.tt.generation = 11;
     const old_tt = engine.tt;
@@ -1743,11 +2191,11 @@ test "hash resize failure at every preparation stage preserves live resources" {
         try std.testing.expectEqual(@as(u32, 1), engine.hashSizeMb());
         try std.testing.expectEqual(old_hint.entries.ptr, engine.rfp_hint.entries.ptr);
         try std.testing.expectEqual(old_hint.mask, engine.rfp_hint.mask);
-        try std.testing.expectEqual(old_eval.entries.ptr, engine.eval_cache.entries.ptr);
+        try std.testing.expectEqual(old_eval.sets.ptr, engine.eval_cache.sets.ptr);
         try std.testing.expectEqual(old_eval.index_shift, engine.eval_cache.index_shift);
         try std.testing.expectEqual(@as(u64, 17), engine.tt.entries[0].entries[0].key);
         try std.testing.expectEqual(@as(u64, 19), engine.rfp_hint.entries[0].entries[0].key);
-        try std.testing.expectEqual(@as(u64, 23), engine.eval_cache.entries[0].key);
+        try std.testing.expectEqual(@as(u64, 23 << 16 | 41), engine.eval_cache.sets[0].slots[0]);
         try std.testing.expectEqual(@as(i16, 43), engine.history.quiet[0][0][0][0]);
     }
     // The original engine remains usable after all three failures.
@@ -1760,25 +2208,23 @@ test "hash resize failure at every preparation stage preserves live resources" {
     try std.testing.expectEqual(@as(u16, 3), result.depth);
 }
 
-test "hash resize commits all tables and preserves eval associativity" {
+test "hash resize commits all tables" {
     var engine = try Engine.init(std.testing.allocator, 1);
     defer engine.deinit();
-    engine.eval_cache.assoc = 1;
     const net = engine.evaluator.net;
     const context = engine.ctx;
     for ([_]u32{ 2, 4, 1 }) |mb| {
         engine.tt.entries[0].entries[0].key = 17;
         engine.rfp_hint.entries[0].entries[0].key = 19;
-        engine.eval_cache.entries[0].key = 23;
+        engine.eval_cache.sets[0].slots[0] = 23;
         engine.history.quiet[0][0][0][0] = 43;
         try engine.resizeHash(mb);
         try std.testing.expectEqual(mb, engine.hashSizeMb());
         try std.testing.expectEqual(hintSizeFor(mb), engine.rfp_hint.hintSizeMb());
         try std.testing.expectEqual(eval_cache_mod.sizeForHash(mb), engine.eval_cache.cacheSizeMb());
-        try std.testing.expectEqual(@as(u8, 1), engine.eval_cache.assoc);
         try std.testing.expectEqual(@as(u64, 0), engine.tt.entries[0].entries[0].key);
         try std.testing.expectEqual(@as(u64, 0), engine.rfp_hint.entries[0].entries[0].key);
-        try std.testing.expectEqual(@as(u64, 0), engine.eval_cache.entries[0].key);
+        try std.testing.expectEqual(@as(u64, 0), engine.eval_cache.sets[0].slots[0]);
         try std.testing.expectEqual(@as(i16, 0), engine.history.quiet[0][0][0][0]);
         try std.testing.expectEqual(net, engine.evaluator.net);
         try std.testing.expectEqual(context, engine.ctx);
@@ -1831,7 +2277,7 @@ test "parallel engines size their private tables from the thread share" {
     var one = try Engine.initForParallel(std.testing.allocator, 32, 1, &owner);
     defer one.deinit();
     try std.testing.expectEqual(serial.rfp_hint.entries.len, one.rfp_hint.entries.len);
-    try std.testing.expectEqual(serial.eval_cache.entries.len, one.eval_cache.entries.len);
+    try std.testing.expectEqual(serial.eval_cache.sets.len, one.eval_cache.sets.len);
     var quarter = try Engine.initForParallel(std.testing.allocator, 32, 4, &owner);
     defer quarter.deinit();
     try std.testing.expectEqual(@as(u32, 4), quarter.rfp_hint.hintSizeMb());
@@ -1942,7 +2388,7 @@ test "shared const net searches keep mutable worker resources independent" {
             try std.testing.expect(engine.ctx != other.ctx);
             try std.testing.expect(engine.tt.entries.ptr != other.tt.entries.ptr);
             try std.testing.expect(engine.rfp_hint.entries.ptr != other.rfp_hint.entries.ptr);
-            try std.testing.expect(engine.eval_cache.entries.ptr != other.eval_cache.entries.ptr);
+            try std.testing.expect(engine.eval_cache.sets.ptr != other.eval_cache.sets.ptr);
         }
     }
     var threads: [4]runtime.Thread = undefined;
@@ -1978,6 +2424,249 @@ test "root outcome authority distinguishes actual loss from restricted draw" {
     try std.testing.expect(rootOutcomeScore(.loss, 12) < -score_mod.TB_DECISIVE_THRESHOLD);
 }
 
+/// Test helper: a FEN plus UCI moves, with the game history a GUI would send.
+fn replayForTest(fen_text: []const u8, moves_text: []const []const u8, pos: *position.Position, history: *repetition.History) !void {
+    pos.* = try @import("../core/fen.zig").parse(fen_text);
+    history.* = .{};
+    history.push(pos.zobrist_key);
+    for (moves_text) |text| {
+        var moves = move_mod.MoveList.init();
+        legal.generate(pos, &moves);
+        var found: ?move_mod.Move = null;
+        for (moves.slice()) |mv| {
+            var buffer: [5]u8 = undefined;
+            if (std.mem.eql(u8, mv.toUci(&buffer), text)) found = mv;
+        }
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(pos, found orelse return error.IllegalTestMove, &state);
+        history.push(pos.zobrist_key);
+    }
+}
+
+fn uciText(mv: move_mod.Move, buffer: *[5]u8) []const u8 {
+    return mv.toUci(buffer);
+}
+
+/// Test helper: whether playing `mv` lets the opponent claim a threefold at
+/// once or with one reply (the child, or a child of it, occurs a third time).
+fn claimWithinOneReply(pos: *const position.Position, history: *const repetition.History, mv: move_mod.Move) bool {
+    var child = pos.*;
+    var state = make_unmake.StateInfo{};
+    _ = make_unmake.makeMove(&child, mv, &state);
+    if (history.childOccurrences(child.zobrist_key, child.halfmove_clock) >= 2) return true;
+    var line = history.*;
+    line.push(child.zobrist_key);
+    var replies = move_mod.MoveList.init();
+    legal.generate(&child, &replies);
+    for (replies.slice()) |reply| {
+        var grandchild = child;
+        var reply_state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&grandchild, reply, &reply_state);
+        if (line.childOccurrences(grandchild.zobrist_key, grandchild.halfmove_clock) >= 2) return true;
+    }
+    return false;
+}
+
+/// Test helper: the tables' clock-aware verdict for the side to move after `mv`.
+fn tablebaseVerdictAfter(pos: *const position.Position, mv: move_mod.Move) !syzygy.Wdl {
+    var child = pos.*;
+    var state = make_unmake.StateInfo{};
+    _ = make_unmake.makeMove(&child, mv, &state);
+    var job = syzygy.beginJob();
+    defer job.deinit();
+    const policy = job.probeRootMoves(&child, null, null) orelse return error.MissingRootTables;
+    return policy.wdl;
+}
+
+test "TB root: no instant win into a threefold, no rounded boundary win, no summary overwrite" {
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var engine = try Engine.init(a, 16);
+    defer engine.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var pos: position.Position = undefined;
+    var history = repetition.History{};
+    var buffer: [5]u8 = undefined;
+
+    // Audit D (U-TB-REP), both judges' legal histories: the instant TB win
+    // played e1e2 / e1f1, each the third occurrence of its position. Both
+    // windows hold repeated positions, so since the review round the root is
+    // searched (no instant move, no authoritative score); the move must keep
+    // the win and give no claim.
+    const repetitions = .{
+        .{ "4k3/8/8/8/8/8/3QK3/8 b - - 1 1", &[_][]const u8{ "e8f8", "d2c2", "f8e8", "c2d2", "e8f8", "e2e1", "f8e8" }, "e1e2" },
+        .{ "8/8/8/8/8/8/8/R4K1k b - - 1 1", &[_][]const u8{ "h1h2", "f1e1", "h2h1", "e1f1", "h1h2", "f1e1", "h2h1" }, "e1f1" },
+    };
+    inline for (repetitions) |case| {
+        try replayForTest(case[0], case[1], &pos, &history);
+        const result = engine.search(&pos, &history, .{ .depth = 10 }, &stop);
+        try std.testing.expect(!std.mem.eql(u8, uciText(result.best_move.?, &buffer), case[2]));
+        try std.testing.expect(result.nodes > 1);
+        try std.testing.expect(result.score > 0);
+        try std.testing.expect(!claimWithinOneReply(&pos, &history, result.best_move.?));
+        try std.testing.expectEqual(syzygy.Wdl.loss, try tablebaseVerdictAfter(&pos, result.best_move.?));
+    }
+
+    // Audit D (U-TB-DTZ100): at clock 97 the rounded a6a2 (r = 3) tied with the
+    // exact r = 3 wins and drew; an exact win is played instead.
+    try replayForTest("8/8/Q7/6p1/8/8/8/3K2k1 w - - 97 1", &.{}, &pos, &history);
+    const boundary = engine.search(&pos, &history, .{ .depth = 10 }, &stop);
+    try std.testing.expect(!std.mem.eql(u8, uciText(boundary.best_move.?, &buffer), "a6a2"));
+    try std.testing.expectEqual(@as(u64, 1), boundary.nodes);
+    try std.testing.expect(boundary.score >= score_mod.TB_DECISIVE_THRESHOLD);
+    // After a6a2 Kh1 every move reaches the 50-move claim; the root summary
+    // (a DTZ-1 "win") no longer overrides the moves' own states.
+    try replayForTest("8/8/Q7/6p1/8/8/8/3K2k1 w - - 97 1", &.{ "a6a2", "g1h1" }, &pos, &history);
+    const cursed = engine.search(&pos, &history, .{ .depth = 6 }, &stop);
+    try std.testing.expectEqual(@as(i32, 0), cursed.score);
+    try std.testing.expect(cursed.nodes > 1);
+}
+
+test "TB root: no instant win once the window holds a repeated position" {
+    // Review round (U-TB-REP): e1f1 was played at once (child new), but Black's
+    // only reply h1h2 recreates the start position a third time. e1f2 mates in 3.
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var engine = try Engine.init(a, 16);
+    defer engine.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var pos: position.Position = undefined;
+    var history = repetition.History{};
+    var buffer: [5]u8 = undefined;
+    try replayForTest("8/8/8/8/8/8/7k/R4K2 w - - 1 1", &.{ "f1e1", "h2h3", "e1f1", "h3h2", "f1e1", "h2h1" }, &pos, &history);
+    try std.testing.expect(claimWithinOneReply(&pos, &history, move_mod.Move.init(.e1, .f1, .quiet)));
+    const result = engine.search(&pos, &history, .{ .depth = 8 }, &stop);
+    try std.testing.expect(!std.mem.eql(u8, uciText(result.best_move.?, &buffer), "e1f1"));
+    try std.testing.expect(result.nodes > 1);
+    try std.testing.expect(result.score > 0);
+    try std.testing.expect(!claimWithinOneReply(&pos, &history, result.best_move.?));
+    try std.testing.expectEqual(syzygy.Wdl.loss, try tablebaseVerdictAfter(&pos, result.best_move.?));
+    // Winning control: restricted to e1f2, the search finds the mate.
+    var only = move_mod.MoveList.init();
+    only.add(move_mod.Move.init(.e1, .f2, .quiet));
+    const control = engine.searchWithRootMoves(&pos, &history, .{ .depth = 8 }, &stop, &only);
+    try std.testing.expectEqual(only.moves[0], control.best_move.?);
+    try std.testing.expect(score_mod.isMateLike(control.score) and control.score > 0);
+}
+
+test "TB root: an unproven boundary win keeps the searched score" {
+    // Review round (U-TB-DTZ100): restricted to the rounded boundary win a6a2,
+    // the root still reported 28000 although the search found the draw (after
+    // a6a2 g1h1 every White move reaches the 50-move claim).
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var engine = try Engine.init(a, 16);
+    defer engine.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var pos: position.Position = undefined;
+    var history = repetition.History{};
+    try replayForTest("8/8/Q7/6p1/8/8/8/3K2k1 w - - 97 1", &.{}, &pos, &history);
+    var only = move_mod.MoveList.init();
+    only.add(move_mod.Move.init(.a6, .a2, .quiet));
+    const searched = engine.searchWithRootMoves(&pos, &history, .{ .depth = 8 }, &stop, &only);
+    try std.testing.expectEqual(only.moves[0], searched.best_move.?);
+    try std.testing.expectEqual(@as(i32, 0), searched.score);
+    // Early stops: the pre-iteration fallback and interrupted iterations
+    // carry no TB score either.
+    for ([_]u64{ 1, 2, 64, 200 }) |n| {
+        const early = engine.searchWithRootMoves(&pos, &history, .{ .node_limit = n }, &stop, &only);
+        try std.testing.expectEqual(only.moves[0], early.best_move.?);
+        try std.testing.expect(!score_mod.isDecisive(early.score));
+    }
+}
+
+test "TB root: a certain win keeps uncertain wins out of the searched set" {
+    // Review round (three-way review, Astra F1): a6a5 is the certain win but
+    // returns to a child seen once (no instant move); a6a2 is a rounded
+    // boundary win that draws (after g1h1 no zeroing move or mate comes before
+    // the claim). With both in the set the engine played a6a2 with cp 28000,
+    // also at one node.
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var engine = try Engine.init(a, 16);
+    defer engine.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var pos: position.Position = undefined;
+    var history = repetition.History{};
+    var buffer: [5]u8 = undefined;
+    try replayForTest("8/8/8/Q5p1/8/8/8/3K2k1 b - - 94 1", &.{ "g1h1", "a5a6", "h1g1" }, &pos, &history);
+    var allowed = move_mod.MoveList.init();
+    allowed.add(move_mod.Move.init(.a6, .a2, .quiet));
+    allowed.add(move_mod.Move.init(.a6, .a5, .quiet));
+    const searched = engine.searchWithRootMoves(&pos, &history, .{ .depth = 8 }, &stop, &allowed);
+    try std.testing.expectEqualStrings("a6a5", uciText(searched.best_move.?, &buffer));
+    for ([_]u64{ 1, 2, 64, 200 }) |n| {
+        const early = engine.searchWithRootMoves(&pos, &history, .{ .node_limit = n }, &stop, &allowed);
+        try std.testing.expectEqualStrings("a6a5", uciText(early.best_move.?, &buffer));
+    }
+}
+
+test "TB root: an unproven boundary loss keeps the searched score" {
+    // Review round follow-up: a2b2 has r = -6 at clock 94 (opponent DTZ 5,
+    // rounded), but White needs 6 plies, so Black reaches the 50-move claim.
+    // The engine played a2b2 and still reported -28000. Without the proof the
+    // score is the search's own (at depth 10 the horizon hides the claim).
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var engine = try Engine.init(a, 16);
+    defer engine.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var pos: position.Position = undefined;
+    var history = repetition.History{};
+    var buffer: [5]u8 = undefined;
+    try replayForTest("8/8/8/Q7/8/1p6/k6K/8 b - - 94 1", &.{}, &pos, &history);
+    const searched = engine.search(&pos, &history, .{ .depth = 10 }, &stop);
+    try std.testing.expectEqualStrings("a2b2", uciText(searched.best_move.?, &buffer));
+    try std.testing.expect(!score_mod.isDecisive(searched.score));
+    for ([_]u64{ 1, 2, 64, 200 }) |n| {
+        const early = engine.search(&pos, &history, .{ .node_limit = n }, &stop);
+        try std.testing.expect(!score_mod.isDecisive(early.score));
+    }
+}
+
+test "NNUE Scale Percent 360: an evaluation keeps its value through a TT store and probe at other plies" {
+    // Review round (S-TB-PLY, Astra judge A finding 4): this five-queen position
+    // evaluated to 27,396 at scale 360; stored as a lower bound at ply 2 it
+    // was written as 27,398 and read back at ply 4 as 27,394.
+    const tt_store = @import("tt_store.zig");
+    const tt_probe = @import("tt_probe.zig");
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    engine.setNnueScalePercent(360);
+    var stop = std.atomic.Value(bool).init(false);
+    engine.ctx.* = .{ .repetition = .{}, .control = time.Controller.init(&stop, .{}) };
+    // Both signs (the second: a sixth queen, the bare king to move, -27,939).
+    const cases = .{
+        .{ "7k/8/8/8/Q7/8/Q1Q1Q1Q1/K7 w - - 0 1", @as(i32, 1) },
+        .{ "7k/8/8/8/Q7/8/Q1Q1Q1Q1/K1Q5 b - - 0 1", @as(i32, -1) },
+    };
+    inline for (cases) |case| {
+        const pos = try @import("../core/fen.zig").parse(case[0]);
+        engine.evaluator.prepareRoot(&engine.ctx.stack, &pos, &engine.ctx.finny, &engine.ctx.ft);
+        const eval = engine.evaluator.evaluate(&engine.ctx.stack, 0, &pos, &engine.ctx.finny, &engine.ctx.ft);
+        try std.testing.expectEqual(case[1] * score_mod.ORDINARY_SCORE_LIMIT, eval);
+        tt_store.storeLowerBound(null, &engine.tt, pos.zobrist_key, 6, eval, null, tt.STATIC_EVAL_NONE, false, 2);
+        var probe: tt_probe.Result = undefined;
+        tt_probe.probeInto(&probe, engine.ctx, &engine.tt, pos.zobrist_key, 6, -30_000, 30_000, null, 0, 4);
+        try std.testing.expectEqual(eval, probe.entry.?.score);
+    }
+}
+
 test "drawn Horsie root cannot accept false TB loss or stop on its streak" {
     const a = std.testing.allocator;
     const path = std.process.getEnvVarOwned(a, "ZQ_ROOT_TB_PATH") catch return error.SkipZigTest;
@@ -1998,6 +2687,6 @@ test "drawn Horsie root cannot accept false TB loss or stop on its streak" {
     try std.testing.expectEqual(@as(u64, 20000), engine.ctx.nodes);
     var job = syzygy.beginJob();
     defer job.deinit();
-    const policy = job.probeRootMoves(&pos, null).?;
+    const policy = job.probeRootMoves(&pos, null, null).?;
     try std.testing.expect(rootMoveAllowed(&policy.moves, result.best_move.?));
 }

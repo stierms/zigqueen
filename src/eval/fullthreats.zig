@@ -151,27 +151,83 @@ pub inline fn fullIndex(ak: usize, f_o: usize, t_o: usize, victim_own: bool, vra
 }
 
 /// One perspective's index frame for one attacker group (attacker key `ak` on
-/// oriented square `f_o`), hoisted out of the per-target loops: fullIndex is
-/// `base + rel(...)` with the same table reads done once per group.
-const GroupIdx = struct {
-    att: u64,
-    base: usize,
-    nv: usize,
+/// oriented square `f_o`): its empty-board attack set, the index of its first
+/// feature and the index stride per target (2 * nv), so that fullIndex(ak, f_o,
+/// t_o, own, vrank) = base + popcount(att below t_o) * stride + victim slot.
+const GroupFrame = struct { att: u64, base: u32, stride: u32 };
 
-    inline fn of(ak: usize, f_o: usize) GroupIdx {
+const GROUP_FRAMES: [10][64]GroupFrame = blk: {
+    @setEvalBranchQuota(100_000);
+    var g: [10][64]GroupFrame = undefined;
+    for (0..10) |ak| for (0..64) |f| {
         const nv = NV[ak % 5];
+        g[ak][f] = .{ .att = T.empty_att[ak][f], .base = T.ak_offset[ak] + @as(u32, T.pair_base[ak][f]) * 2 * @as(u32, nv), .stride = 2 * @as(u32, nv) };
+    };
+    break :blk g;
+};
+
+/// ATTACKER_KEY[persp][piece]: the piece's attacker key in that perspective
+/// (0..4 own PNBRQ, 5..9 the opponent's); kings and `none` never attack.
+const ATTACKER_KEY: [2][13]u8 = blk: {
+    var k: [2][13]u8 = .{.{0} ** 13} ** 2;
+    for (0..2) |persp| for (0..12) |pi| {
+        const atype = pi % 6;
+        if (atype == 5) continue;
+        k[persp][pi] = (if (pi / 6 == persp) 0 else 5) + atype;
+    };
+    break :blk k;
+};
+
+/// VICTIM_SLOT[persp][ak][piece]: a victim's slot within one target's 2 * nv
+/// feature block (own victims first, then the opponent's, by kept-set rank), or
+/// -1 when that victim is no feature for attacker key `ak` (king, subset-
+/// redundant pair, `none`).
+const VICTIM_SLOT: [2][10][13]i8 = blk: {
+    @setEvalBranchQuota(100_000);
+    var v: [2][10][13]i8 = .{.{.{-1} ** 13} ** 10} ** 2;
+    for (0..2) |persp| for (0..10) |ak| for (0..12) |pi| {
+        const vr = VRANK[ak % 5][pi % 6];
+        if (vr < 0) continue;
+        v[persp][ak][pi] = @as(i8, @intCast(if (pi / 6 == persp) 0 else NV[ak % 5])) + vr;
+    };
+    break :blk v;
+};
+
+/// One attacker group (piece on one square) in both perspectives.
+const GroupPair = struct {
+    w: GroupFrame,
+    b: GroupFrame,
+    vw: *const [13]i8,
+    vb: *const [13]i8,
+
+    inline fn of(p: piece.Piece, sq: u6, wflip: u6, bflip: u6) GroupPair {
+        const akw = ATTACKER_KEY[0][@intFromEnum(p)];
+        const akb = ATTACKER_KEY[1][@intFromEnum(p)];
         return .{
-            .att = T.empty_att[ak][f_o],
-            .base = T.ak_offset[ak] + @as(usize, T.pair_base[ak][f_o]) * 2 * nv,
-            .nv = nv,
+            .w = GROUP_FRAMES[akw][sq ^ wflip],
+            .b = GROUP_FRAMES[akb][(sq ^ 56) ^ bflip],
+            .vw = &VICTIM_SLOT[0][akw],
+            .vb = &VICTIM_SLOT[1][akb],
         };
     }
 
-    /// fullIndex(ak, f_o, t_o, victim_own, vrank) - base.
-    inline fn rel(g: GroupIdx, t_o: usize, victim_own: bool, vrank: usize) usize {
-        std.debug.assert((g.att >> @as(u6, @intCast(t_o))) & 1 == 1);
-        const pairpos: usize = @popCount(g.att & ((@as(u64, 1) << @as(u6, @intCast(t_o))) - 1));
-        return pairpos * (2 * g.nv) + (if (victim_own) 0 else g.nv) + vrank;
+    /// Victim `v` on square `t` is a feature of this group.
+    inline fn isFeature(g: GroupPair, v: piece.Piece) bool {
+        return g.vw[@intFromEnum(v)] >= 0;
+    }
+
+    /// Emit (this group -> `v` on `t`) in both perspectives as `add`; `v` must be
+    /// a feature victim (isFeature).
+    inline fn emit(g: GroupPair, comptime add: bool, t: u6, v: piece.Piece, wflip: u6, bflip: u6, sink: anytype) void {
+        const vi = @intFromEnum(v);
+        const sw: u32 = @intCast(g.vw[vi]);
+        const sb: u32 = @intCast(g.vb[vi]);
+        const tw: u6 = t ^ wflip;
+        const tb: u6 = (t ^ 56) ^ bflip;
+        std.debug.assert((g.w.att >> tw) & 1 == 1 and (g.b.att >> tb) & 1 == 1);
+        const iw = g.w.base + @as(u32, @popCount(g.w.att & ((@as(u64, 1) << tw) - 1))) * g.w.stride + sw;
+        const ib = g.b.base + @as(u32, @popCount(g.b.att & ((@as(u64, 1) << tb) - 1))) * g.b.stride + sb;
+        sink.emitPair(add, iw, ib);
     }
 };
 
@@ -207,11 +263,13 @@ pub fn enumerateColors(pos: *const position.Position, out_white: *PerspBits, out
         inline for ([_]piece.PieceType{ .pawn, .knight, .bishop, .rook, .queen }) |pt| {
             const atype: usize = @intFromEnum(pt); // 0..4
             var bb = pos.pieces[ac_idx][atype];
-            while (bitboard.popLsb(&bb)) |from| {
-                const from_idx: usize = from.index();
+            while (bb != 0) {
+                const from = bitboard.popLsbUnchecked(&bb);
+                const from_idx: usize = @intFromEnum(from);
                 var tb = attackSet(pt, ac, from, occ) & occ;
-                while (bitboard.popLsb(&tb)) |to| {
-                    const to_idx: usize = to.index();
+                while (tb != 0) {
+                    const to = bitboard.popLsbUnchecked(&tb);
+                    const to_idx: usize = @intFromEnum(to);
                     const tp = pos.mailbox[to_idx];
                     const vtype_full: usize = @intFromEnum(tp.pieceType()); // 0..5
                     if (vtype_full == 5) continue; // king victims excluded
@@ -239,6 +297,46 @@ pub fn enumerateColors(pos: *const position.Position, out_white: *PerspBits, out
     }
 }
 
+/// Most active features of one perspective: each (non-king attacker, occupied
+/// target) pair is at most one feature, so 30 attackers x 31 targets bound it.
+pub const MAX_ACTIVE: usize = 30 * 31;
+
+/// enumerateColors for ONE perspective, as the list of its active feature
+/// indices (enumerateColors' attacker order) instead of a cleared 940-word set:
+/// the sparse form for the flip-cache rebuild (nnue768 FullThreatState). Every
+/// feature appears once (one per attacker-target pair). Returns the count.
+pub fn enumeratePerspList(pos: *const position.Position, comptime persp: types.Color, out: *[MAX_ACTIVE]u16) usize {
+    const occ = pos.occupied;
+    const flip: u6 = if (pos.king_squares[@intFromEnum(persp)].?.file() > 3) 7 else 0;
+    const orient: u6 = (if (persp == .black) 56 else 0) ^ flip;
+    var n: usize = 0;
+    inline for ([_]types.Color{ .white, .black }) |ac| {
+        const ac_idx = @intFromEnum(ac);
+        inline for ([_]piece.PieceType{ .pawn, .knight, .bishop, .rook, .queen }) |pt| {
+            const atype: usize = @intFromEnum(pt); // 0..4
+            const ak: usize = (if (ac == persp) @as(usize, 0) else 5) + atype;
+            var bb = pos.pieces[ac_idx][atype];
+            while (bb != 0) {
+                const from = bitboard.popLsbUnchecked(&bb);
+                const f_o: usize = @intFromEnum(from) ^ orient;
+                var tb = attackSet(pt, ac, from, occ) & occ;
+                while (tb != 0) {
+                    const to = bitboard.popLsbUnchecked(&tb);
+                    const to_idx: usize = @intFromEnum(to);
+                    const tp = pos.mailbox[to_idx];
+                    const vtype_full: usize = @intFromEnum(tp.pieceType()); // 0..5
+                    if (vtype_full == 5) continue; // king victims excluded
+                    const vr = VRANK[atype][vtype_full];
+                    if (vr < 0) continue; // subset-redundant combo
+                    out[n] = @intCast(fullIndex(ak, f_o, to_idx ^ orient, tp.color().? == persp, @intCast(vr)));
+                    n += 1;
+                }
+            }
+        }
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // Per-move delta (docs/V6_INCREMENTAL_DESIGN.md r1 groups; direct form, lane 2
 // #4). Groups = attacker squares: group(sq, colored-type) is the contiguous
@@ -252,6 +350,12 @@ pub const SquareChange = struct { sq: u6, old: piece.Piece, new: piece.Piece };
 /// Bytes of each emitted threat row prefetched at emission (4 cache lines);
 /// the flush walk (nnue768 PendingThreatRowsT(i8)) prefetches from here on.
 pub const ROW_PREFETCH_BYTES: usize = 256;
+
+/// Bound on one move's changed features per direction. Adds: one (A) group
+/// with an attacker (<= 8 features: one per queen ray, knight target) plus, per
+/// changed square (<= 4), <= 12 leapers (4 pawns, 8 knights) and <= 8 slider
+/// rays: 88. Removes: <= 2 (R) groups (16) + the same 80 (T) features: 96.
+pub const MAX_MOVE_FEATURES: usize = 128;
 
 pub inline fn kingFlips(pos: *const position.Position) struct { w: u6, b: u6 } {
     return .{
@@ -269,9 +373,9 @@ pub inline fn kingFlips(pos: *const position.Position) struct { w: u6, b: u6 } {
 //   (R) every feature of each changed square's OLD occupant group, read off the
 //       OLD board (occupancy occ_old, old victims), is REMOVED;
 //   (A) every feature of each changed square's NEW occupant group is ADDED;
-//   (T) attackers on unchanged squares take the targeted update (the same
-//       target rule and proof as updateAttackerGroupBoth), old_on -> REMOVE,
-//       new_on -> ADD.
+//   (T) attackers on unchanged squares emit their changed features, read off
+//       each changed square: a pawn's or knight's victim there, a slider's
+//       first blocker on the ray through it (see emitMoveDelta).
 // A feature belongs to exactly one group (its attacker's square and coloured
 // type); (R)/(A) groups sit on changed squares, (T) groups on unchanged ones,
 // and an old and a new occupant of one square never share a key. An (R) group
@@ -279,8 +383,9 @@ pub inline fn kingFlips(pos: *const position.Position) struct { w: u6, b: u6 } {
 // had none before it, so (R) emits exactly that group's old-truth \ new-truth
 // and (A) its new-truth \ old-truth; (T) emits exactly the XOR of its group.
 // Row adds/subs wrap and PSQT sums are integers, so emission order is free.
-// `sink.emit(comptime black: bool, comptime add: bool, idx: usize)` receives
-// every (perspective, direction, feature index).
+// `sink.emitPair(comptime add: bool, iw: usize, ib: usize)` receives every
+// changed feature once, with its direction and its white- and black-
+// perspective indices. At most MAX_MOVE_FEATURES features per direction.
 // ---------------------------------------------------------------------------
 
 /// Old occupant of square `t` (post-move occupant unless `t` changed).
@@ -294,8 +399,9 @@ inline fn oldOccupant(pos: *const position.Position, changes: []const SquareChan
     return p;
 }
 
-/// Emit every feature of the group (sq, color, atype) on one board as `add`.
-/// `occ_use`/`kept` describe that board; `old_board` selects old victims.
+/// Emit every feature of the group of attacker `att` (of type `atype`) on
+/// `sq_idx` on one board as `add`. `occ_use`/`kept` describe that board;
+/// `old_board` selects old victims.
 inline fn emitWholeGroup(
     comptime add: bool,
     comptime old_board: bool,
@@ -303,7 +409,7 @@ inline fn emitWholeGroup(
     changes: []const SquareChange,
     changed_mask: u64,
     sq_idx: u6,
-    color: types.Color,
+    att: piece.Piece,
     atype: usize,
     occ_use: u64,
     kept: u64,
@@ -311,68 +417,82 @@ inline fn emitWholeGroup(
     bflip: u6,
     sink: anytype,
 ) void {
-    const f_ow: usize = @as(usize, sq_idx ^ wflip);
-    const f_ob: usize = @as(usize, (sq_idx ^ 56) ^ bflip);
-    const gw = GroupIdx.of((if (color == .white) @as(usize, 0) else 5) + atype, f_ow);
-    const gb = GroupIdx.of((if (color == .black) @as(usize, 0) else 5) + atype, f_ob);
+    const g = GroupPair.of(att, sq_idx, wflip, bflip);
     const pt: piece.PieceType = @enumFromInt(atype);
-    var tb = attackSet(pt, color, square.Square.fromIndex(sq_idx), occ_use) & kept;
-    while (bitboard.popLsb(&tb)) |to| {
-        const t: usize = to.index();
+    var tb = attackSet(pt, att.color().?, square.Square.fromIndex(sq_idx), occ_use) & kept;
+    while (tb != 0) {
+        const to = bitboard.popLsbUnchecked(&tb);
+        const t: u6 = @intFromEnum(to);
         const p = if (old_board) oldOccupant(pos, changes, changed_mask, t) else pos.mailbox[t];
-        const vrank: usize = @intCast(VRANK[atype][@intFromEnum(p.pieceType())]);
-        const t_black = p.color().? == .black;
-        sink.emit(false, add, gw.base + gw.rel(t ^ wflip, !t_black, vrank));
-        sink.emit(true, add, gb.base + gb.rel((t ^ 56) ^ bflip, t_black, vrank));
+        g.emit(add, t, p, wflip, bflip, sink);
     }
 }
 
-/// One (attacker group, target, victim) feature in both perspectives as `add`,
-/// if the victim is a kept class for `atype`.
-inline fn emitTargetBoth(comptime add: bool, atype: usize, gw: GroupIdx, gb: GroupIdx, wflip: u6, bflip: u6, t: usize, p: piece.Piece, sink: anytype) void {
-    const vtype_full: usize = @intFromEnum(p.pieceType());
-    if (vtype_full == 5) return; // king victims excluded
-    const vr = VRANK[atype][vtype_full];
-    if (vr < 0) return; // subset-redundant combo
-    const vrank: usize = @intCast(vr);
-    const t_black = p.color().? == .black;
-    sink.emit(false, add, gw.base + gw.rel(t ^ wflip, !t_black, vrank));
-    sink.emit(true, add, gb.base + gb.rel((t ^ 56) ^ bflip, t_black, vrank));
+/// RAYS[s][d]: the squares beyond `s` (exclusive) in direction d = (dr + 1) * 3
+/// + (df + 1), dr/df in {-1, 0, 1} the rank/file step; d = 4 is empty. A
+/// direction with d > 4 walks to higher square indices.
+const RAYS: [64][9]u64 = blk: {
+    @setEvalBranchQuota(100_000);
+    var r: [64][9]u64 = .{.{0} ** 9} ** 64;
+    for (0..64) |s| for (0..9) |d| {
+        if (d == 4) continue;
+        const dr: i32 = @as(i32, @intCast(d / 3)) - 1;
+        const df: i32 = @as(i32, @intCast(d % 3)) - 1;
+        var nr: i32 = @as(i32, @intCast(s / 8)) + dr;
+        var nf: i32 = @as(i32, @intCast(s % 8)) + df;
+        while (nr >= 0 and nr < 8 and nf >= 0 and nf < 8) : ({
+            nr += dr;
+            nf += df;
+        }) r[s][d] |= @as(u64, 1) << @intCast(nr * 8 + nf);
+    };
+    break :blk r;
+};
+
+/// First occupied square of `ray` (a RAYS entry, walking up or down); >= 64
+/// when the ray holds none.
+inline fn firstOn(ray: u64, occ: u64, up: bool) u7 {
+    const b = ray & occ;
+    return if (up) @ctz(b) else 63 ^ @clz(b);
 }
 
-/// (T): updateAttackerGroupBoth's target rule with directed emission.
-inline fn emitAttackerGroup(
+/// (T), slider: `x` (unchanged square) sees changed square `s` with no changed
+/// square in between, so on the ray x -> s -> beyond only the first blocker can
+/// differ: s itself when occupied, else the first occupied square beyond it,
+/// under each occupancy. Remove the old first-blocker feature, add the new one.
+inline fn emitSliderRay(
     pos: *const position.Position,
     changes: []const SquareChange,
     changed_mask: u64,
     occ_old: u64,
-    sq_idx: u6,
-    color: types.Color,
-    atype: usize,
+    x: u6,
+    s: u6,
+    s_old: piece.Piece,
+    s_new: piece.Piece,
     wflip: u6,
     bflip: u6,
     sink: anytype,
 ) void {
-    const pt: piece.PieceType = @enumFromInt(atype);
-    const from = square.Square.fromIndex(sq_idx);
-    const a_new = attackSet(pt, color, from, pos.occupied);
-    // Pawn and knight attack sets do not depend on occupancy.
-    const a_old = if (atype <= 1) a_new else attackSet(pt, color, from, occ_old);
-    var targets = ((a_old ^ a_new) | changed_mask) & (a_old | a_new);
-    if (targets == 0) return;
-    const gw = GroupIdx.of((if (color == .white) @as(usize, 0) else 5) + atype, @as(usize, sq_idx ^ wflip));
-    const gb = GroupIdx.of((if (color == .black) @as(usize, 0) else 5) + atype, @as(usize, (sq_idx ^ 56) ^ bflip));
-    while (bitboard.popLsb(&targets)) |to| {
-        const t: usize = to.index();
-        const bit = @as(u64, 1) << @intCast(t);
-        const new_piece = pos.mailbox[t];
-        const old_piece = if (changed_mask & bit != 0) oldOccupant(pos, changes, changed_mask, t) else new_piece;
-        const old_on = (a_old & bit) != 0 and old_piece != .none;
-        const new_on = (a_new & bit) != 0 and new_piece != .none;
-        if (old_on and new_on and old_piece == new_piece) continue;
-        if (old_on) emitTargetBoth(false, atype, gw, gb, wflip, bflip, t, old_piece, sink);
-        if (new_on) emitTargetBoth(true, atype, gw, gb, wflip, bflip, t, new_piece, sink);
-    }
+    const dr = @as(i32, s >> 3) - @as(i32, x >> 3);
+    const df = @as(i32, s & 7) - @as(i32, x & 7);
+    const d: usize = @intCast((@as(i32, @intFromBool(dr > 0)) - @intFromBool(dr < 0) + 1) * 3 + (@as(i32, @intFromBool(df > 0)) - @intFromBool(df < 0) + 1));
+    const ray = RAYS[s][d];
+    const up = d > 4;
+    const vo: u7 = if (s_old != .none) s else firstOn(ray, occ_old, up);
+    const vn: u7 = if (s_new != .none) s else firstOn(ray, pos.occupied, up);
+    const po: piece.Piece = if (vo < 64) oldOccupant(pos, changes, changed_mask, vo) else .none;
+    const pn: piece.Piece = if (vn < 64) pos.mailbox[vn] else .none;
+    if (vo == vn and po == pn) return;
+    const g = GroupPair.of(pos.mailbox[x], x, wflip, bflip);
+    if (g.isFeature(po)) g.emit(false, @intCast(vo), po, wflip, bflip, sink);
+    if (g.isFeature(pn)) g.emit(true, @intCast(vn), pn, wflip, bflip, sink);
+}
+
+/// (T), pawn or knight on unchanged square `x` attacking changed square `s`:
+/// its attack set ignores occupancy, so only the victim on `s` changes.
+inline fn emitLeaperTarget(pos: *const position.Position, x: u6, s: u6, s_old: piece.Piece, s_new: piece.Piece, wflip: u6, bflip: u6, sink: anytype) void {
+    const g = GroupPair.of(pos.mailbox[x], x, wflip, bflip);
+    if (g.isFeature(s_old)) g.emit(false, s, s_old, wflip, bflip, sink);
+    if (g.isFeature(s_new)) g.emit(true, s, s_new, wflip, bflip, sink);
 }
 
 /// Emit a move's threat-feature delta (both perspectives, with directions) to
@@ -416,65 +536,386 @@ pub fn emitMoveDelta(pos: *const position.Position, changes: []const SquareChang
     for (changes) |c| {
         if (c.old != .none) {
             const at: usize = @intFromEnum(c.old.pieceType());
-            if (at < 5) emitWholeGroup(false, true, pos, changes, changed_mask, c.sq, c.old.color().?, at, occ_old, kept_old[at], flips.w, flips.b, sink);
+            if (at < 5) emitWholeGroup(false, true, pos, changes, changed_mask, c.sq, c.old, at, occ_old, kept_old[at], flips.w, flips.b, sink);
         }
         if (c.new != .none) {
             const at: usize = @intFromEnum(c.new.pieceType());
-            if (at < 5) emitWholeGroup(true, false, pos, changes, changed_mask, c.sq, c.new.color().?, at, occ, kept_new[at], flips.w, flips.b, sink);
+            if (at < 5) emitWholeGroup(true, false, pos, changes, changed_mask, c.sq, c.new, at, occ, kept_new[at], flips.w, flips.b, sink);
         }
     }
 
-    // (T): attackers of every changed square under NEW occupancy on UNCHANGED
-    // squares (a candidate on a changed square is its new occupant, done above),
-    // collected per coloured type as bitboards (the union dedupes). This single
-    // reverse-lookup rule covers both reasons an unchanged attacker's features
-    // can change: (a) a victim changed (pawn/knight attack sets are occupancy-
-    // independent; sliders are read back off the changed square's rays), and
-    // (b) a slider's attack set changed, which always makes it a new-occupancy
-    // attacker of some changed square:
-    //    Proof of (b). Take a slider S whose attack set differs between old_occ
-    //    and occ along some direction d, and let s_1, s_2, ... be d's ray from
-    //    S. Some square on the ray changed (otherwise the first blocker, and
-    //    hence the whole ray's attack set, is identical); let s_k be the FIRST
-    //    changed one. Every s_j with j < k is unchanged. If any such s_j were
-    //    occupied it would be occupied under BOTH occupancies and stop the ray
-    //    before s_k in both, making d's attack set identical — contradiction.
-    //    So s_1..s_{k-1} are empty under `occ`, i.e. S attacks s_k under `occ`
-    //    (a magic attack set contains every empty square up to and including
-    //    the first blocker). s_k is a changed square, so (T) collects S. ∎
-    //    The same argument covers old-occupancy victims: if S attacked changed square c under old_occ but
-    //    not under occ, a square between S and c became occupied; that square
-    //    is changed and lies before c, so the first changed square s_k on the
-    //    ray satisfies k <= index(c), and every s_j (j < k) was empty under
-    //    old_occ (S reached c) and is unchanged, hence empty under occ too —
-    //    so S attacks s_k under `occ` and is collected. ∎
-    var cand = [_]u64{0} ** 10;
+    // (T): attackers on UNCHANGED squares (a changed square's piece is its (R)/(A)
+    // group above), per changed square s with old/new occupants O/N.
+    //  - Pawns and knights attacking s: their attack sets ignore occupancy, so
+    //    exactly their features on s change: remove (X -> O), add (X -> N).
+    //  - Sliders: a slider's features are the first blockers of its rays, and a
+    //    ray's first blocker can only change if the ray holds a changed square.
+    //    Collect sliders attacking s under occ2 = occ | changed (changed squares
+    //    block): x is collected at s iff x sees s under `occ` with no changed
+    //    square strictly between (the squares between are unchanged and empty,
+    //    so x sees s under occ_old too). Each ray holding a changed square is
+    //    thus processed exactly once, at its FIRST changed square s: on it the
+    //    old/new first blocker is s if s is occupied on that board, else the
+    //    first occupied square beyond s (emitSliderRay). Rays without a changed
+    //    square keep their blocker, so nothing else of x changes.
+    // No feature is emitted twice: leaper features are distinct per (x, s) and
+    // slider features per (x, ray); a remove/add of the same feature is skipped.
+    const occ2 = occ | changed_mask;
+    const bq = pos.pieces[0][2] | pos.pieces[1][2] | pos.pieces[0][4] | pos.pieces[1][4];
+    const rq = pos.pieces[0][3] | pos.pieces[1][3] | pos.pieces[0][4] | pos.pieces[1][4];
+    const knights = pos.pieces[0][1] | pos.pieces[1][1];
     for (changes) |c| {
         const t = square.Square.fromIndex(c.sq);
-        const diag = attacks.bishopAttacksDirect(t, occ);
-        const ortho = attacks.rookAttacksDirect(t, occ);
-        const knight_att = attacks.knightAttacksDirect(t);
-        inline for ([_]types.Color{ .white, .black }) |ac| {
-            const ci: usize = @intFromEnum(ac);
-            const enemy: types.Color = if (ac == .white) .black else .white;
-            cand[ci * 5 + 0] |= attacks.pawnAttacksFrom(enemy, t) & pos.pieces[ci][0];
-            cand[ci * 5 + 1] |= knight_att & pos.pieces[ci][1];
-            cand[ci * 5 + 2] |= diag & pos.pieces[ci][2];
-            cand[ci * 5 + 3] |= ortho & pos.pieces[ci][3];
-            cand[ci * 5 + 4] |= (diag | ortho) & pos.pieces[ci][4];
+        var leapers = ((attacks.pawnAttacksFrom(.black, t) & pos.pieces[0][0]) |
+            (attacks.pawnAttacksFrom(.white, t) & pos.pieces[1][0]) |
+            (attacks.knightAttacksDirect(t) & knights)) & ~changed_mask;
+        while (leapers != 0) {
+            const x = bitboard.popLsbUnchecked(&leapers);
+            emitLeaperTarget(pos, @intFromEnum(x), c.sq, c.old, c.new, flips.w, flips.b, sink);
         }
-    }
-    inline for (0..10) |key| {
-        const color: types.Color = if (key < 5) .white else .black;
-        var bb = cand[key] & ~changed_mask;
-        while (bitboard.popLsb(&bb)) |s|
-            emitAttackerGroup(pos, changes, changed_mask, occ_old, s.index(), color, key % 5, flips.w, flips.b, sink);
+        var sliders = ((attacks.bishopAttacksDirect(t, occ2) & bq) | (attacks.rookAttacksDirect(t, occ2) & rq)) & ~changed_mask;
+        while (sliders != 0) {
+            const x = bitboard.popLsbUnchecked(&sliders);
+            emitSliderRay(pos, changes, changed_mask, occ_old, @intFromEnum(x), c.sq, c.old, c.new, flips.w, flips.b, sink);
+        }
     }
 }
 
 inline fn keptVictimMasksFrom(u: [5]u64) [5]u64 {
     const pnbr = u[0] | u[1] | u[2] | u[3];
     return .{ u[0] | u[1] | u[3], pnbr | u[4], pnbr, pnbr, pnbr | u[4] };
+}
+
+// ---------------------------------------------------------------------------
+// Ray-slot emission (docs/research/RAY_PERMUTATION_EMISSION_SPEC.md §1.1-1.4,
+// §2.2-2.4; implemented from that spec only). Every square s gets a fixed row
+// of 64 slots: 8 directions in rotational order (N, NE, E, SE, S, SW, W, NW, so
+// d + 4 is the opposite of d), each one byte of slots: slot 8d + 0 is a knight
+// square, slots 8d + k (k = 1..7) the squares k steps along d. A board seen
+// from s is its 64 class bytes permuted into that order; occupancy, attackers
+// and nearest blockers per ray are then bit operations on 64-bit slot masks.
+// ---------------------------------------------------------------------------
+
+pub const has_avx2 = blk: {
+    if (@import("builtin").cpu.arch != .x86_64) break :blk false;
+    break :blk std.Target.x86.featureSetHas(@import("builtin").cpu.features, .avx2);
+};
+
+/// Direction steps (rank, file) in rotational order, and the knight jump each
+/// direction owns: the jump half a step clockwise of it (our assignment).
+const RAY_STEP = [8][2]i32{ .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 }, .{ -1, 1 }, .{ -1, 0 }, .{ -1, -1 }, .{ 0, -1 }, .{ 1, -1 } };
+const RAY_KNIGHT = [8][2]i32{ .{ 2, 1 }, .{ 1, 2 }, .{ -1, 2 }, .{ -2, 1 }, .{ -2, -1 }, .{ -1, -2 }, .{ 1, -2 }, .{ 2, -1 } };
+
+/// Off-board slot: its top bit makes a byte shuffle return 0 for it.
+const SLOT_OFF: u8 = 0x80;
+const SLOT_NONE: u8 = 0xFF;
+
+/// SLOT_SQ[s][slot]: the square in that slot of s's row, or SLOT_OFF.
+/// SLOT_OF[s][t]: the slot of square t in s's row, or SLOT_NONE.
+const SlotTables = struct { sq: [64][64]u8 align(64), of: [64][64]u8 align(64) };
+const SLOTS: SlotTables = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var st: SlotTables = .{ .sq = .{.{SLOT_OFF} ** 64} ** 64, .of = .{.{SLOT_NONE} ** 64} ** 64 };
+    for (0..64) |s| {
+        const r: i32 = @intCast(s / 8);
+        const f: i32 = @intCast(s % 8);
+        for (0..8) |d| {
+            const kr = r + RAY_KNIGHT[d][0];
+            const kf = f + RAY_KNIGHT[d][1];
+            if (kr >= 0 and kr < 8 and kf >= 0 and kf < 8) st.sq[s][8 * d] = @intCast(kr * 8 + kf);
+            for (1..8) |k| {
+                const nr = r + RAY_STEP[d][0] * @as(i32, @intCast(k));
+                const nf = f + RAY_STEP[d][1] * @as(i32, @intCast(k));
+                if (nr >= 0 and nr < 8 and nf >= 0 and nf < 8) st.sq[s][8 * d + k] = @intCast(nr * 8 + nf);
+            }
+        }
+        for (0..64) |i| {
+            if (st.sq[s][i] != SLOT_OFF) st.of[s][st.sq[s][i]] = @intCast(i);
+        }
+    }
+    break :blk st;
+};
+
+/// Class bytes (bit per class; bit 7 = black, ignored by every test mask).
+const CL_WP: u8 = 1;
+const CL_BP: u8 = 2;
+const CL_N: u8 = 4;
+const CL_B: u8 = 8;
+const CL_R: u8 = 16;
+const CL_Q: u8 = 32;
+const CL_K: u8 = 64;
+const CL_BLACK: u8 = 128;
+
+/// Class byte of each piece code (index = piece.Piece; `none` and the unused
+/// codes 13..15 are empty).
+const PIECE_CLASS = [16]u8{
+    CL_WP,            CL_N,            CL_B,            CL_R,            CL_Q,            CL_K,
+    CL_BP | CL_BLACK, CL_N | CL_BLACK, CL_B | CL_BLACK, CL_R | CL_BLACK, CL_Q | CL_BLACK, CL_K | CL_BLACK,
+    0,                0,               0,               0,
+};
+
+/// Byte b of a 64-bit slot mask = direction b.
+const KNIGHT_SLOTS: u64 = 0x0101_0101_0101_0101;
+const STEP_SLOTS: u64 = 0xFEFE_FEFE_FEFE_FEFE;
+const ORTHO_STEPS: u64 = 0x00FE_00FE_00FE_00FE; // bytes 0, 2, 4, 6
+const DIAG_STEPS: u64 = 0xFE00_FE00_FE00_FE00; // bytes 1, 3, 5, 7
+
+/// Outgoing slots of each attacker piece code (kings and `none`: none).
+const OUT_SLOTS = blk: {
+    var o = [_]u64{0} ** 16;
+    o[0] = (1 << (8 * 1 + 1)) | (1 << (8 * 7 + 1)); // white pawn: NE, NW step 1
+    o[6] = (1 << (8 * 3 + 1)) | (1 << (8 * 5 + 1)); // black pawn: SE, SW step 1
+    for ([_]usize{ 1, 7 }) |p| o[p] = KNIGHT_SLOTS;
+    for ([_]usize{ 2, 8 }) |p| o[p] = DIAG_STEPS;
+    for ([_]usize{ 3, 9 }) |p| o[p] = ORTHO_STEPS;
+    for ([_]usize{ 4, 10 }) |p| o[p] = STEP_SLOTS;
+    break :blk o;
+};
+
+/// Victim classes an attacker piece code keeps (spec r2 kept sets).
+const KEPT_CLASS = blk: {
+    const pawns = CL_WP | CL_BP;
+    var k = [_]u8{0} ** 16;
+    for ([_]usize{ 0, 6 }) |p| k[p] = pawns | CL_N | CL_R;
+    for ([_]usize{ 1, 7, 4, 10 }) |p| k[p] = pawns | CL_N | CL_B | CL_R | CL_Q;
+    for ([_]usize{ 2, 8, 3, 9 }) |p| k[p] = pawns | CL_N | CL_B | CL_R;
+    break :blk k;
+};
+
+/// Per slot: the attacker classes that attack the focus square from it.
+/// Knight slots: knights; orthogonal steps: rooks, queens; diagonal steps:
+/// bishops, queens, and at step 1 the pawn colour attacking from that side
+/// (black pawns from NE/NW, white pawns from SE/SW).
+fn attackerClassAt(slot: usize, comptime sliders_only: bool) u8 {
+    const d = slot / 8;
+    const k = slot % 8;
+    if (k == 0) return if (sliders_only) 0 else CL_N;
+    if (d % 2 == 0) return CL_R | CL_Q;
+    var c: u8 = CL_B | CL_Q;
+    if (!sliders_only and k == 1) c |= if (d == 1 or d == 7) CL_BP else CL_WP;
+    return c;
+}
+
+/// INCOMING[t]: per slot, the attacker classes that attack the focus from it
+/// AND keep a victim of type t (pieceType order; king: none).
+const INCOMING: [6][64]u8 align(64) = blk: {
+    @setEvalBranchQuota(100_000);
+    const all = CL_WP | CL_BP | CL_N | CL_B | CL_R | CL_Q;
+    const keepers = [6]u8{ all, all, CL_N | CL_B | CL_R | CL_Q, all, CL_N | CL_Q, 0 };
+    var m: [6][64]u8 = undefined;
+    for (0..6) |t| for (0..64) |i| {
+        m[t][i] = attackerClassAt(i, false) & keepers[t];
+    };
+    break :blk m;
+};
+const SLIDERS_AT: [64]u8 align(64) = blk: {
+    var m: [64]u8 = undefined;
+    for (0..64) |i| m[i] = attackerClassAt(i, true);
+    break :blk m;
+};
+
+const V32 = @Vector(32, u8);
+const V64 = @Vector(64, u8);
+
+inline fn pshufb(tbl: V32, idx: V32) V32 {
+    return asm ("vpshufb %[idx], %[tbl], %[out]"
+        : [out] "=v" (-> V32),
+        : [tbl] "v" (tbl),
+          [idx] "v" (idx),
+    );
+}
+
+/// Slot-mask of the bytes of `v` that share a bit with `m`.
+inline fn slotsWith(v: V64, m: V64) u64 {
+    return ~@as(u64, @bitCast((v & m) == @as(V64, @splat(0))));
+}
+
+/// Per direction byte: the knight bit if set, and the nearest occupied step.
+inline fn nearestPerRay(occ: u64) u64 {
+    const o = occ | 0x8181_8181_8181_8181;
+    return (o ^ (o -% 0x0303_0303_0303_0303)) & occ;
+}
+
+/// For a mask with bit 0 clear and at most one other bit per byte: bits 0..6 of
+/// every byte that holds a bit.
+inline fn raySpan(x: u64) u64 {
+    const hi = (x +% 0x7E7E_7E7E_7E7E_7E7E) & 0x8080_8080_8080_8080;
+    return hi -% (hi >> 7);
+}
+
+/// The board in class bytes, and its four 16-byte quarters in both lanes.
+const ClassBoard = struct {
+    q: [4]V32,
+
+    inline fn of(pos: *const position.Position) ClassBoard {
+        const lut16: @Vector(16, u8) = PIECE_CLASS;
+        const lut: V32 = @shuffle(u8, lut16, undefined, [32]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 });
+        const mb: *const [64]u8 = @ptrCast(&pos.mailbox);
+        const lo = pshufb(lut, mb[0..32].*);
+        const hi = pshufb(lut, mb[32..64].*);
+        return .{ .q = .{
+            @shuffle(u8, lo, undefined, [32]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }),
+            @shuffle(u8, lo, undefined, [32]i32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 }),
+            @shuffle(u8, hi, undefined, [32]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }),
+            @shuffle(u8, hi, undefined, [32]i32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 }),
+        } };
+    }
+
+    /// 32 class bytes at the squares `idx` (each < 64, or with its top bit set
+    /// for 0): a byte shuffle per quarter, then blends on index bits 4 and 5.
+    inline fn gather32(cb: *const ClassBoard, idx: V32) V32 {
+        const zero: @Vector(32, i8) = @splat(0);
+        const w: @Vector(16, u16) = @bitCast(idx);
+        const b4: @Vector(32, i8) = @bitCast(w << @splat(3)); // bit 4 -> bit 7
+        const b5: @Vector(32, i8) = @bitCast(w << @splat(2)); // bit 5 -> bit 7
+        const lo = @select(u8, b4 < zero, pshufb(cb.q[1], idx), pshufb(cb.q[0], idx));
+        const hi = @select(u8, b4 < zero, pshufb(cb.q[3], idx), pshufb(cb.q[2], idx));
+        return @select(u8, b5 < zero, hi, lo);
+    }
+
+    /// The board seen from `s`: class byte per slot (off-board slots empty).
+    inline fn view(cb: *const ClassBoard, s: u6) V64 {
+        const row: *const [64]u8 = &SLOTS.sq[s];
+        const a = cb.gather32(row[0..32].*);
+        const b = cb.gather32(row[32..64].*);
+        return std.simd.join(a, b);
+    }
+};
+
+/// One changed square's slot-space state (spec §2.2-2.3): the board after the
+/// move seen from `s` (the view), and the occupancies of both boards with the
+/// other changed square `c` patched in. `cbit` is c's slot bit (0 when c is not
+/// in s's row); the union occupancy treats c as a blocker.
+const RayFocus = struct {
+    s: u6,
+    view: V64,
+    sc: u8,
+    cbit: u64,
+    near0: u64,
+    near1: u64,
+    nearu: u64,
+
+    inline fn of(cb: *const ClassBoard, f: SquareChange, o: SquareChange) RayFocus {
+        const v1 = cb.view(f.sq);
+        const occ1 = ~@as(u64, @bitCast(v1 == @as(V64, @splat(0))));
+        const sc = SLOTS.of[f.sq][o.sq];
+        const cbit: u64 = if (sc != SLOT_NONE) @as(u64, 1) << @intCast(sc & 63) else 0;
+        const occ0 = (occ1 & ~cbit) | (if (o.old != .none) cbit else 0);
+        return .{
+            .s = f.sq,
+            .view = v1,
+            .sc = sc,
+            .cbit = cbit,
+            .near0 = nearestPerRay(occ0),
+            .near1 = nearestPerRay(occ1),
+            .nearu = nearestPerRay(occ1 | cbit),
+        };
+    }
+};
+
+/// emitMoveDelta for exactly two changed squares, in slot space (spec §2.2):
+/// each changed square s (old/new occupants O/N) is processed against both
+/// boards at once, the other changed square c acting as a blocker in the union
+/// occupancy. Per s:
+///  - (R) O's outgoing slots AND B0's nearest blockers AND O's kept classes
+///    (B0 bytes: c re-patched with its old occupant): remove;
+///  - (A) the same for N on B1: add;
+///  - (T) incoming: attackers of s that keep O's (N's) type, nearest on the
+///    union occupancy and not c: remove (x -> O on s) / add (x -> N on s);
+///  - (T) x-ray, only when s's occupancy changes: each slider seeing s (union
+///    nearest, not c) is paired with the nearest blocker beyond s on the
+///    opposite ray, of B0 when a piece arrives on s (remove) and of B1 when s
+///    is vacated (add); a pair is emitted when that victim is kept.
+/// That is S2's rule: an unchanged attacker is collected exactly at the first
+/// changed square of each ray that holds one, so every changed feature is
+/// emitted once with its direction (the walk-equality test checks this against
+/// emitMoveDelta move by move).
+pub fn emitMoveDeltaRay2(pos: *const position.Position, changes: []const SquareChange, sink: anytype) void {
+    std.debug.assert(changes.len == 2);
+    const flips = kingFlips(pos);
+    const cb = ClassBoard.of(pos);
+    for (0..2) |i| emitRayFocus(pos, &cb, changes[i], changes[1 - i], flips.w, flips.b, sink);
+}
+
+inline fn emitRayFocus(pos: *const position.Position, cb: *const ClassBoard, f: SquareChange, o: SquareChange, wflip: u6, bflip: u6, sink: anytype) void {
+    const rf = RayFocus.of(cb, f, o);
+    const s = rf.s;
+    const row = &SLOTS.sq[s];
+    const mb = &pos.mailbox;
+    const old_c_class = PIECE_CLASS[@intFromEnum(o.old)];
+    // (R): the old occupant's features on the old board.
+    if (@intFromEnum(f.old.pieceType()) < 5) {
+        const kc = KEPT_CLASS[@intFromEnum(f.old)];
+        const k1 = ~@as(u64, @bitCast((rf.view & @as(V64, @splat(kc))) == @as(V64, @splat(0))));
+        const k0 = (k1 & ~rf.cbit) | (if (old_c_class & kc != 0) rf.cbit else 0);
+        var tg = OUT_SLOTS[@intFromEnum(f.old)] & rf.near0 & k0;
+        const g = GroupPair.of(f.old, s, wflip, bflip);
+        while (tg != 0) : (tg &= tg - 1) {
+            const slot: u8 = @ctz(tg);
+            const t: u6 = @intCast(row[slot]);
+            g.emit(false, t, if (slot == rf.sc) o.old else mb[t], wflip, bflip, sink);
+        }
+    }
+    // (A): the new occupant's features on the new board.
+    if (@intFromEnum(f.new.pieceType()) < 5) {
+        const kc = KEPT_CLASS[@intFromEnum(f.new)];
+        var tg = OUT_SLOTS[@intFromEnum(f.new)] & rf.near1 & slotsWith(rf.view, @splat(kc));
+        const g = GroupPair.of(f.new, s, wflip, bflip);
+        while (tg != 0) : (tg &= tg - 1) {
+            const t: u6 = @intCast(row[@ctz(tg)]);
+            g.emit(true, t, mb[t], wflip, bflip, sink);
+        }
+    }
+    // (T): unchanged attackers, nearest on the union occupancy, not c.
+    const seen = rf.nearu & ~rf.cbit;
+    if (f.old != .none) {
+        var att = slotsWith(rf.view, INCOMING[@intFromEnum(f.old.pieceType())]) & seen;
+        while (att != 0) : (att &= att - 1) {
+            const x: u6 = @intCast(row[@ctz(att)]);
+            GroupPair.of(mb[x], x, wflip, bflip).emit(false, s, f.old, wflip, bflip, sink);
+        }
+    }
+    if (f.new != .none) {
+        var att = slotsWith(rf.view, INCOMING[@intFromEnum(f.new.pieceType())]) & seen;
+        while (att != 0) : (att &= att - 1) {
+            const x: u6 = @intCast(row[@ctz(att)]);
+            GroupPair.of(mb[x], x, wflip, bflip).emit(true, s, f.new, wflip, bflip, sink);
+        }
+    }
+    // (T) x-ray: a piece arriving on s blocks what sliders saw beyond it on the
+    // old board; a vacated s opens the new board's blockers beyond it.
+    if (f.old == .none) {
+        emitRayXray(false, pos, &rf, rf.near0, o.old, seen, wflip, bflip, sink);
+    } else if (f.new == .none) {
+        emitRayXray(true, pos, &rf, rf.near1, o.old, seen, wflip, bflip, sink);
+    }
+}
+
+/// The x-ray pairs of one focus: each slider seeing s (`seen` restricts to the
+/// union-nearest, unchanged slots) and the nearest blocker `near` beyond s on
+/// the opposite ray (rotating the mask by 32 bits maps each ray onto its
+/// opposite); raySpan pairs them by direction byte. Removes read the old board
+/// (`c_old` on the other changed square), adds the new one.
+inline fn emitRayXray(comptime add: bool, pos: *const position.Position, rf: *const RayFocus, near: u64, c_old: piece.Piece, seen: u64, wflip: u6, bflip: u6, sink: anytype) void {
+    const sl = slotsWith(rf.view, SLIDERS_AT) & seen;
+    if (sl == 0) return;
+    const row = &SLOTS.sq[rf.s];
+    const mb = &pos.mailbox;
+    const beyond = std.math.rotr(u64, near & ~KNIGHT_SLOTS, 32);
+    const valid = raySpan(sl) & raySpan(beyond);
+    var a = sl & valid;
+    var v = beyond & valid;
+    while (a != 0) : ({
+        a &= a - 1;
+        v &= v - 1;
+    }) {
+        const x: u6 = @intCast(row[@ctz(a)]);
+        const vslot: u8 = (@as(u8, @ctz(v)) + 32) & 63;
+        const vt: u6 = @intCast(row[vslot]);
+        const vp = if (!add and vslot == rf.sc) c_old else mb[vt];
+        const g = GroupPair.of(mb[x], x, wflip, bflip);
+        if (g.isFeature(vp)) g.emit(add, vt, vp, wflip, bflip, sink);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +996,12 @@ const CheckSink = struct {
     bad: u32 = 0,
     count: u32 = 0,
 
-    pub fn emit(self: *CheckSink, comptime black: bool, comptime add: bool, idx: usize) void {
+    pub fn emitPair(self: *CheckSink, comptime add: bool, iw: usize, ib: usize) void {
+        self.emit(false, add, iw);
+        self.emit(true, add, ib);
+    }
+
+    fn emit(self: *CheckSink, comptime black: bool, comptime add: bool, idx: usize) void {
         if (black and !self.use_b) return;
         if (!black and !self.use_w) return;
         self.count += 1;
@@ -652,6 +1098,155 @@ test "full-threats direct delta equals the enumeration XOR over game trees and r
                 emitMoveDelta(&pos, &[_]SquareChange{}, &sink);
                 try std.testing.expectEqual(@as(u32, 0), sink.count);
             }
+        }
+    }
+}
+
+test "full-threats perspective list equals the enumerated bitset over random games" {
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "1k6/1P6/8/8/8/8/6p1/K6R w - - 0 1",
+    };
+    var rng: u64 = 0xD1B5_4A32_D192_ED03;
+    var games: usize = 0;
+    while (games < 100) : (games += 1) {
+        var pos = try fen.parse(fens[games % fens.len]);
+        var ply: usize = 0;
+        while (ply < 160) : (ply += 1) {
+            var w: PerspBits = undefined;
+            var b: PerspBits = undefined;
+            enumerateColors(&pos, &w, &b);
+            inline for (.{ types.Color.white, types.Color.black }, 0..) |persp, pi| {
+                var list: [MAX_ACTIVE]u16 = undefined;
+                const n = enumeratePerspList(&pos, persp, &list);
+                var got: PerspBits = [_]u64{0} ** WORDS;
+                for (list[0..n]) |f| {
+                    // Each feature once: the sparse flip-cache diff relies on it.
+                    try std.testing.expect((got[f >> 6] >> @as(u6, @intCast(f & 63))) & 1 == 0);
+                    setBit(&got, f);
+                }
+                try std.testing.expectEqualSlices(u64, if (pi == 0) &w else &b, &got);
+            }
+            var moves = move_mod.MoveList.init();
+            legal.generate(&pos, &moves);
+            if (moves.slice().len == 0) break;
+            rng = rng *% 6364136223846793005 +% 1442695040888963407;
+            const mv = moves.slice()[@intCast((rng >> 33) % moves.slice().len)];
+            var st: make_unmake.StateInfo = .{};
+            _ = make_unmake.makeMove(&pos, mv, &st);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ray-slot walk gates (spec §2.6.1): for every move with two changed squares of
+// legal-move trees and random games, (1) emitMoveDeltaRay2 applied with strict
+// direction checks to the pre-move enumeration reproduces the post-move one,
+// and (2) its (direction, white index, black index) multiset equals
+// emitMoveDelta's.
+const CollectSink = struct {
+    n: usize = 0,
+    e: [512]u64 = undefined,
+
+    pub fn emitPair(self: *CollectSink, comptime add: bool, iw: usize, ib: usize) void {
+        self.e[self.n] = (@as(u64, @intFromBool(add)) << 40) | (@as(u64, iw) << 20) | ib;
+        self.n += 1;
+    }
+
+    fn sorted(self: *CollectSink) []u64 {
+        std.mem.sort(u64, self.e[0..self.n], {}, std.sort.asc(u64));
+        return self.e[0..self.n];
+    }
+};
+
+fn checkRayMove(pos: *position.Position, mv: move_mod.Move) !void {
+    var pre_w: PerspBits = undefined;
+    var pre_b: PerspBits = undefined;
+    enumerateColors(pos, &pre_w, &pre_b);
+    const pre_flips = kingFlips(pos);
+    var premail: [64]piece.Piece = undefined;
+    for (0..64) |i| premail[i] = pos.mailbox[i];
+    var st: make_unmake.StateInfo = .{};
+    _ = make_unmake.makeMove(pos, mv, &st);
+    defer make_unmake.unmakeMove(pos, mv, &st);
+    var changes: [4]SquareChange = undefined;
+    var nc: usize = 0;
+    for (0..64) |i| {
+        if (pos.mailbox[i] != premail[i]) {
+            changes[nc] = .{ .sq = @intCast(i), .old = premail[i], .new = pos.mailbox[i] };
+            nc += 1;
+        }
+    }
+    if (nc != 2) return;
+    var post_w: PerspBits = undefined;
+    var post_b: PerspBits = undefined;
+    enumerateColors(pos, &post_w, &post_b);
+    const post_flips = kingFlips(pos);
+    var sink = CheckSink{ .w = &pre_w, .b = &pre_b, .use_w = pre_flips.w == post_flips.w, .use_b = pre_flips.b == post_flips.b };
+    emitMoveDeltaRay2(pos, changes[0..2], &sink);
+    try std.testing.expectEqual(@as(u32, 0), sink.bad);
+    if (sink.use_w) try std.testing.expect(std.mem.eql(u64, &pre_w, &post_w));
+    if (sink.use_b) try std.testing.expect(std.mem.eql(u64, &pre_b, &post_b));
+    var a: CollectSink = .{};
+    var b: CollectSink = .{};
+    emitMoveDelta(pos, changes[0..2], &a);
+    emitMoveDeltaRay2(pos, changes[0..2], &b);
+    // The changed squares in either order.
+    var c: CollectSink = .{};
+    const swapped = [2]SquareChange{ changes[1], changes[0] };
+    emitMoveDeltaRay2(pos, &swapped, &c);
+    try std.testing.expectEqualSlices(u64, a.sorted(), b.sorted());
+    try std.testing.expectEqualSlices(u64, a.sorted(), c.sorted());
+}
+
+fn rayTreeWalk(pos: *position.Position, depth: u8) !void {
+    var moves = move_mod.MoveList.init();
+    legal.generate(pos, &moves);
+    for (moves.slice()) |mv| {
+        try checkRayMove(pos, mv);
+        if (depth > 1) {
+            var st: make_unmake.StateInfo = .{};
+            _ = make_unmake.makeMove(pos, mv, &st);
+            try rayTreeWalk(pos, depth - 1);
+            make_unmake.unmakeMove(pos, mv, &st);
+        }
+    }
+}
+
+test "full-threats ray-slot walk equals the direct delta over game trees and random games" {
+    if (comptime !has_avx2) return error.SkipZigTest;
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "8/8/2pp4/8/3p4/4K3/4P3/k7 w - - 0 1",
+        "4k3/8/8/2pP1p2/8/8/5P2/4K3 w - c6 0 2",
+        "r1bq1rk1/pp2nppp/2n1p3/3pP3/2PP4/P1PB1N2/5PPP/R1BQK2R w KQ - 0 10",
+        "1k6/1P6/8/8/8/8/6p1/K6R w - - 0 1",
+        "4r1k1/1q3pp1/p2b3p/1p1P4/2pQ4/P1B2N1P/1P3PP1/4R1K1 b - - 0 1",
+        "2rq1rk1/pb1nbppp/1p2pn2/2pp4/2PP4/1P1BPN2/PB1N1PPP/R2Q1RK1 w - - 0 1",
+    };
+    for (fens, 0..) |f, fi| {
+        var pos = try fen.parse(f);
+        try rayTreeWalk(&pos, if (fi < 2) 2 else 3);
+    }
+    var rng: u64 = 0x2545_F491_4F6C_DD1D;
+    var games: usize = 0;
+    while (games < 400) : (games += 1) {
+        var pos = try fen.parse(fens[games % fens.len]);
+        var ply: usize = 0;
+        while (ply < 160) : (ply += 1) {
+            var moves = move_mod.MoveList.init();
+            legal.generate(&pos, &moves);
+            if (moves.slice().len == 0) break;
+            rng = rng *% 6364136223846793005 +% 1442695040888963407;
+            const mv = moves.slice()[@intCast((rng >> 33) % moves.slice().len)];
+            try checkRayMove(&pos, mv);
+            var st: make_unmake.StateInfo = .{};
+            _ = make_unmake.makeMove(&pos, mv, &st);
         }
     }
 }

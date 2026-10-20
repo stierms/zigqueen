@@ -2,6 +2,7 @@ const std = @import("std");
 const attacks = @import("movegen/attacks.zig");
 const bench = @import("tools/bench.zig");
 const bitboard = @import("core/bitboard.zig");
+const build_options = @import("build_options");
 const datagen = @import("tools/datagen.zig");
 const fen = @import("core/fen.zig");
 const history_report = @import("tools/history_report.zig");
@@ -34,6 +35,7 @@ const zobrist = @import("core/zobrist.zig");
 pub fn main() !void {
     // Prewarm before dispatch/spawn. Engine constructors remain the safety boundary.
     @import("search/startup.zig").ensure();
+    defer if (build_options.pgo_dump) @import("tools/pgo_dump.zig").dump();
     var args = try std.process.argsWithAllocator(std.heap.page_allocator);
     defer args.deinit();
 
@@ -319,7 +321,10 @@ pub fn main() !void {
 fn parsePositionArg(arg: ?[]const u8) !position.Position {
     const text = arg orelse return fen.startpos();
     if (std.mem.eql(u8, text, "startpos")) return fen.startpos();
-    return fen.parse(text);
+    const pos = try fen.parse(text);
+    // Every FEN-argument mode evaluates or searches this board (Position.hasBackRankPawn).
+    if (pos.hasBackRankPawn()) return error.InvalidPiecePlacement;
+    return pos;
 }
 
 fn parseEvalOptions(eval_file_path_text: ?[]const u8, nnue_scale_text: ?[]const u8) !search_engine.EvalOptions {
@@ -367,7 +372,24 @@ test "parse eval options treats default sentinel as no override" {
     try std.testing.expectEqual(@as(?[]const u8, null), options.eval_file_path);
 }
 
+test "a FEN argument with a pawn on rank 1 or 8 is rejected" {
+    // Audit B (E-BACKRANK-PAWN, user decision 1): bench and the other CLI
+    // modes panicked a safe build on these boards.
+    for ([_][]const u8{
+        "r3k3/8/8/8/8/8/1n6/P3K2R w - - 0 1",
+        "1p2k3/2N5/8/8/8/8/8/4K3 w - - 0 1",
+    }) |text| try std.testing.expectError(error.InvalidPiecePlacement, parsePositionArg(text));
+    const no_pawn = try parsePositionArg("r3k3/8/8/8/8/8/1n6/4K2R w - - 0 1");
+    try std.testing.expectEqual(@as(u8, 0), no_pawn.countPieces(.white, .pawn));
+    _ = try parsePositionArg("4k3/P7/8/8/8/8/p7/4K3 w - - 0 1");
+    _ = try parsePositionArg("startpos");
+    _ = try parsePositionArg(null);
+}
+
 test "root modules compile" {
+    _ = @import("tb/tb.zig");
+    _ = @import("util/shared_blob.zig");
+    _ = @import("eval/net_share.zig");
     _ = attacks;
     _ = bench;
     _ = bitboard;
@@ -385,6 +407,8 @@ test "root modules compile" {
     _ = pseudo;
     _ = root_trace;
     _ = raw_search_probe;
+    // Its parser test covers the back-rank pawn skip (E-BACKRANK-PAWN).
+    _ = relabel;
     _ = search_profile;
     _ = search_profile_sequence;
     _ = square;

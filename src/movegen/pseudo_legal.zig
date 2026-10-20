@@ -25,45 +25,177 @@ fn generateFor(comptime side: types.Color, pos: *const position.Position, list: 
     generateCastlingMoves(side, pos, list);
 }
 
-/// Legality-FUSED generation (perf-r8). Valid only under the caller's proof
-/// that the side to move is NOT in check, NOTHING is pinned, no pawn of the
-/// side to move can capture en passant and the side to move has no castling
-/// right left (legal.canFuseLegality). In that regime the only
-/// pseudo-legal moves that can be illegal are king steps onto a square the
-/// opponent attacks, so masking the target sets deletes exactly the moves the
-/// legality filter used to delete — and the caller no longer has to re-read and
-/// re-pack the whole list afterwards (that pass was 54% of `generateHinted`'s
-/// samples). `enemy_king` is masked out of EVERY target set, reproducing the
-/// filter's `capturesOpponentKing` guard bit for bit; `king_unsafe` is the
-/// opponent's attack map with our king removed from occupancy.
-/// Move CONTENT and ORDER are identical to generate-then-filter.
-pub fn generateLegalNoPins(
+/// Legality-FUSED generation (perf-r8; pins, castling and en passant since
+/// perf r3) for a side NOT in check. A pseudo-legal move can then be illegal
+/// only as a capture of the enemy king (`enemy_king` is masked out of every
+/// target set, the filter's `capturesOpponentKing` guard), a king step onto a
+/// square the opponent attacks (`king_unsafe`: the opponent's attack map with
+/// our king removed from occupancy; occupancy at a destination never blocks
+/// attacks to it, and a captured piece never attacks its own square), a
+/// pinned piece leaving its line through the king (it keeps only
+/// `pin_lines[from]`, the squares the filter's collinearity test accepts), or
+/// one of the two moves a mask cannot decide, en passant and castling, which
+/// are emitted only when `special.allows` them (the filter's full per-move
+/// check). So the caller no longer re-reads and re-packs the whole list, and
+/// move CONTENT and ORDER are identical to generate-then-filter: every move
+/// is emitted at its generator position or dropped exactly when the filter
+/// drops it.
+pub fn generateLegalPinned(
     pos: *const position.Position,
     list: *move_mod.MoveList,
     enemy_king: bitboard.Bitboard,
     king_unsafe: bitboard.Bitboard,
+    pinned: bitboard.Bitboard,
+    pin_lines: *const [64]bitboard.Bitboard,
+    special: anytype,
 ) void {
     list.clear();
     switch (pos.side_to_move) {
-        .white => generateLegalNoPinsFor(.white, pos, list, enemy_king, king_unsafe),
-        .black => generateLegalNoPinsFor(.black, pos, list, enemy_king, king_unsafe),
+        .white => generateLegalPinnedFor(.white, pos, list, enemy_king, king_unsafe, pinned, pin_lines, special),
+        .black => generateLegalPinnedFor(.black, pos, list, enemy_king, king_unsafe, pinned, pin_lines, special),
     }
 }
 
-fn generateLegalNoPinsFor(
+fn generateLegalPinnedFor(
     comptime side: types.Color,
     pos: *const position.Position,
     list: *move_mod.MoveList,
     enemy_king: bitboard.Bitboard,
     king_unsafe: bitboard.Bitboard,
+    pinned: bitboard.Bitboard,
+    pin_lines: *const [64]bitboard.Bitboard,
+    special: anytype,
 ) void {
-    generatePawnMoves(side, pos, list, true, enemy_king);
-    generateLeaperMoves(side, pos, .knight, attacks.knightAttacksFrom, list, true, enemy_king);
-    generateSliderMoves(side, pos, .bishop, attacks.bishopAttacksOnTheFly, list, true, enemy_king);
-    generateSliderMoves(side, pos, .rook, attacks.rookAttacksOnTheFly, list, true, enemy_king);
-    generateSliderMoves(side, pos, .queen, attacks.queenAttacksOnTheFly, list, true, enemy_king);
+    generatePawnMovesPinned(side, pos, list, enemy_king, pinned, pin_lines, special);
+    generatePieceMovesPinned(side, pos, .knight, list, enemy_king, pinned, pin_lines);
+    generatePieceMovesPinned(side, pos, .bishop, list, enemy_king, pinned, pin_lines);
+    generatePieceMovesPinned(side, pos, .rook, list, enemy_king, pinned, pin_lines);
+    generatePieceMovesPinned(side, pos, .queen, list, enemy_king, pinned, pin_lines);
     generateLeaperMoves(side, pos, .king, attacks.kingAttacksFrom, list, true, enemy_king | king_unsafe);
-    // No castling moves: the caller only takes this path with no rights left.
+    // generateCastlingMoves emits nothing without a right of the mover; the
+    // test spares its in-check query.
+    const rights: u4 = @bitCast(pos.castling_rights);
+    const mover_rights: u4 = if (side == .white) 0b0011 else 0b1100;
+    if ((rights & mover_rights) == 0) return;
+    const before_castling = list.count;
+    generateCastlingMoves(side, pos, list);
+    var write_index = before_castling;
+    for (list.moves[before_castling..list.count]) |mv| {
+        if (!special.allows(mv)) continue;
+        list.moves[write_index] = mv;
+        write_index += 1;
+    }
+    list.count = write_index;
+}
+
+/// The squares a piece on `from` may move to: all when it is not pinned, its
+/// line through the king when it is.
+inline fn pinAllowed(pinned: bitboard.Bitboard, pin_lines: *const [64]bitboard.Bitboard, from: square.Square) bitboard.Bitboard {
+    const index = @intFromEnum(from);
+    return if (((pinned >> index) & 1) != 0) pin_lines[index] else ~@as(bitboard.Bitboard, 0);
+}
+
+/// `generatePawnMoves` with every push, double push, promotion and capture
+/// target intersected with the pawn's pin mask, captures of the enemy king
+/// dropped, and en passant emitted only when `special.allows` it. Same
+/// per-pawn emission order.
+fn generatePawnMovesPinned(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    list: *move_mod.MoveList,
+    enemy_king: bitboard.Bitboard,
+    pinned: bitboard.Bitboard,
+    pin_lines: *const [64]bitboard.Bitboard,
+    special: anytype,
+) void {
+    var pawns = pos.pieceBitboard(side, .pawn);
+    const opponent_occ = pos.occupancyFor(side.other()) & ~enemy_king;
+    const forward_delta: i8 = if (side == .white) 1 else -1;
+    const start_rank: u3 = if (side == .white) 1 else 6;
+    const promotion_from_rank: u3 = if (side == .white) 6 else 1;
+
+    while (pawns != 0) {
+        const from = bitboard.popLsbUnchecked(&pawns);
+        const file = from.file();
+        const rank = from.rank();
+        const allowed = pinAllowed(pinned, pin_lines, from);
+
+        const one_step_rank_i: i8 = @as(i8, @intCast(rank)) + forward_delta;
+        if (one_step_rank_i >= 0 and one_step_rank_i < 8) {
+            const one_step = square.Square.fromCoords(file, @intCast(one_step_rank_i));
+            if (!pos.isSquareOccupied(one_step)) {
+                const one_step_allowed = (allowed & bitboard.bit(one_step)) != 0;
+                if (rank == promotion_from_rank) {
+                    if (one_step_allowed) addPromotions(list, from, one_step, false);
+                } else {
+                    if (one_step_allowed) list.add(move_mod.Move.init(from, one_step, .quiet));
+                    if (rank == start_rank) {
+                        const two_step_rank_i = one_step_rank_i + forward_delta;
+                        if (two_step_rank_i >= 0 and two_step_rank_i < 8) {
+                            const two_step = square.Square.fromCoords(file, @intCast(two_step_rank_i));
+                            if (!pos.isSquareOccupied(two_step) and (allowed & bitboard.bit(two_step)) != 0) {
+                                list.add(move_mod.Move.init(from, two_step, .double_push));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ & allowed;
+        while (capture_targets != 0) {
+            const to = bitboard.popLsbUnchecked(&capture_targets);
+            if (rank == promotion_from_rank) {
+                addPromotions(list, from, to, true);
+            } else {
+                list.add(move_mod.Move.init(from, to, .capture));
+            }
+        }
+
+        if (pos.en_passant) |ep_square| {
+            const ep_mask = bitboard.bit(ep_square);
+            if ((attacks.pawnAttacksFrom(side, from) & ep_mask) != 0) {
+                const mv = move_mod.Move.init(from, ep_square, .en_passant);
+                if (special.allows(mv)) list.add(mv);
+            }
+        }
+    }
+}
+
+/// `generateLeaperMoves` / `generateSliderMoves` (knight, bishop, rook,
+/// queen) with each piece's targets intersected with its pin mask and the
+/// enemy king dropped. A pinned knight keeps nothing (no knight step stays on
+/// a line through its square).
+fn generatePieceMovesPinned(
+    comptime side: types.Color,
+    pos: *const position.Position,
+    comptime piece_type: piece.PieceType,
+    list: *move_mod.MoveList,
+    enemy_king: bitboard.Bitboard,
+    pinned: bitboard.Bitboard,
+    pin_lines: *const [64]bitboard.Bitboard,
+) void {
+    var pieces = pos.pieceBitboard(side, piece_type);
+    const blocked = pos.occupancyFor(side) | enemy_king;
+    const opp_occ = pos.occupancyFor(side.other());
+    const occupied = pos.occupancy();
+
+    while (pieces != 0) {
+        const from = bitboard.popLsbUnchecked(&pieces);
+        const reach = switch (piece_type) {
+            .knight => attacks.knightAttacksFrom(from),
+            .bishop => attacks.bishopAttacksOnTheFly(from, occupied),
+            .rook => attacks.rookAttacksOnTheFly(from, occupied),
+            .queen => attacks.queenAttacksOnTheFly(from, occupied),
+            else => @compileError("pawns and kings have their own generators"),
+        };
+        var targets = reach & ~blocked & pinAllowed(pinned, pin_lines, from);
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
+            const flag: move_mod.MoveFlag = if ((opp_occ & bitboard.bit(to)) != 0) .capture else .quiet;
+            list.add(move_mod.Move.init(from, to, flag));
+        }
+    }
 }
 
 /// Candidate generation for a side IN CHECK (perf push 2026-10-08). `allow`
@@ -115,7 +247,8 @@ fn generatePawnEvasionCandidates(
     const start_rank: u3 = if (side == .white) 1 else 6;
     const promotion_from_rank: u3 = if (side == .white) 6 else 1;
 
-    while (bitboard.popLsb(&pawns)) |from| {
+    while (pawns != 0) {
+        const from = bitboard.popLsbUnchecked(&pawns);
         const file = from.file();
         const rank = from.rank();
 
@@ -142,7 +275,8 @@ fn generatePawnEvasionCandidates(
         }
 
         var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ & allow;
-        while (bitboard.popLsb(&capture_targets)) |to| {
+        while (capture_targets != 0) {
+            const to = bitboard.popLsbUnchecked(&capture_targets);
             if (rank == promotion_from_rank) {
                 addPromotions(list, from, to, true);
             } else {
@@ -189,7 +323,8 @@ fn generatePawnMoves(
     const start_rank: u3 = if (side == .white) 1 else 6;
     const promotion_from_rank: u3 = if (side == .white) 6 else 1;
 
-    while (bitboard.popLsb(&pawns)) |from| {
+    while (pawns != 0) {
+        const from = bitboard.popLsbUnchecked(&pawns);
         const file = from.file();
         const rank = from.rank();
 
@@ -216,7 +351,8 @@ fn generatePawnMoves(
 
         var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ;
         if (masked) capture_targets &= ~forbidden;
-        while (bitboard.popLsb(&capture_targets)) |to| {
+        while (capture_targets != 0) {
+            const to = bitboard.popLsbUnchecked(&capture_targets);
             if (rank == promotion_from_rank) {
                 addPromotions(list, from, to, true);
             } else {
@@ -250,7 +386,8 @@ fn generateTacticalPawnMoves(
     const forward_delta: i8 = if (side == .white) 1 else -1;
     const promotion_from_rank: u3 = if (side == .white) 6 else 1;
 
-    while (bitboard.popLsb(&pawns)) |from| {
+    while (pawns != 0) {
+        const from = bitboard.popLsbUnchecked(&pawns);
         const file = from.file();
         const rank = from.rank();
 
@@ -264,7 +401,8 @@ fn generateTacticalPawnMoves(
 
         var capture_targets = attacks.pawnAttacksFrom(side, from) & opponent_occ;
         if (masked) capture_targets &= ~forbidden;
-        while (bitboard.popLsb(&capture_targets)) |to| {
+        while (capture_targets != 0) {
+            const to = bitboard.popLsbUnchecked(&capture_targets);
             if (rank == promotion_from_rank) {
                 addPromotions(list, from, to, true);
             } else {
@@ -315,25 +453,41 @@ fn generateQuietChecksFor(comptime side: types.Color, pos: *const position.Posit
     const pawn_checks = attacks.pawnAttacksFrom(enemy, ksq) & empty;
 
     var knights = pos.pieceBitboard(side, .knight);
-    while (bitboard.popLsb(&knights)) |from| {
+    while (knights != 0) {
+        const from = bitboard.popLsbUnchecked(&knights);
         var targets = attacks.knightAttacksFrom(from) & knight_checks;
-        while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
+            list.add(move_mod.Move.init(from, to, .quiet));
+        }
     }
     var bishops = pos.pieceBitboard(side, .bishop);
-    while (bitboard.popLsb(&bishops)) |from| {
+    while (bishops != 0) {
+        const from = bitboard.popLsbUnchecked(&bishops);
         var targets = attacks.bishopAttacksOnTheFly(from, occ) & bishop_checks;
-        while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
+            list.add(move_mod.Move.init(from, to, .quiet));
+        }
     }
     var rooks = pos.pieceBitboard(side, .rook);
-    while (bitboard.popLsb(&rooks)) |from| {
+    while (rooks != 0) {
+        const from = bitboard.popLsbUnchecked(&rooks);
         var targets = attacks.rookAttacksOnTheFly(from, occ) & rook_checks;
-        while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
+            list.add(move_mod.Move.init(from, to, .quiet));
+        }
     }
     var queens = pos.pieceBitboard(side, .queen);
-    while (bitboard.popLsb(&queens)) |from| {
+    while (queens != 0) {
+        const from = bitboard.popLsbUnchecked(&queens);
         const from_attacks = attacks.bishopAttacksOnTheFly(from, occ) | attacks.rookAttacksOnTheFly(from, occ);
         var targets = from_attacks & (bishop_checks | rook_checks);
-        while (bitboard.popLsb(&targets)) |to| list.add(move_mod.Move.init(from, to, .quiet));
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
+            list.add(move_mod.Move.init(from, to, .quiet));
+        }
     }
 
     // Pawn pushes landing on a checking square. A checking landing square is
@@ -343,7 +497,8 @@ fn generateQuietChecksFor(comptime side: types.Color, pos: *const position.Posit
     const start_rank: i8 = if (side == .white) 1 else 6;
     const my_pawns = pos.pieceBitboard(side, .pawn);
     var pawn_targets = pawn_checks;
-    while (bitboard.popLsb(&pawn_targets)) |to| {
+    while (pawn_targets != 0) {
+        const to = bitboard.popLsbUnchecked(&pawn_targets);
         const from_rank_i: i8 = @as(i8, @intCast(to.rank())) - forward_delta;
         if (from_rank_i < 0 or from_rank_i > 7) continue;
         const from_sq = square.Square.fromCoords(to.file(), @intCast(from_rank_i));
@@ -374,9 +529,11 @@ fn generateLeaperMoves(
     const blocked = if (masked) pos.occupancyFor(side) | forbidden else pos.occupancyFor(side);
     const opp_occ = pos.occupancyFor(side.other());
 
-    while (bitboard.popLsb(&pieces)) |from| {
+    while (pieces != 0) {
+        const from = bitboard.popLsbUnchecked(&pieces);
         var targets = attack_fn(from) & ~blocked;
-        while (bitboard.popLsb(&targets)) |to| {
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
             const flag: move_mod.MoveFlag = if ((opp_occ & bitboard.bit(to)) != 0) .capture else .quiet;
             list.add(move_mod.Move.init(from, to, flag));
         }
@@ -395,9 +552,11 @@ fn generateTacticalLeaperMoves(
     var pieces = pos.pieceBitboard(side, piece_type);
     const opp_occ = if (masked) pos.occupancyFor(side.other()) & ~forbidden else pos.occupancyFor(side.other());
 
-    while (bitboard.popLsb(&pieces)) |from| {
+    while (pieces != 0) {
+        const from = bitboard.popLsbUnchecked(&pieces);
         var targets = attack_fn(from) & opp_occ;
-        while (bitboard.popLsb(&targets)) |to| {
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
             list.add(move_mod.Move.init(from, to, .capture));
         }
     }
@@ -417,9 +576,11 @@ fn generateSliderMoves(
     const opp_occ = pos.occupancyFor(side.other());
     const occupied = pos.occupancy();
 
-    while (bitboard.popLsb(&pieces)) |from| {
+    while (pieces != 0) {
+        const from = bitboard.popLsbUnchecked(&pieces);
         var targets = attack_fn(from, occupied) & ~blocked;
-        while (bitboard.popLsb(&targets)) |to| {
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
             const flag: move_mod.MoveFlag = if ((opp_occ & bitboard.bit(to)) != 0) .capture else .quiet;
             list.add(move_mod.Move.init(from, to, flag));
         }
@@ -439,9 +600,11 @@ fn generateTacticalSliderMoves(
     const opp_occ = if (masked) pos.occupancyFor(side.other()) & ~forbidden else pos.occupancyFor(side.other());
     const occupied = pos.occupancy();
 
-    while (bitboard.popLsb(&pieces)) |from| {
+    while (pieces != 0) {
+        const from = bitboard.popLsbUnchecked(&pieces);
         var targets = attack_fn(from, occupied) & opp_occ;
-        while (bitboard.popLsb(&targets)) |to| {
+        while (targets != 0) {
+            const to = bitboard.popLsbUnchecked(&targets);
             list.add(move_mod.Move.init(from, to, .capture));
         }
     }

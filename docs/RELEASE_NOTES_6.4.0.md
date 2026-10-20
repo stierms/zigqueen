@@ -39,7 +39,7 @@ and 3697 for 6.3.
 
 These are our own performance estimates against CCRL-rated engines, not CCRL
 ratings. zigqueen forfeited none of the 2,068 games.
-[STRENGTH.md](STRENGTH.md) has the per-opponent results.
+[STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.4.0/docs/STRENGTH.md) has the per-opponent results.
 
 The larger network costs some speed: 6.4.0 searches about 4% fewer positions
 per second than 6.3.0. The numbers above already include that.

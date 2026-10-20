@@ -236,7 +236,6 @@ pub const Pool = struct {
             slot.engine.evaluator = owner.borrow(slot.engine.allocator);
             slot.engine.contempt_cp = coordinator.contempt_cp;
             slot.engine.basin_config = coordinator.basin_config;
-            slot.engine.eval_cache.assoc = coordinator.eval_cache.assoc;
         }
         self.network_epoch = network_epoch;
         self.config_epoch = config_epoch;
@@ -302,7 +301,7 @@ pub const Pool = struct {
         // value. Helpers never borrow a coordinator-local move buffer.
         if (policy) |p| {
             self.job.?.root_moves = p.moves;
-            self.job.?.root_wdl = p.wdl;
+            self.job.?.root_wdl = p.authoritativeWdl();
         }
         if (self.control.stopping()) return;
         if (self.control.budget) |*budget| {
@@ -364,7 +363,7 @@ test "drawn root policy is copied before helpers and survives tiny budgets" {
     defer pool.destroy();
     const request = TestRequest{ .position = try @import("../core/fen.zig").parse("7k/1q6/7P/6P1/2Q3K1/8/8/8 b - - 54 170") };
     var lease = syzygy.beginJob();
-    const policy = lease.probeRootMoves(&request.position, null).?;
+    const policy = lease.probeRootMoves(&request.position, null, null).?;
     lease.deinit();
     for ([_]u64{ 1, 64, 129, 20000 }, 1..) |n, id| {
         const outcome = try pool.run(&coordinator, id, 1, 1, &request, .{ .node_limit = n });
@@ -379,4 +378,130 @@ test "drawn root policy is copied before helpers and survives tiny budgets" {
             try std.testing.expectEqual(@as(usize, 4), outcome.participants);
         }
     }
+}
+
+/// Test helper: a FEN plus UCI moves as a pool request, with the game history
+/// a GUI would send.
+fn replayRequestForTest(fen_text: []const u8, moves_text: []const []const u8) !TestRequest {
+    const legal = @import("../movegen/legal.zig");
+    const make_unmake = @import("../movegen/make_unmake.zig");
+    var request = TestRequest{ .position = try @import("../core/fen.zig").parse(fen_text) };
+    request.history.push(request.position.zobrist_key);
+    for (moves_text) |text| {
+        var moves = @import("../core/move.zig").MoveList.init();
+        legal.generate(&request.position, &moves);
+        var found: ?@import("../core/move.zig").Move = null;
+        for (moves.slice()) |mv| {
+            var buffer: [5]u8 = undefined;
+            if (std.mem.eql(u8, mv.toUci(&buffer), text)) found = mv;
+        }
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&request.position, found orelse return error.IllegalTestMove, &state);
+        request.history.push(request.position.zobrist_key);
+    }
+    return request;
+}
+
+test "Threads 3: an unproven boundary win keeps the searched score" {
+    // Review round (U-TB-DTZ100): the coordinator reported 28000, and helpers
+    // copied the ranked win as job.root_wdl.
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var owner = try eval_backend.EngineState.init(a, .{});
+    defer owner.deinit();
+    var coordinator = try engine_mod.Engine.initForParallel(a, 16, 3, &owner);
+    defer coordinator.deinit();
+    var external = std.atomic.Value(bool).init(false);
+    const pool = try Pool.create(a, 3, 16, &owner, &external, 1, 1);
+    defer pool.destroy();
+    var request = try replayRequestForTest("8/8/Q7/6p1/8/8/8/3K2k1 w - - 97 1", &.{});
+    request.root_moves = @import("../core/move.zig").MoveList.init();
+    request.root_moves.?.add(@import("../core/move.zig").Move.init(.a6, .a2, .quiet));
+    const full = try pool.run(&coordinator, 1, 1, 1, &request, .{ .depth = 8 });
+    try std.testing.expectEqual(request.root_moves.?.moves[0], full.result.best_move.?);
+    try std.testing.expectEqual(@as(i32, 0), full.result.score);
+    try std.testing.expectEqual(@as(usize, 3), full.participants);
+    for ([_]u64{ 1, 64, 129, 2000 }, 2..) |n, id| {
+        const early = try pool.run(&coordinator, id, 1, 1, &request, .{ .node_limit = n });
+        try std.testing.expect(early.result.nodes <= n);
+        try std.testing.expectEqual(request.root_moves.?.moves[0], early.result.best_move.?);
+        try std.testing.expect(!@import("score.zig").isDecisive(early.result.score));
+    }
+}
+
+test "Threads 3: a certain win keeps uncertain wins out of the searched set" {
+    // Review round (three-way review, Astra F1): Threads 3 also played the
+    // drawing boundary win a6a2 with cp 28000 next to the certain a6a5.
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var owner = try eval_backend.EngineState.init(a, .{});
+    defer owner.deinit();
+    var coordinator = try engine_mod.Engine.initForParallel(a, 16, 3, &owner);
+    defer coordinator.deinit();
+    var external = std.atomic.Value(bool).init(false);
+    const pool = try Pool.create(a, 3, 16, &owner, &external, 1, 1);
+    defer pool.destroy();
+    const Move = @import("../core/move.zig").Move;
+    var request = try replayRequestForTest("8/8/8/Q5p1/8/8/8/3K2k1 b - - 94 1", &.{ "g1h1", "a5a6", "h1g1" });
+    request.root_moves = @import("../core/move.zig").MoveList.init();
+    request.root_moves.?.add(Move.init(.a6, .a2, .quiet));
+    request.root_moves.?.add(Move.init(.a6, .a5, .quiet));
+    const full = try pool.run(&coordinator, 1, 1, 1, &request, .{ .depth = 8 });
+    try std.testing.expectEqual(Move.init(.a6, .a5, .quiet), full.result.best_move.?);
+    for ([_]u64{ 1, 2, 64, 200 }, 2..) |n, id| {
+        const early = try pool.run(&coordinator, id, 1, 1, &request, .{ .node_limit = n });
+        try std.testing.expect(early.result.nodes <= n);
+        try std.testing.expectEqual(Move.init(.a6, .a5, .quiet), early.result.best_move.?);
+    }
+}
+
+test "Threads 3: no instant TB win once the window holds a repeated position" {
+    // Review round (U-TB-REP): e1f1 was played at once; Black's only reply
+    // h1h2 then recreates the start position a third time.
+    const a = std.testing.allocator;
+    const path = std.process.getEnvVarOwned(a, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer a.free(path);
+    try std.testing.expect(syzygy.init(path));
+    defer syzygy.disable();
+    var owner = try eval_backend.EngineState.init(a, .{});
+    defer owner.deinit();
+    var coordinator = try engine_mod.Engine.initForParallel(a, 16, 3, &owner);
+    defer coordinator.deinit();
+    var external = std.atomic.Value(bool).init(false);
+    const pool = try Pool.create(a, 3, 16, &owner, &external, 1, 1);
+    defer pool.destroy();
+    var request = try replayRequestForTest("8/8/8/8/8/8/7k/R4K2 w - - 1 1", &.{ "f1e1", "h2h3", "e1f1", "h3h2", "f1e1", "h2h1" });
+    const searched = try pool.run(&coordinator, 1, 1, 1, &request, .{ .depth = 8 });
+    const best = searched.result.best_move.?;
+    try std.testing.expect(best != @import("../core/move.zig").Move.init(.e1, .f1, .quiet));
+    try std.testing.expect(searched.result.score > 0);
+    try std.testing.expectEqual(@as(usize, 3), searched.participants);
+    // Black's replies to the chosen move recreate no position for a third time.
+    const make_unmake = @import("../movegen/make_unmake.zig");
+    var child = request.position;
+    var state = make_unmake.StateInfo{};
+    _ = make_unmake.makeMove(&child, best, &state);
+    try std.testing.expect(request.history.childOccurrences(child.zobrist_key, child.halfmove_clock) < 2);
+    var line = request.history;
+    line.push(child.zobrist_key);
+    var replies = @import("../core/move.zig").MoveList.init();
+    @import("../movegen/legal.zig").generate(&child, &replies);
+    for (replies.slice()) |reply| {
+        var grandchild = child;
+        var reply_state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&grandchild, reply, &reply_state);
+        try std.testing.expect(line.childOccurrences(grandchild.zobrist_key, grandchild.halfmove_clock) < 2);
+    }
+    // Restricted to e1f2, the search finds the mate (winning control).
+    request.root_moves = @import("../core/move.zig").MoveList.init();
+    request.root_moves.?.add(@import("../core/move.zig").Move.init(.e1, .f2, .quiet));
+    const control = try pool.run(&coordinator, 2, 1, 1, &request, .{ .depth = 8 });
+    try std.testing.expectEqual(request.root_moves.?.moves[0], control.result.best_move.?);
+    try std.testing.expect(@import("score.zig").isMateLike(control.result.score) and control.result.score > 0);
 }

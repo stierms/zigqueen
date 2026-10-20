@@ -31,6 +31,13 @@ const PinDirection = enum(u3) {
 const PIN_RAYS = initPinRays();
 const PIN_ROOK_RAYS = initPinRookRays();
 const PIN_BISHOP_RAYS = initPinBishopRays();
+/// BETWEEN[a][b]: the squares strictly between two squares on one rank, file
+/// or diagonal; 0 when they share no line (or are equal or adjacent).
+const BETWEEN = initBetween();
+/// LINE[a][b]: every square of the rank, file or diagonal through two
+/// distinct squares a and b; 0 when they share none. A target `to` of a piece
+/// on `from` lies in LINE[king][from] exactly when isCollinear(king, from, to).
+const LINE = initLine();
 
 const LegalityContext = struct {
     side: types.Color,
@@ -70,20 +77,16 @@ pub fn generateHinted(pos: *const position.Position, list: *move_mod.MoveList, k
         filterGeneral(pos, list, &ctx, false);
         return;
     }
-    // FUSED fast path (perf-r8). When no mover pawn can capture en passant and
-    // the mover has no castling right left (canFuseLegality), the legality
-    // context alone decides everything, and
-    // if additionally nothing is pinned and we are not in check the only
-    // illegal pseudo-legal moves are king steps onto attacked squares. Handing
-    // the two masks to the generator deletes those at the source, so the whole
-    // generate-then-re-pack pass disappears (it was 54% of this function's
-    // samples). The context is built FIRST here; the general path below builds
-    // exactly the same one, so nothing is computed twice.
-    if (canFuseLegality(pos)) {
+    // FUSED path (perf-r8; pins, castling and en passant since perf r3): not in
+    // check, the legality context decides every move at the source
+    // (pseudo.generateLegalPinned), so the generate-then-re-pack pass (54% of
+    // this function's samples in r8) disappears. The context is built FIRST;
+    // in check without a hint the full filter runs on the same context.
+    if (pos.kingSquare(pos.side_to_move) != null) {
         var ctx: LegalityContext = undefined;
         initLegalityContext(pos, known_in_check, &ctx);
-        if (!ctx.in_check and ctx.pinned == 0) {
-            pseudo.generateLegalNoPins(pos, list, ctx.opponent_king, opponentAttacksKingRemoved(&ctx));
+        if (!ctx.in_check) {
+            generateLegalNotInCheck(pos, list, &ctx);
             return;
         }
         pseudo.generate(pos, list);
@@ -102,6 +105,32 @@ pub fn generateHinted(pos: *const position.Position, list: *move_mod.MoveList, k
     filterGeneral(pos, list, &ctx, false);
 }
 
+/// Legal moves of a side not in check, generated legal (pseudo.generateLegalPinned):
+/// exactly the generate-then-filter list, in its order. Pins come from the
+/// context; en passant and castling get the filter's full per-move check.
+fn generateLegalNotInCheck(pos: *const position.Position, list: *move_mod.MoveList, ctx: *const LegalityContext) void {
+    std.debug.assert(!ctx.in_check);
+    const Special = struct {
+        pos: *const position.Position,
+        ctx: *const LegalityContext,
+
+        pub inline fn allows(self: @This(), mv: move_mod.Move) bool {
+            std.debug.assert(mv.flag == .en_passant or mv.flag == .castle);
+            const moving_type: piece.PieceType = if (mv.flag == .castle) .king else .pawn;
+            return isLegalPseudoMove(self.pos, mv, moving_type, self.ctx);
+        }
+    };
+    pseudo.generateLegalPinned(
+        pos,
+        list,
+        ctx.opponent_king,
+        opponentAttacksKingRemoved(ctx),
+        ctx.pinned,
+        &LINE[@intFromEnum(ctx.king_square)],
+        Special{ .pos = pos, .ctx = ctx },
+    );
+}
+
 /// The squares a NON-KING, non-en-passant move must land on to possibly
 /// resolve a check against `ctx.king_square`: with exactly one checker C, C
 /// itself plus the squares strictly between C and the king (empty for a pawn,
@@ -116,7 +145,7 @@ pub fn generateHinted(pos: *const position.Position, list: *move_mod.MoveList, k
 /// no checker at all (impossible with a correct hint) masks nothing.
 fn evasionTargets(ctx: *const LegalityContext) bitboard.Bitboard {
     const king = ctx.king_square;
-    const king_index = king.index();
+    const king_index = @intFromEnum(king);
     const occupied = ctx.occupied;
     const checkers = (attacks.pawnAttacksFromDirect(ctx.side, king) & ctx.opponent_pawns) |
         (attacks.knightAttacksDirect(king) & ctx.opponent_knights) |
@@ -516,13 +545,25 @@ fn opponentAttacksKingRemoved(ctx: *const LegalityContext) bitboard.Bitboard {
     const occ = ctx.occupied & ~ctx.king_mask;
     var attacked = attacks.pawnAttacksDirect(ctx.opponent, ctx.opponent_pawns);
     var knights = ctx.opponent_knights;
-    while (bitboard.popLsb(&knights)) |sq| attacked |= attacks.knightAttacksDirect(sq);
+    while (knights != 0) {
+        const sq = bitboard.popLsbUnchecked(&knights);
+        attacked |= attacks.knightAttacksDirect(sq);
+    }
     var bishop_like = ctx.opponent_bishops | ctx.opponent_queens;
-    while (bitboard.popLsb(&bishop_like)) |sq| attacked |= attacks.bishopAttacksDirect(sq, occ);
+    while (bishop_like != 0) {
+        const sq = bitboard.popLsbUnchecked(&bishop_like);
+        attacked |= attacks.bishopAttacksDirect(sq, occ);
+    }
     var rook_like = ctx.opponent_rooks | ctx.opponent_queens;
-    while (bitboard.popLsb(&rook_like)) |sq| attacked |= attacks.rookAttacksDirect(sq, occ);
+    while (rook_like != 0) {
+        const sq = bitboard.popLsbUnchecked(&rook_like);
+        attacked |= attacks.rookAttacksDirect(sq, occ);
+    }
     var opp_king = ctx.opponent_king;
-    while (bitboard.popLsb(&opp_king)) |sq| attacked |= attacks.kingAttacksDirect(sq);
+    while (opp_king != 0) {
+        const sq = bitboard.popLsbUnchecked(&opp_king);
+        attacked |= attacks.kingAttacksDirect(sq);
+    }
     return attacked;
 }
 
@@ -796,7 +837,16 @@ inline fn moveStaysOnPinLine(king_square: square.Square, from: square.Square, to
     return isCollinear(king_square, from, to);
 }
 
-inline fn isCollinear(a: square.Square, b: square.Square, c: square.Square) bool {
+/// Whether `c` lies on the rank, file or diagonal through the distinct
+/// squares `a` and `b` (every caller passes a king and another piece): one
+/// LINE lookup instead of the file/rank/diagonal arithmetic it replaced
+/// (`isCollinearByCoords`, the test reference).
+pub inline fn isCollinear(a: square.Square, b: square.Square, c: square.Square) bool {
+    std.debug.assert(a != b);
+    return (LINE[@intFromEnum(a)][@intFromEnum(b)] & bitboard.bit(c)) != 0;
+}
+
+fn isCollinearByCoords(a: square.Square, b: square.Square, c: square.Square) bool {
     if (a.file() == b.file() and b.file() == c.file()) return true;
     if (a.rank() == b.rank() and b.rank() == c.rank()) return true;
 
@@ -809,6 +859,20 @@ inline fn isCollinear(a: square.Square, b: square.Square, c: square.Square) bool
 
     return (af - ar == bf - br and bf - br == cf - cr) or
         (af + ar == bf + br and bf + br == cf + cr);
+}
+
+test "LINE collinearity equals the coordinate test for distinct squares" {
+    for (0..64) |a| {
+        for (0..64) |b| {
+            if (a == b) continue;
+            for (0..64) |c| {
+                const sa = square.Square.fromIndex(@intCast(a));
+                const sb = square.Square.fromIndex(@intCast(b));
+                const sc = square.Square.fromIndex(@intCast(c));
+                try std.testing.expectEqual(isCollinearByCoords(sa, sb, sc), isCollinear(sa, sb, sc));
+            }
+        }
+    }
 }
 
 /// Fills `ctx` through an out-pointer instead of returning by value: the sret
@@ -869,6 +933,23 @@ fn initLegalityContextFor(comptime side: types.Color, pos: *const position.Posit
     };
 }
 
+/// Pieces of `side` pinned to their own king by enemy sliders: the only
+/// piece between the king and an enemy bishop/rook/queen on that line
+/// (either colour's view, unlike the legality context, which is the side to
+/// move's). 0 without a king. Used by the pin-aware SEE.
+pub fn pinnedPieces(pos: *const position.Position, side: types.Color) bitboard.Bitboard {
+    const king_square = pos.kingSquare(side) orelse return 0;
+    const enemy = side.other();
+    const enemy_queens = pos.pieceBitboard(enemy, .queen);
+    return computePinnedPieces(
+        pos.occupancy(),
+        pos.occupancyFor(side),
+        pos.pieceBitboard(enemy, .bishop) | enemy_queens,
+        pos.pieceBitboard(enemy, .rook) | enemy_queens,
+        king_square,
+    );
+}
+
 fn computePinnedPieces(
     occupied: bitboard.Bitboard,
     own_occ: bitboard.Bitboard,
@@ -876,7 +957,33 @@ fn computePinnedPieces(
     enemy_rook_like: bitboard.Bitboard,
     king_square: square.Square,
 ) bitboard.Bitboard {
-    const king_index = king_square.index();
+    // From the snipers instead of the rays: an enemy slider on a line of its
+    // kind through the king pins the one piece between them when that piece
+    // is the only one there and is ours. On each ray this is the per-ray test
+    // (first blocker ours, next blocker such a slider; a farther slider on
+    // the same ray has two pieces in between), without the ray walk's three
+    // data-dependent exits per ray; only the sniper loop branches.
+    const king_index = @intFromEnum(king_square);
+    var snipers = (PIN_ROOK_RAYS[king_index] & enemy_rook_like) | (PIN_BISHOP_RAYS[king_index] & enemy_bishop_like);
+    var pinned: bitboard.Bitboard = 0;
+    while (snipers != 0) {
+        const sniper = bitboard.popLsbUnchecked(&snipers);
+        const between = BETWEEN[king_index][@intFromEnum(sniper)] & occupied;
+        const single = @intFromBool(between != 0) & @intFromBool((between & (between -% 1)) == 0);
+        pinned |= between & own_occ & (0 -% @as(bitboard.Bitboard, single));
+    }
+    return pinned;
+}
+
+/// The per-ray form `computePinnedPieces` replaced (differential test reference).
+fn computePinnedPiecesByRays(
+    occupied: bitboard.Bitboard,
+    own_occ: bitboard.Bitboard,
+    enemy_bishop_like: bitboard.Bitboard,
+    enemy_rook_like: bitboard.Bitboard,
+    king_square: square.Square,
+) bitboard.Bitboard {
+    const king_index = @intFromEnum(king_square);
     var pinned: bitboard.Bitboard = 0;
     if ((enemy_rook_like & PIN_ROOK_RAYS[king_index]) != 0) {
         pinned |= pinnedAlongRay(occupied, own_occ, enemy_rook_like, king_index, .east);
@@ -907,7 +1014,7 @@ inline fn pinnedAlongRay(
     const candidate_mask = bitboard.bit(candidate);
     if ((own_occ & candidate_mask) == 0) return 0;
 
-    const beyond_candidate = PIN_RAYS[candidate.index()][@intFromEnum(direction)] & occupied;
+    const beyond_candidate = PIN_RAYS[@intFromEnum(candidate)][@intFromEnum(direction)] & occupied;
     if (beyond_candidate == 0) return 0;
     const pinner = firstBlocker(beyond_candidate, direction);
     return if ((enemy_sliders & bitboard.bit(pinner)) != 0) candidate_mask else 0;
@@ -933,6 +1040,43 @@ fn initPinRays() [64][8]bitboard.Bitboard {
         table[idx][@intFromEnum(PinDirection.north_west)] = rayMask(from, -1, 1);
         table[idx][@intFromEnum(PinDirection.south_east)] = rayMask(from, 1, -1);
         table[idx][@intFromEnum(PinDirection.south_west)] = rayMask(from, -1, -1);
+    }
+    return table;
+}
+
+fn initBetween() [64][64]bitboard.Bitboard {
+    @setEvalBranchQuota(200_000);
+    var table = [_][64]bitboard.Bitboard{[_]bitboard.Bitboard{0} ** 64} ** 64;
+    for (0..64) |from| {
+        for (0..8) |direction| {
+            const ray = PIN_RAYS[from][direction];
+            var rest = ray;
+            while (rest != 0) {
+                const to = @ctz(rest);
+                rest &= rest - 1;
+                table[from][to] = ray & ~PIN_RAYS[to][direction] & ~(@as(bitboard.Bitboard, 1) << to);
+            }
+        }
+    }
+    return table;
+}
+
+fn initLine() [64][64]bitboard.Bitboard {
+    @setEvalBranchQuota(200_000);
+    var table = [_][64]bitboard.Bitboard{[_]bitboard.Bitboard{0} ** 64} ** 64;
+    // Opposite directions in PinDirection order (north, south, east, west,
+    // north_east, north_west, south_east, south_west).
+    const opposite = [8]usize{ 1, 0, 3, 2, 7, 6, 5, 4 };
+    for (0..64) |from| {
+        for (0..8) |direction| {
+            const line = PIN_RAYS[from][direction] | PIN_RAYS[from][opposite[direction]] | (@as(bitboard.Bitboard, 1) << from);
+            var rest = PIN_RAYS[from][direction];
+            while (rest != 0) {
+                const to = @ctz(rest);
+                rest &= rest - 1;
+                table[from][to] = line;
+            }
+        }
     }
     return table;
 }
@@ -993,10 +1137,11 @@ fn castleRookMove(side: types.Color, king_destination: square.Square) CastleRook
 }
 
 fn enPassantCapturedPawnSquare(side: types.Color, destination: square.Square) square.Square {
-    return switch (side) {
-        .white => square.Square.fromCoords(destination.file(), @intCast(@as(u8, destination.rank()) - 1)),
-        .black => square.Square.fromCoords(destination.file(), @intCast(@as(u8, destination.rank()) + 1)),
-    };
+    const index: u6 = @intFromEnum(destination);
+    return @enumFromInt(switch (side) {
+        .white => index - 8,
+        .black => index + 8,
+    });
 }
 
 fn removeCapturedFromBitboards(
@@ -1563,15 +1708,31 @@ test "fused generation with opponent-only castling rights or an uncapturable en-
         // Mover without rights, opponent with rights (both colours).
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R4RK1 w kq - 0 1",
         "r4rk1/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQ - 0 1",
-        // En-passant square no mover pawn attacks, and one that is attacked.
-        "4k3/8/8/3p4/8/8/8/4K3 w - d6 0 1",
+        // An en-passant square a mover pawn attacks (the uncapturable ones
+        // follow below).
         "4k3/8/8/2Pp4/8/8/8/4K3 w - d6 0 1",
-        "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
         // Pins with opponent-only rights (fused context, general filter).
         "r3k2r/8/8/8/1b6/8/3N4/4K3 w kq - 0 1",
     };
     for (fens) |fen_text| {
         var pos = try fen.parse(fen_text);
+        try expectGenerationMatchesReference(&pos);
+    }
+    // fen.parse drops an en-passant target no pawn can use (C-EP-KEY), so the
+    // uncapturable case is built by hand: d6 set after the double push d7d5
+    // with no white pawn beside it. canFuseLegality must look at
+    // enPassantCapturable, not at the bare square: without castling rights
+    // the first position takes the fused path.
+    const uncapturable = [_][]const u8{
+        "4k3/8/8/3p4/8/8/8/4K3 w - - 0 1",
+        "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+    };
+    for (uncapturable, 0..) |fen_text, idx| {
+        var pos = try fen.parse(fen_text);
+        pos.en_passant = .d6;
+        pos.zobrist_key = @import("../core/zobrist.zig").hashPosition(&pos);
+        try std.testing.expect(pos.en_passant != null and !enPassantCapturable(&pos));
+        if (idx == 0) try std.testing.expect(canFuseLegality(&pos));
         try expectGenerationMatchesReference(&pos);
     }
     const walks = [_][]const u8{
@@ -1583,5 +1744,70 @@ test "fused generation with opponent-only castling rights or an uncapturable en-
     for (walks) |fen_text| {
         var pos = try fen.parse(fen_text);
         try walkGenerationReference(&pos, 3);
+    }
+}
+
+test "sniper pin computation matches the per-ray walk" {
+    var prng = std.Random.DefaultPrng.init(0x9e37_79b9);
+    const rand = prng.random();
+    for (0..20_000) |trial| {
+        // Sparse to dense boards; the king square is never occupied by others.
+        const density: u6 = @intCast(1 + trial % 5);
+        var occupied: bitboard.Bitboard = 0;
+        for (0..density) |_| occupied |= rand.int(u64) & rand.int(u64);
+        const king: square.Square = @enumFromInt(rand.uintLessThan(u8, 64));
+        occupied &= ~bitboard.bit(king);
+        const own = occupied & rand.int(u64);
+        const enemy = occupied & ~own;
+        const bishop_like = enemy & rand.int(u64);
+        const rook_like = enemy & (rand.int(u64) | bishop_like & rand.int(u64));
+        const all = occupied | bitboard.bit(king);
+        try std.testing.expectEqual(
+            computePinnedPiecesByRays(all, own, bishop_like, rook_like, king),
+            computePinnedPieces(all, own, bishop_like, rook_like, king),
+        );
+    }
+}
+
+/// generate-then-filter, the form `generateHinted`'s legality-fused paths
+/// replace (differential test reference).
+fn generateByFilter(pos: *const position.Position, list: *move_mod.MoveList) void {
+    pseudo.generate(pos, list);
+    if (list.count == 0) return;
+    var ctx: LegalityContext = undefined;
+    initLegalityContext(pos, null, &ctx);
+    filterGeneral(pos, list, &ctx, false);
+}
+
+test "legality-fused generation equals generate-then-filter, content and order" {
+    const fen = @import("../core/fen.zig");
+    const fens = [_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        "4k3/8/8/2KpP2r/8/8/8/8 w - d6 0 1",
+        "4k3/4r3/8/4P3/3pP3/8/4K3/4R3 b - e3 0 1",
+        "r3k2r/8/8/8/3q4/8/8/R3K2R w KQkq - 0 1",
+        "2kr1bnr/ppp2ppp/q1n5/4p3/2PP2b1/5N2/PP1BBPPP/RN1QK2R w KQ - 3 9",
+    };
+    var prng = std.Random.DefaultPrng.init(0x7e57_9e11);
+    const rand = prng.random();
+    for (fens) |text| {
+        var pos = try fen.parse(text);
+        // A random walk from each position covers pins, castling and en passant states.
+        var states: [40]@import("make_unmake.zig").StateInfo = undefined;
+        for (0..40) |ply| {
+            var fused = move_mod.MoveList.init();
+            var filtered = move_mod.MoveList.init();
+            generateHinted(&pos, &fused, null);
+            generateByFilter(&pos, &filtered);
+            try std.testing.expectEqualSlices(move_mod.Move, filtered.slice(), fused.slice());
+            if (filtered.count == 0) break;
+            const mv = filtered.moves[rand.uintLessThan(usize, filtered.count)];
+            _ = make_unmake.makeMove(&pos, mv, &states[ply]);
+        }
     }
 }

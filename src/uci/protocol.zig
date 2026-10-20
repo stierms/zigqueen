@@ -15,6 +15,7 @@ const search_time = @import("../search/time.zig");
 const search_stack = @import("../search/stack.zig");
 const tunables = @import("../search/tunables.zig");
 const worker_mod = @import("worker.zig");
+const syzygy = @import("../search/syzygy.zig");
 
 pub const UciError = error{
     InvalidCommand,
@@ -118,6 +119,13 @@ fn handleCommandRecovering(state: *UciState, line: []const u8) !bool {
     };
 }
 
+fn writeGoFallbackNotice(output: worker_mod.OutputSink, reason: []const u8, line: []const u8) !void {
+    var buffer: [256]u8 = undefined;
+    const shown = line[0..@min(line.len, 160)];
+    const text = try std.fmt.bufPrint(&buffer, "info string error: {s}, searching depth 1 instead: {s}{s}\n", .{ reason, shown, if (shown.len < line.len) "..." else "" });
+    try output.writeAll(text);
+}
+
 fn writeRejectedCommandNotice(output: worker_mod.OutputSink, reason: []const u8, line: []const u8) !void {
     var buffer: [256]u8 = undefined;
     const shown = line[0..@min(line.len, 160)];
@@ -138,7 +146,28 @@ fn readCommandLine(input: anytype, buffer: *std.ArrayList(u8), allocator: std.me
     return std.mem.trimRight(u8, buffer.items, "\r");
 }
 
-fn handleCommand(state: *UciState, line: []const u8) !bool {
+/// Every command of the UCI specification, including the ones this engine
+/// accepts and ignores (debug, register, ponderhit).
+const uci_commands = [_][]const u8{ "uci", "debug", "isready", "setoption", "register", "ucinewgame", "position", "go", "stop", "ponderhit", "quit" };
+
+/// The line from its first UCI command on, or null when it has none. UCI:
+/// "if the engine or the GUI receives an unknown command or token it should
+/// just ignore it and try to parse the rest of the string", so `joho isready`
+/// is `isready` (audit D, U-UNKNOWN-TOKEN). Only leading tokens are skipped:
+/// a recognized command owns the rest of its line, arguments included.
+fn commandSuffix(line: []const u8) ?[]const u8 {
+    var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    while (tokens.next()) |token| {
+        for (uci_commands) |command| {
+            if (std.mem.eql(u8, token, command)) return line[@intFromPtr(token.ptr) - @intFromPtr(line.ptr) ..];
+        }
+    }
+    return null;
+}
+
+fn handleCommand(state: *UciState, raw_line: []const u8) !bool {
+    // Each handler re-reads its own line, so it gets the line from the command on.
+    const line = commandSuffix(raw_line) orelse return false;
     var tokens = std.mem.tokenizeScalar(u8, line, ' ');
     const command = tokens.next() orelse return false;
 
@@ -148,10 +177,13 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
         try state.options.writeUciOptions(state.worker.output);
         try state.worker.output.writeAll("uciok\n");
         announceEvalFile(state);
+        announceWeights(state);
         return false;
     }
 
     if (std.mem.eql(u8, command, "isready")) {
+        // Tablebase snapshots are freed on this thread only (see syzygy.zig).
+        syzygy.collect();
         try state.worker.output.writeAll("readyok\n");
         return false;
     }
@@ -165,14 +197,18 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
         };
         if (apply_result == .applied) {
             if (state.options.threads != previous.threads) {
-                state.worker.setThreads(state.options.threads) catch {
+                state.worker.setThreads(state.options.threads) catch |err| {
+                    const requested = state.options.threads;
                     state.options = previous;
+                    try writeOptionRollbackNotice(state.worker.output, "Threads", requested, previous.threads, @errorName(err));
                     return false;
                 };
             }
             if (state.options.hash_mb != previous.hash_mb) {
-                state.worker.resizeHash(state.options.hash_mb) catch {
+                state.worker.resizeHash(state.options.hash_mb) catch |err| {
+                    const requested = state.options.hash_mb;
                     state.options = previous;
+                    try writeOptionRollbackNotice(state.worker.output, "Hash", requested, previous.hash_mb, @errorName(err));
                     return false;
                 };
             }
@@ -181,6 +217,14 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
                     fatalEvalFile(state, state.options.evalFilePath(), @errorName(err));
                 };
                 announceEvalFile(state);
+                announceWeights(state);
+            }
+            if (state.options.shared_weights != previous.shared_weights) {
+                state.worker.setSharedWeights(state.options.shared_weights) catch |err| {
+                    state.options.shared_weights = previous.shared_weights;
+                    try state.worker.output.print("info string NNUE Shared Weights unchanged: {s}\n", .{@errorName(err)});
+                };
+                announceWeights(state);
             }
             if (state.options.contempt_cp != previous.contempt_cp) {
                 state.worker.setContempt(state.options.contempt_cp);
@@ -200,11 +244,15 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
                         "info string SyzygyPath could not be loaded; tablebases disabled\n");
                     return false;
                 }
+                // Tables found, and which files are mapped or on positioned reads.
+                if (syzygy.report()) |r| try r.write(state.worker.output);
             }
             // An explicit NNUE Scale Percent always wins, even when it equals the shown
             // value: a pawn-pair (ZQBA) net loaded later keeps its own default scale
             // only while the scale was never set explicitly (B3 review finding 4).
-            const scale_named = std.ascii.eqlIgnoreCase(setOptionNameForNotice(line), "NNUE Scale Percent");
+            // Named by the option layer's canonical name, so any token spacing
+            // counts (audit D, U-SCALE-WS).
+            const scale_named = if (options_mod.parseSetOptionLine(line)) |parsed| parsed.names("NNUE Scale Percent") else |_| false;
             if (state.options.nnue_scale_percent != previous.nnue_scale_percent or scale_named) {
                 state.worker.setNnueScalePercent(state.options.nnue_scale_percent);
             }
@@ -225,6 +273,7 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
 
     if (std.mem.eql(u8, command, "ucinewgame")) {
         state.worker.resetEngine();
+        syzygy.collect();
         const parsed = try parsePositionCommand("position startpos");
         state.current_position = parsed.position;
         state.history = parsed.history;
@@ -257,10 +306,20 @@ fn handleCommand(state: *UciState, line: []const u8) !bool {
 
     if (std.mem.eql(u8, command, "quit")) {
         state.worker.stopAndWait();
+        syzygy.collect();
         return true;
     }
 
     return false;
+}
+
+/// Say how the net's weights are held: one machine-wide shared copy (created
+/// by this process or attached to another's) or a private copy, and why.
+/// Like announceEvalFile, never during a search.
+fn announceWeights(state: *UciState) void {
+    var desc_buf: [160]u8 = undefined;
+    const text = state.worker.weightsStatus().describe(&desc_buf);
+    state.worker.output.print("info string NNUE weights: {s}\n", .{text}) catch {};
 }
 
 /// Say WHICH net is playing, so every engine log is its own evidence of what ran
@@ -328,6 +387,13 @@ fn fatalEvalFile(state: *UciState, path: []const u8, reason: []const u8) noretur
     std.process.exit(1);
 }
 
+/// A Hash or Threads change the engine could not prepare is rolled back whole
+/// (the worker's configuration change is transactional). Say so: silently the
+/// GUI would keep showing a value that is not in effect (audit D, U-HASH-FAIL).
+fn writeOptionRollbackNotice(output: worker_mod.OutputSink, name: []const u8, requested: u32, kept: u32, reason: []const u8) !void {
+    try output.print("info string {s} {d} could not be applied ({s}); keeping {d}\n", .{ name, requested, reason, kept });
+}
+
 fn writeUnknownOptionNotice(output: worker_mod.OutputSink, name: []const u8) !void {
     const prefix = "info string unknown option: ";
     var buffer: [256]u8 = undefined;
@@ -358,7 +424,12 @@ fn handleGo(state: *UciState, line: []const u8) !void {
         try state.worker.output.writeAll("info string error: the last position command was rejected; no search started\nbestmove 0000\n");
         return;
     }
-    const command = try parseGoCommand(line, &state.current_position);
+    // UCI: every go needs a bestmove. A go line that still fails to parse is
+    // reported and answered by a one-ply search instead of being dropped.
+    const command = parseGoCommand(line, &state.current_position) catch |err| fallback: {
+        try writeGoFallbackNotice(state.worker.output, @errorName(err), line);
+        break :fallback GoCommand{ .limits = .{ .depth = 1 } };
+    };
     // Contempt makes a draw worth -c to the root side and +c to its opponent,
     // and the tables store those scores as found. Entries written for one
     // root side are wrong for the other, so a change of root side starts from
@@ -414,7 +485,7 @@ fn parseGoCommand(line: []const u8, pos: *const position.Position) UciError!GoCo
         }
         if (std.mem.eql(u8, token, "movetime")) {
             const value = tokens.next() orelse return error.InvalidCommand;
-            command.limits.movetime_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCommand;
+            command.limits.movetime_ms = try parseClockMs(value);
             continue;
         }
         if (std.mem.eql(u8, token, "nodes")) {
@@ -424,22 +495,22 @@ fn parseGoCommand(line: []const u8, pos: *const position.Position) UciError!GoCo
         }
         if (std.mem.eql(u8, token, "wtime")) {
             const value = tokens.next() orelse return error.InvalidCommand;
-            command.limits.wtime_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCommand;
+            command.limits.wtime_ms = try parseClockMs(value);
             continue;
         }
         if (std.mem.eql(u8, token, "btime")) {
             const value = tokens.next() orelse return error.InvalidCommand;
-            command.limits.btime_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCommand;
+            command.limits.btime_ms = try parseClockMs(value);
             continue;
         }
         if (std.mem.eql(u8, token, "winc")) {
             const value = tokens.next() orelse return error.InvalidCommand;
-            command.limits.winc_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCommand;
+            command.limits.winc_ms = try parseClockMs(value);
             continue;
         }
         if (std.mem.eql(u8, token, "binc")) {
             const value = tokens.next() orelse return error.InvalidCommand;
-            command.limits.binc_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCommand;
+            command.limits.binc_ms = try parseClockMs(value);
             continue;
         }
         if (std.mem.eql(u8, token, "movestogo")) {
@@ -464,6 +535,15 @@ fn parseGoCommand(line: []const u8, pos: *const position.Position) UciError!GoCo
     if (requested_moves.count != 0) command.root_moves = requested_moves;
     if (!command.limits.hasExplicitLimit()) command.limits.depth = 1;
     return command;
+}
+
+/// UCI clock fields are milliseconds "left on the clock". A GUI that tolerates
+/// a small overstep reports it as a negative number: that is 0 ms left, not a
+/// malformed command (CCRL game 93, 2026-10-15: `btime -1000` made 6.4.0
+/// ignore the whole go and lose on time with minutes left).
+fn parseClockMs(value: []const u8) UciError!u64 {
+    const ms = std.fmt.parseInt(i64, value, 10) catch return error.InvalidCommand;
+    return if (ms < 0) 0 else @intCast(ms);
 }
 
 fn isGoKeyword(token: []const u8) bool {
@@ -494,7 +574,10 @@ pub fn parsePositionCommand(line: []const u8) UciError!PositionCommandResult {
     if (std.mem.eql(u8, mode, "startpos")) {
         pos = fen.startpos() catch return error.InvalidPosition;
     } else if (std.mem.eql(u8, mode, "fen")) {
-        var fen_fields: [6][]const u8 = undefined;
+        // Leniency for GUIs and hand-typed FENs (audit C, C-FEN-SHORT): the move
+        // counters may be missing (4 or 5 fields; they default to `0 1`), a
+        // halfmove `-` reads as 0 and a fullmove 0 as 1. fen.parse stays strict.
+        var fen_fields = [6][]const u8{ "", "", "", "", "0", "1" };
         var fen_count: usize = 0;
         while (fen_count < fen_fields.len) {
             const token = tokens.next() orelse break;
@@ -502,20 +585,27 @@ pub fn parsePositionCommand(line: []const u8) UciError!PositionCommandResult {
             fen_fields[fen_count] = token;
             fen_count += 1;
         }
-        if (fen_count != 6) return error.InvalidPosition;
+        if (fen_count < 4) return error.InvalidPosition;
+        if (std.mem.eql(u8, fen_fields[4], "-")) fen_fields[4] = "0";
+        if (std.mem.eql(u8, fen_fields[5], "0")) fen_fields[5] = "1";
 
         var fen_buffer: [128]u8 = undefined;
         var fen_len: usize = 0;
-        for (fen_fields[0..fen_count], 0..) |field, index| {
-            if (index != 0) {
+        for (fen_fields, 0..) |field, index| {
+            // Capacity for the separator AND the field before either is written:
+            // a first field that fills the buffer exactly must not let the
+            // separator land one byte past it (audit D, U-FEN-OVF).
+            const separator: usize = @intFromBool(index != 0);
+            if (fen_len + separator + field.len > fen_buffer.len) return error.InvalidPosition;
+            if (separator != 0) {
                 fen_buffer[fen_len] = ' ';
                 fen_len += 1;
             }
-            if (fen_len + field.len > fen_buffer.len) return error.InvalidPosition;
             @memcpy(fen_buffer[fen_len..][0..field.len], field);
             fen_len += field.len;
         }
         pos = fen.parse(fen_buffer[0..fen_len]) catch return error.InvalidPosition;
+        if (pos.hasBackRankPawn()) return error.InvalidPosition;
     } else {
         return error.InvalidPosition;
     }
@@ -523,23 +613,18 @@ pub fn parsePositionCommand(line: []const u8) UciError!PositionCommandResult {
     var history = repetition.History{};
     history.push(pos.zobrist_key);
 
-    if (std.mem.indexOf(u8, line, " moves ")) |_| {
-        var move_tokens = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = move_tokens.next();
-        _ = move_tokens.next();
-        if (!std.mem.eql(u8, mode, "startpos")) {
-            var fen_fields_to_skip: usize = 6;
-            while (fen_fields_to_skip > 0) : (fen_fields_to_skip -= 1) _ = move_tokens.next();
-        }
-        while (move_tokens.next()) |token| {
-            if (std.mem.eql(u8, token, "moves")) break;
-        }
-        while (move_tokens.next()) |move_text| {
-            const mv = findLegalMoveByUci(&pos, move_text) orelse return error.InvalidMove;
-            var state = make_unmake.StateInfo{};
-            _ = make_unmake.makeMove(&pos, mv, &state);
-            appendGameHistory(&history, pos.zobrist_key, pos.halfmove_clock);
-        }
+    // The move list follows the first `moves` token. No FEN field is ever
+    // `moves`, so this needs no count of FEN fields to skip; a fixed skip of
+    // six would swallow `moves e2e4` after a short FEN (judge C's hazard).
+    var move_tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    while (move_tokens.next()) |token| {
+        if (std.mem.eql(u8, token, "moves")) break;
+    }
+    while (move_tokens.next()) |move_text| {
+        const mv = findLegalMoveByUci(&pos, move_text) orelse return error.InvalidMove;
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&pos, mv, &state);
+        appendGameHistory(&history, pos.zobrist_key, pos.halfmove_clock);
     }
 
     return .{
@@ -641,6 +726,7 @@ test "handleCommand writes uci handshake" {
         "EvalFile",
         "NNUE Scale Percent",
         "Contempt",
+        "NNUE Shared Weights",
     };
     for (built_in_names) |name| try expectAdvertisedOption(out, name, true);
 
@@ -649,10 +735,46 @@ test "handleCommand writes uci handshake" {
     try std.testing.expectEqual(@as(usize, 63), basin.specs.len);
     for (basin.specs) |spec| try expectAdvertisedOption(out, spec.uci_name, build_options.tuning);
 
-    const expected_count: usize = if (build_options.tuning) 7 + 39 + 63 else 7;
+    const expected_count: usize = if (build_options.tuning) 8 + 39 + 63 else 8;
     try std.testing.expectEqual(expected_count, std.mem.count(u8, out, "option name "));
     try std.testing.expect(std.mem.indexOf(u8, out, "uciok") != null);
 }
+
+test "uci handshake reports how the NNUE weights are held; the option reloads them" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    // Off by default: the handshake says so.
+    try std.testing.expect(!try handleCommand(&state, "uci"));
+    try std.testing.expect(std.mem.indexOf(u8, output.contents(), "option name NNUE Shared Weights type check default false\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.contents(), "info string NNUE weights: private (disabled)\n") != null);
+    try std.testing.expectEqual(@import("../eval/net_share.zig").Mode.private, state.worker.weightsStatus().mode);
+
+    // On: the same net is reloaded into the shared blob, where the platform
+    // allows it (otherwise private with the reason, never "disabled").
+    try std.testing.expect(!try handleCommand(&state, "setoption name NNUE Shared Weights value true"));
+    try std.testing.expect(state.options.shared_weights);
+    const shared = state.worker.weightsStatus();
+    try std.testing.expect(shared.isShared() or !std.mem.eql(u8, shared.reason, "disabled"));
+    if (builtin.os.tag == .linux or builtin.os.tag == .windows) try std.testing.expect(shared.isShared());
+    // Same net, same scale: only where the weights live changed.
+    try std.testing.expectEqualStrings(eval_backend_builtin, state.worker.network_owner.evalFilePath());
+
+    // Off again: private.
+    try std.testing.expect(!try handleCommand(&state, "setoption name NNUE Shared Weights value false"));
+    try std.testing.expectEqual(@import("../eval/net_share.zig").Mode.private, state.worker.weightsStatus().mode);
+
+    // A search still works after the reloads.
+    try std.testing.expect(!try handleCommand(&state, "position startpos"));
+    try std.testing.expect(!try handleCommand(&state, "go depth 2"));
+    state.worker.waitIdle();
+    try std.testing.expect(std.mem.indexOf(u8, output.contents(), "bestmove 0000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.contents(), "bestmove ") != null);
+}
+
+const eval_backend_builtin = @import("../eval/backend.zig").builtin_eval_file;
 
 fn expectAdvertisedOption(out: []const u8, name: []const u8, expected: bool) !void {
     var buffer: [96]u8 = undefined;
@@ -671,6 +793,106 @@ test "setoption hash reconfigures engine-owned table" {
     try std.testing.expectEqual(@as(u32, 2), state.worker.hashSizeMb());
 }
 
+test "a failed Hash or Threads change is reported and rolled back" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+    const engine = &state.worker.coordinator.engine;
+
+    // Hash: the new table's allocation fails (a 2 MB table goes through the
+    // TT's own allocator, as in engine.zig's real-allocator failure test).
+    const tt_allocator = engine.tt.allocator;
+    var failing_tt = std.testing.FailingAllocator.init(tt_allocator, .{ .fail_index = 0 });
+    engine.tt.allocator = failing_tt.allocator();
+    const hash_result = handleCommand(&state, "setoption name Hash value 2");
+    engine.tt.allocator = tt_allocator;
+    try std.testing.expect(!try hash_result);
+    try std.testing.expect(failing_tt.has_induced_failure);
+    try std.testing.expectEqual(@as(u32, 256), state.options.hash_mb);
+    try std.testing.expectEqual(@as(u32, 256), state.worker.hashSizeMb());
+
+    // Threads: the new configuration's first allocation fails.
+    const engine_allocator = engine.allocator;
+    var failing_engine = std.testing.FailingAllocator.init(engine_allocator, .{ .fail_index = 0 });
+    engine.allocator = failing_engine.allocator();
+    const threads_result = handleCommand(&state, "setoption name Threads value 2");
+    engine.allocator = engine_allocator;
+    try std.testing.expect(!try threads_result);
+    try std.testing.expect(failing_engine.has_induced_failure);
+    try std.testing.expectEqual(@as(u8, 1), state.options.threads);
+    try std.testing.expectEqual(@as(u8, 1), state.worker.threads());
+
+    try std.testing.expectEqualStrings(
+        "info string Hash 2 could not be applied (OutOfMemory); keeping 256\n" ++
+            "info string Threads 2 could not be applied (OutOfMemory); keeping 1\n",
+        output.contents(),
+    );
+    // The engine still searches with the kept configuration.
+    try std.testing.expect(!try handleCommand(&state, "go depth 2"));
+    state.worker.waitIdle();
+    try std.testing.expect(!std.mem.eql(u8, bestMoveText(output.contents()).?, "0000"));
+}
+
+test "a failed Hash or Threads change is rolled back even when its notice cannot be written" {
+    // Judges D (H / J7): restore the options first, then report. The session
+    // ends on an output error anyway; the options must not keep the value.
+    const Broken = struct {
+        fn write(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.BrokenPipe;
+        }
+    };
+    var unused: u8 = 0;
+    var state: UciState = undefined;
+    try state.init(.{ .ctx = &unused, .write_fn = Broken.write });
+    defer state.deinit();
+    const engine = &state.worker.coordinator.engine;
+
+    const tt_allocator = engine.tt.allocator;
+    var failing_tt = std.testing.FailingAllocator.init(tt_allocator, .{ .fail_index = 0 });
+    engine.tt.allocator = failing_tt.allocator();
+    const hash_result = handleCommand(&state, "setoption name Hash value 2");
+    engine.tt.allocator = tt_allocator;
+    try std.testing.expectError(error.BrokenPipe, hash_result);
+    try std.testing.expectEqual(@as(u32, 256), state.options.hash_mb);
+
+    const engine_allocator = engine.allocator;
+    var failing_engine = std.testing.FailingAllocator.init(engine_allocator, .{ .fail_index = 0 });
+    engine.allocator = failing_engine.allocator();
+    const threads_result = handleCommand(&state, "setoption name Threads value 2");
+    engine.allocator = engine_allocator;
+    try std.testing.expectError(error.BrokenPipe, threads_result);
+    try std.testing.expectEqual(@as(u8, 1), state.options.threads);
+}
+
+test "unknown leading tokens are skipped and the command behind them runs once" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    // Audit D (U-UNKNOWN-TOKEN): `joho isready` produced no readyok.
+    try std.testing.expect(!try handleCommand(&state, "joho isready"));
+    try std.testing.expectEqualStrings("readyok\n", output.contents());
+    try std.testing.expect(!try handleCommand(&state, "xyzzy  plugh position startpos moves e2e4"));
+    try std.testing.expectEqual(@import("../core/types.zig").Color.black, state.current_position.side_to_move);
+    try std.testing.expect(!try handleCommand(&state, "foo go depth 1"));
+    state.worker.waitIdle();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.contents(), "bestmove "));
+    const before = output.len;
+
+    // No command at all, and the commands accepted and ignored, do nothing; a
+    // command owns its arguments, so `isready` after `debug` is not dispatched.
+    for ([_][]const u8{ "xyzzy", "  ", "debug on", "register later", "ponderhit", "joho debug isready" }) |line| {
+        try std.testing.expect(!try handleCommand(&state, line));
+    }
+    try std.testing.expectEqual(before, output.len);
+    // A command word inside a recognized command's arguments is not run.
+    try std.testing.expect(!try handleCommand(&state, "setoption name go value 1"));
+    try std.testing.expectEqualStrings("info string unknown option: go\n", output.contents()[before..]);
+    try std.testing.expect(try handleCommand(&state, "bye quit"));
+}
+
 test "position startpos with moves is applied legally" {
     const parsed = try parsePositionCommand("position startpos moves e2e4 c7c5 g1f3");
     const piece = @import("../core/piece.zig").Piece;
@@ -679,6 +901,82 @@ test "position startpos with moves is applied legally" {
     try std.testing.expectEqual(piece.black_pawn, parsed.position.pieceAt(.c5));
     try std.testing.expectEqual(piece.white_knight, parsed.position.pieceAt(.f3));
     try std.testing.expectEqual(parsed.position.zobrist_key, parsed.history.current());
+}
+
+test "position fen rejects an oversized first field without writing past the FEN buffer" {
+    // Audit D (U-FEN-OVF): a 128-byte first field filled the 128-byte buffer and
+    // the separator before the side-to-move field was written at index 128.
+    // Safe builds panicked there; every length is now rejected cleanly.
+    for ([_]usize{ 126, 127, 128, 129 }) |len| {
+        var line_buffer: [192]u8 = undefined;
+        const prefix = "position fen ";
+        const suffix = " w - - 0 1";
+        @memcpy(line_buffer[0..prefix.len], prefix);
+        @memset(line_buffer[prefix.len..][0..len], '8');
+        @memcpy(line_buffer[prefix.len + len ..][0..suffix.len], suffix);
+        const line = line_buffer[0 .. prefix.len + len + suffix.len];
+        try std.testing.expectError(error.InvalidPosition, parsePositionCommand(line));
+    }
+    // An ordinary FEN still parses.
+    _ = try parsePositionCommand("position fen r3k2r/8/8/3pP3/8/8/8/R3K2R w KQkq d6 0 1");
+}
+
+test "position fen with a pawn on rank 1 or 8 is rejected" {
+    // Audit B (E-BACKRANK-PAWN): both FENs panicked a safe build in the
+    // full-threat indexing; a pawn that attacks nothing did not.
+    for ([_][]const u8{
+        "position fen r3k3/8/8/8/8/8/1n6/P3K2R w - - 0 1",
+        "position fen 1p2k3/2N5/8/8/8/8/8/4K3 w - - 0 1",
+        "position fen r3k3/8/8/8/8/8/8/P3K2R w - - 0 1",
+        "position fen 4k2P/8/8/8/8/8/8/4K3 b - - 0 1",
+    }) |line| try std.testing.expectError(error.InvalidPosition, parsePositionCommand(line));
+    // Pawns on ranks 2 and 7 and promotions stay fine.
+    _ = try parsePositionCommand("position fen 4k3/P6p/8/8/8/8/p6P/4K3 w - - 0 1");
+    _ = try parsePositionCommand("position fen 4k3/P7/8/8/8/8/8/4K3 w - - 0 1 moves a7a8q");
+
+    // Rejected like any invalid position: reported, and go does not search the old board.
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+    try std.testing.expect(!try handleCommandRecovering(&state, "position fen r3k3/8/8/8/8/8/1n6/P3K2R w - - 0 1"));
+    try std.testing.expect(!try handleCommandRecovering(&state, "go depth 4"));
+    const out = output.contents();
+    try std.testing.expect(std.mem.indexOf(u8, out, "info string error: InvalidPosition, command ignored: position fen r3k3/8/8/8/8/8/1n6/P3K2R") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "bestmove 0000\n"));
+}
+
+test "position fen accepts missing move counters, halfmove - and fullmove 0" {
+    // Audit C (C-FEN-SHORT): these were rejected and answered bestmove 0000.
+    const reference = try parsePositionCommand("position startpos moves e2e4");
+    const four = try parsePositionCommand("position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - moves e2e4");
+    try std.testing.expect(four.position.eql(&reference.position));
+    try std.testing.expectEqual(reference.position.zobrist_key, four.position.zobrist_key);
+    try std.testing.expectEqual(@as(usize, 2), four.history.count);
+
+    const five = try parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - 7");
+    try std.testing.expectEqual(@as(u16, 7), five.position.halfmove_clock);
+    try std.testing.expectEqual(@as(u16, 1), five.position.fullmove_number);
+    const five_moves = try parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - 7 moves e1g1");
+    try std.testing.expectEqual(@import("../core/piece.zig").Piece.white_king, five_moves.position.pieceAt(.g1));
+
+    const zero = try parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - 0 0");
+    try std.testing.expectEqual(@as(u16, 1), zero.position.fullmove_number);
+    const dash = try parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R b K - - 1");
+    try std.testing.expectEqual(@as(u16, 0), dash.position.halfmove_clock);
+    try std.testing.expectEqual(@as(u16, 1), dash.position.fullmove_number);
+    // Equal to the six-field spelling, key included.
+    const six = try parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - 0 1");
+    try std.testing.expect(six.position.eql(&zero.position));
+    try std.testing.expectEqual(six.position.zobrist_key, (try parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K -")).position.zobrist_key);
+
+    // Still rejected: three fields, with or without moves, and malformed counters.
+    try std.testing.expectError(error.InvalidPosition, parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K"));
+    try std.testing.expectError(error.InvalidPosition, parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K moves e1g1"));
+    try std.testing.expectError(error.InvalidPosition, parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - x 1"));
+    try std.testing.expectError(error.InvalidPosition, parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - 0 -"));
+    // A move list after a short FEN is applied, never skipped silently.
+    try std.testing.expectError(error.InvalidMove, parsePositionCommand("position fen 4k3/8/8/8/8/8/8/4K2R w K - moves e2e4"));
 }
 
 test "go depth returns a legal move instead of 0000 in start position" {
@@ -872,18 +1170,22 @@ test "setoption NNUE Scale Percent equal to the shown value is still explicit (a
     var line_buf: [512]u8 = undefined;
     const eval_line = try std.fmt.bufPrint(&line_buf, "setoption name EvalFile value {s}", .{path});
 
-    var output = TestOutput{};
-    var state: UciState = undefined;
-    try state.init(output.sink());
-    defer state.deinit();
-    const shown = state.options.nnue_scale_percent;
-    try std.testing.expectEqual(eval_backend.zqba_nnue_scale_percent, shown);
-    try std.testing.expect(shown != eval_backend.default_nnue_scale_percent);
-    var set_buf: [128]u8 = undefined;
-    const scale_line = try std.fmt.bufPrint(&set_buf, "setoption name NNUE Scale Percent value {d}", .{shown});
-    try std.testing.expect(!try handleCommand(&state, scale_line));
-    try std.testing.expect(!try handleCommand(&state, eval_line));
-    try std.testing.expectEqual(shown, state.worker.coordinator.engine.evaluator.nnue_scale_percent);
+    // Any token spacing names the option (audit D, U-SCALE-WS: doubled spaces
+    // used to lose the explicit pin, 44 became 66).
+    inline for (.{ "setoption name NNUE Scale Percent value {d}", "setoption  name  NNUE  Scale   Percent  value {d}" }) |spelling| {
+        var output = TestOutput{};
+        var state: UciState = undefined;
+        try state.init(output.sink());
+        defer state.deinit();
+        const shown = state.options.nnue_scale_percent;
+        try std.testing.expectEqual(eval_backend.zqba_nnue_scale_percent, shown);
+        try std.testing.expect(shown != eval_backend.default_nnue_scale_percent);
+        var set_buf: [128]u8 = undefined;
+        const scale_line = try std.fmt.bufPrint(&set_buf, spelling, .{shown});
+        try std.testing.expect(!try handleCommand(&state, scale_line));
+        try std.testing.expect(!try handleCommand(&state, eval_line));
+        try std.testing.expectEqual(shown, state.worker.coordinator.engine.evaluator.nnue_scale_percent);
+    }
 
     // Without the explicit setting the ZQB1 net adopts its own default.
     var fresh: UciState = undefined;
@@ -952,6 +1254,77 @@ test "parse go command keeps node and time-control fields" {
     try std.testing.expectEqual(@as(?u32, 20), limits.movestogo);
 }
 
+test "parse go command treats negative clock values as zero" {
+    const pos = try fen.startpos();
+    // CCRL game 93: the GUI reported the opponent's overstepped clock.
+    const ccrl = try parseGoCommand("go wtime 54250 btime -1000 winc 2000 binc 2000", &pos);
+    try std.testing.expectEqual(@as(?u64, 54250), ccrl.limits.wtime_ms);
+    try std.testing.expectEqual(@as(?u64, 0), ccrl.limits.btime_ms);
+    try std.testing.expectEqual(@as(u64, 2000), ccrl.limits.winc_ms);
+    try std.testing.expectEqual(@as(u64, 2000), ccrl.limits.binc_ms);
+    const own = try parseGoCommand("go wtime -25 btime 3000 winc -5 binc 0 movetime -1", &pos);
+    try std.testing.expectEqual(@as(?u64, 0), own.limits.wtime_ms);
+    try std.testing.expectEqual(@as(u64, 0), own.limits.winc_ms);
+    try std.testing.expectEqual(@as(?u64, 0), own.limits.movetime_ms);
+    try std.testing.expectError(error.InvalidCommand, parseGoCommand("go wtime 12abc", &pos));
+}
+
+test "go with the opponent's clock negative still answers with bestmove" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    try std.testing.expect(!try handleCommand(&state, "position startpos moves e2e4"));
+    try std.testing.expect(!try handleCommand(&state, "go wtime 54250 btime -1000 winc 2000 binc 2000"));
+    state.worker.waitIdle();
+
+    const out = output.contents();
+    try std.testing.expect(std.mem.indexOf(u8, out, "info string error") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bestmove 0000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bestmove ") != null);
+}
+
+test "go with our own clock negative moves at once" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    var timer = try std.time.Timer.start();
+    try std.testing.expect(!try handleCommand(&state, "go wtime -1000 btime 60000 winc 0 binc 0"));
+    state.worker.waitIdle();
+    // A 1 ms hard cap; generous bound for loaded test hosts.
+    try std.testing.expect(timer.read() < 2 * std.time.ns_per_s);
+
+    const out = output.contents();
+    try std.testing.expect(std.mem.indexOf(u8, out, "bestmove 0000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bestmove ") != null);
+    // The clock waits for depth 1, so the move is a searched one (U-STOP-D1).
+    // The final info line must count searched nodes: an unsearched result is
+    // reported as `info depth 1 ... nodes 0` as well (judge D finding E).
+    const final_info = std.mem.lastIndexOf(u8, out, "info depth ").?;
+    const line_end = std.mem.indexOfScalarPos(u8, out, final_info, '\n').?;
+    const nodes_start = std.mem.indexOf(u8, out[final_info..line_end], " nodes ").? + final_info + " nodes ".len;
+    const nodes_end = std.mem.indexOfScalarPos(u8, out[0..line_end], nodes_start, ' ') orelse line_end;
+    try std.testing.expect(try std.fmt.parseInt(u64, out[nodes_start..nodes_end], 10) > 0);
+}
+
+test "go that fails to parse is answered by a one-ply search" {
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+
+    try std.testing.expect(!try handleCommand(&state, "go mate 0"));
+    state.worker.waitIdle();
+
+    const out = output.contents();
+    try std.testing.expect(std.mem.indexOf(u8, out, "info string error: InvalidCommand, searching depth 1 instead: go mate 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bestmove 0000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bestmove ") != null);
+}
+
 test "parse go command reads a mate request as an explicit limit" {
     const pos = try fen.startpos();
     const command = try parseGoCommand("go mate 3", &pos);
@@ -988,8 +1361,11 @@ test "unparseable commands are reported and the session continues" {
     try std.testing.expect(!try handleCommandRecovering(&state, "position startpos moves e2e4"));
     const accepted = state.current_position.zobrist_key;
 
+    // UCI: every go needs a bestmove, so a go that fails to parse is answered
+    // by a one-ply search of the accepted position instead of being dropped.
     try std.testing.expect(!try handleCommandRecovering(&state, "go depth nope"));
-    try std.testing.expect(std.mem.indexOf(u8, output.contents(), "bestmove") == null);
+    state.worker.waitIdle();
+    try std.testing.expect(!std.mem.eql(u8, bestMoveText(output.contents()).?, "0000"));
     try std.testing.expect(!try handleCommandRecovering(&state, "position startpos moves e2e5"));
     try std.testing.expect(!try handleCommandRecovering(&state, "position fen 4k3/8/8/4P3/8/8/8/4K3 w - d6 0 1"));
     try std.testing.expect(!try handleCommandRecovering(&state, "position"));
@@ -1000,11 +1376,11 @@ test "unparseable commands are reported and the session continues" {
     try std.testing.expect(!try handleCommandRecovering(&state, "isready"));
     {
         const out = output.contents();
-        try std.testing.expect(std.mem.indexOf(u8, out, "info string error: InvalidCommand, command ignored: go depth nope\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "info string error: InvalidCommand, searching depth 1 instead: go depth nope\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "info string error: InvalidMove, command ignored: position startpos moves e2e5\n") != null);
         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "info string error: InvalidPosition"));
         try std.testing.expect(std.mem.endsWith(u8, out, "no search started\nbestmove 0000\nreadyok\n"));
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "bestmove"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "bestmove"));
     }
 
     // An accepted position restores normal service.
@@ -1027,6 +1403,27 @@ test "a failed SyzygyPath change reports that tablebases are off" {
     // Clearing the path is not a failure and stays silent.
     try std.testing.expect(!try handleCommand(&state, "setoption name SyzygyPath value <empty>"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.contents(), "\n"));
+}
+
+test "a SyzygyPath change reports the tables and how they are stored" {
+    const path = std.process.getEnvVarOwned(std.testing.allocator, "ZQ_TB_PATH") catch return error.SkipZigTest;
+    defer std.testing.allocator.free(path);
+    var output = TestOutput{};
+    var state: UciState = undefined;
+    try state.init(output.sink());
+    defer state.deinit();
+    var line: [600]u8 = undefined;
+    try std.testing.expect(!try handleCommand(&state, try std.fmt.bufPrint(&line, "setoption name SyzygyPath value {s}", .{path})));
+    defer _ = handleCommand(&state, "setoption name SyzygyPath value <empty>") catch {};
+    const out = output.contents();
+    try std.testing.expect(std.mem.startsWith(u8, out, "info string Syzygy tables: "));
+    try std.testing.expect(std.mem.indexOf(u8, out, " 0 rejected; storage " ++ build_options.tb_storage ++ ": ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " 0 mapping failures\n") != null);
+    if (!std.mem.eql(u8, build_options.tb_storage, "pread")) {
+        try std.testing.expect(std.mem.indexOf(u8, out, " 0 on positioned reads,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, ": 0 files mapped") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
 }
 
 test "searchmoves stops at following go parameter and deduplicates in input order" {
