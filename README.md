@@ -25,17 +25,20 @@ only if the CPU has both the dotprod and i8mm extensions.
 
 | Version | Our gauntlet, 1 thread | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC |
 |---|---|---|---|---|
-| 6.5.0 | 3717 (95%: 3713–3721) | — | — | — |
-| 6.4.0 | 3701 (95%: 3694–3707) | — | — | — |
-| 6.3.0 | 3676 (95%: 3670–3683) | — | — | 3563 ±81 |
-| 6.2.0 | ~3672 | 3649 ±18 | — | — |
-| 6.1.1 | ~3644 | — | — | 3475 ±45 |
-| 6.0.0 | ~3602 | — | 3498 ±18 | 3402 ±45 |
-| 5.8.3 | ~3590 | 3559 ±14 | — | 3384 ±33 |
+| 6.5.0 | 3717 (95%: 3713–3721) | 3709 ±15 | — | 3707 ±37 |
+| 6.4.0 | 3701 (95%: 3694–3707) | — | 3566 ±19 | 3684 |
+| 6.3.0 | 3676 (95%: 3670–3683) | — | — | 3525 † |
+| 6.2.0 | ~3672 | 3648 ±15 | — | — |
+| 6.1.1 | ~3644 | — | — | 3542 |
+| 6.0.0 | ~3602 | — | 3497 ±18 | 3403 † |
+| 5.8.3 | ~3590 | 3559 ±14 | — | 3386 † |
 
 Our gauntlets are our own estimates against CCRL-rated engines, not official
 numbers. The field changed between versions, so the rows are not directly
-comparable ([docs/STRENGTH.md](docs/STRENGTH.md)).
+comparable ([docs/STRENGTH.md](docs/STRENGTH.md)). External lists as of
+2026-11-11. The Computer Chess Index tests on several machines: the values
+are from its E1 list, those marked † from its older T1 list, and the two are
+not comparable.
 
 ## Features
 

@@ -80,15 +80,32 @@ candidate, and, where published, each release's self-play evidence.
 
 ## External lists
 
-As of 2026-09-29:
+As of 2026-11-11 (CCRL lists of 2026-11-07):
 
-| Version | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC |
+| Version | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) |
+|---|---|---|
+| 6.5.0 | 3709 ±15 (1,088 games), rank 33 in the complete list | — |
+| 6.4.0 | — | 3566 ±19 (486 games), rank 56 in the complete list |
+| 6.2.0 | 3648 ±15 (1,112 games) | — |
+| 6.0.0 | — | 3497 ±18 (582 games) |
+| 5.8.3 | 3559 ±14 (1,327 games) | — |
+
+The [Computer Chess Index](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md)
+rates at three time controls (STC 8s+0.08s, LTC 60s+0.6s, VLTC 2m24s+1.12s)
+on three machines: E1 and P1 are the efficiency and performance cores of an
+Intel Core Ultra 7 265T, T1 is an Intel Core i5-7500T. Its lists per machine
+are not comparable with each other, and its scale is not comparable with
+CCRL's.
+
+| Version | E1: STC / LTC / VLTC | P1: STC / LTC / VLTC | T1: STC / LTC / VLTC |
 |---|---|---|---|
-| 6.3.0 | — | — | 3563 ±81 |
-| 6.2.0 | 3649 ±18 (749 games) | — | — |
-| 6.1.1 | — | — | 3475 ±45 |
-| 6.1.0 | — | — | 3490 ±41 |
-| 6.0.0 | — | 3498 ±18 (582 games) | 3402 ±45 |
-| 5.8.3 | 3559 ±14 (1,327 games) | — | 3384 ±33 |
+| 6.5.0 | 3406 / 3645 / 3707 | 3573 / 3761 / 3781 | — |
+| 6.4.0 | 3337 / 3595 / 3684 | 3505 / 3669 / 3730 | — |
+| 6.3.0 | — | — | 3258 / 3487 / 3525 |
+| 6.1.1 | 3117 / 3501 / 3542 | 3312 / 3588 / 3653 | 3173 / 3432 / 3478 |
+| 6.1.0 | — | — | 3200 / 3351 / 3491 |
+| 6.0.0 | — | — | 3125 / 3363 / 3403 |
+| 5.8.3 | — | — | 3009 / 3326 / 3386 |
 
-The Computer Chess Index uses its own scale, not comparable with CCRL's.
+For 6.5.0 on E1 the index gives ±38 at STC and LTC and ±37 at VLTC, from 162
+to 172 games per time control.
