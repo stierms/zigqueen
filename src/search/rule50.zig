@@ -31,6 +31,37 @@ pub noinline fn interiorScore(
     return ctx.drawScore(pos.side_to_move);
 }
 
+/// From this clock on a quiet move of a piece ends the game: the position
+/// after it has clock 100.
+pub const STAND_PAT_BOUNDARY: u16 = 99;
+
+/// What standing pat is worth at clock 99, outside check. Standing pat means
+/// "a quiet move keeps about the static value". At clock 99 a quiet move of a
+/// piece reaches clock 100, a draw (or a mate, which the first quiescence
+/// ply's quiet checks find); only a pawn move keeps the game going. So the
+/// side to move has the draw when a piece can move quietly, the static value
+/// besides only when a pawn can move, and the static value alone when
+/// neither exists (it must capture, as at any clock). Cold: such nodes exist
+/// only in searches whose root is within a few plies of the boundary.
+pub noinline fn standPatAtBoundary(
+    ctx: *const context_mod.SearchContext,
+    pos: *const position.Position,
+    static_value: types.Score,
+) types.Score {
+    @branchHint(.cold);
+    var moves = move_mod.MoveList.init();
+    legal.generate(pos, &moves);
+    var piece_move = false;
+    var pawn_move = false;
+    for (moves.slice()) |mv| {
+        if (mv.isCapture()) continue;
+        if (pos.pieceAt(mv.from).pieceType() == .pawn) pawn_move = true else piece_move = true;
+    }
+    if (!piece_move) return static_value;
+    const draw = ctx.drawScore(pos.side_to_move);
+    return if (pawn_move) @max(static_value, draw) else draw;
+}
+
 /// First legal root move that checkmates, for a root that is already past the
 /// fifty-move clock: every other move there is a claimable draw, this one wins.
 pub fn matingMove(pos: *const position.Position, allowed: ?*const move_mod.MoveList) ?move_mod.Move {

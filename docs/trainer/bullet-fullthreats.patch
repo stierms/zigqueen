@@ -1315,7 +1315,7 @@ index 0000000..2eb6ad1
 +    // byte-identical to the M=2/M=3 trainers (one-variable law: only the
 +    // training scheme changes). See zqHalfKA8_mrl1536p768_relabel26.rs for
 +    // provenance notes.
-+    let root = "/home/mstie/projects/sf-data/relabel26-house-r1";
++    let root = "/path/to/sf-data/relabel26-house-r1";
 +    let mut components: Vec<Vec<(String, u64)>> = Vec::new();
 +    const V500_DIET: [&str; 27] = [
 +        "leela96-filt-v2split_0",

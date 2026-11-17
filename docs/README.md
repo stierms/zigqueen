@@ -6,13 +6,14 @@
   sources, trainer, and what was and was not taken from other projects.
 - [`STRENGTH.md`](STRENGTH.md) — anchored gauntlet results and the
   self-assessment methodology.
-- [`RELEASE_NOTES_6.5.0.md`](RELEASE_NOTES_6.5.0.md) — current release.
+- [`RELEASE_NOTES_6.6.0.md`](RELEASE_NOTES_6.6.0.md) — current release.
+- [`RELEASE_NOTES_6.5.0.md`](RELEASE_NOTES_6.5.0.md) — what changed in 6.5.0.
 - [`RELEASE_NOTES_6.4.0.md`](RELEASE_NOTES_6.4.0.md) — what changed in 6.4.0.
 - [`RELEASE_VALIDATION_6.4.0.md`](RELEASE_VALIDATION_6.4.0.md) — 6.4.0 release checks.
 - [`RELEASE_NOTES_6.3.0.md`](RELEASE_NOTES_6.3.0.md) — what changed in 6.3.0.
 - [`RELEASE_VALIDATION_6.3.0.md`](RELEASE_VALIDATION_6.3.0.md) — 6.3.0 release checks.
 - [`data-r2/README.md`](data-r2/README.md) — the training-data changes behind
-  the 6.3.0 and 6.4.0 networks (6.5.0 ships the 6.4.0 network) and how to
+  the 6.3.0 and 6.4.0 networks (6.5.0 and 6.6.0 ship the 6.4.0 network) and how to
   reproduce them.
 - [`SYZYGY_FORMAT.md`](SYZYGY_FORMAT.md) — the Syzygy tablebase format and
   probing description our own prober was written from (6.5.0).

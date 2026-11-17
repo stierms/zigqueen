@@ -265,6 +265,15 @@ fn winMapRegular(byte_len: usize) ?[]align(std.heap.page_size_min) u8 {
     return base[0..byte_len];
 }
 
+/// Bytes that `alloc` really maps for a block of `byte_len`: a block of one
+/// huge page or more is backed in whole huge pages (the Linux mappings and
+/// the Windows large-page rung round up), a smaller one is the fallback
+/// allocator's, as asked. Callers that budget memory size their blocks with
+/// this (search/table_budget.zig).
+pub fn backedBytes(byte_len: u64) u64 {
+    return if (byte_len >= HUGE_PAGE_BYTES) std.mem.alignForward(u64, byte_len, HUGE_PAGE_BYTES) else byte_len;
+}
+
 /// Allocate `n` items of `T`, huge-page backed when possible. NOTE: like the
 /// plain allocator path, the returned memory is NOT guaranteed zeroed (mmap
 /// memory is, heap memory isn't) -- callers must clear it themselves.

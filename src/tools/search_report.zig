@@ -34,13 +34,6 @@ pub fn write(writer: anytype, result: *const search_engine.SearchResult, elapsed
     try writer.print("check_extensions {d}\n", .{stats.check_extensions});
     try writer.print("hindsight_depth_extensions {d}\n", .{stats.hindsight_depth_extensions});
     try writer.print("hindsight_depth_reductions {d}\n", .{stats.hindsight_depth_reductions});
-    try writer.print("rfp_hint_probes {d}\n", .{stats.rfp_hint_probes});
-    try writer.print("rfp_hint_cutoffs {d}\n", .{stats.rfp_hint_cutoffs});
-    try writer.print("rfp_hint_cutoffs_depth_1 {d}\n", .{stats.rfp_hint_cutoffs_depth_1});
-    try writer.print("rfp_hint_cutoffs_depth_2 {d}\n", .{stats.rfp_hint_cutoffs_depth_2});
-    try writer.print("rfp_hint_cutoffs_depth_3 {d}\n", .{stats.rfp_hint_cutoffs_depth_3});
-    try writer.print("rfp_hint_alpha_raises {d}\n", .{stats.rfp_hint_alpha_raises});
-    try writer.print("rfp_hint_cutoff_rate_permille {d}\n", .{ratioPermille(stats.rfp_hint_cutoffs, stats.rfp_hint_probes)});
     // Raw-eval cache (perf-r11): probes fire only after a TT static-eval miss,
     // so the hit rates below ARE the hit-after-TT-miss rates per phase.
     try writer.print("eval_cache_probes {d}\n", .{stats.eval_cache_probes});
@@ -240,6 +233,8 @@ pub fn write(writer: anytype, result: *const search_engine.SearchResult, elapsed
     try writer.print("lmr_cut_cutoffs_3_5 {d}\n", .{stats.lmr_cut_cutoffs_3_5});
     try writer.print("lmr_cut_cutoffs_6_7 {d}\n", .{stats.lmr_cut_cutoffs_6_7});
     try writer.print("lmr_cut_cutoffs_8p {d}\n", .{stats.lmr_cut_cutoffs_8p});
+    try writeOnlyMove(writer, "", &stats.only_move);
+    try writeQsRules(writer, "", &stats.qs_rules);
     try writer.print("singular_candidates {d}\n", .{stats.singular_candidates});
     try writer.print("singular_cut_candidates {d}\n", .{stats.singular_cut_candidates});
     try writer.print("singular_candidates_6_7 {d}\n", .{stats.singular_candidates_6_7});
@@ -380,4 +375,158 @@ fn stopReasonName(reason: ?search_engine.IterationStopReason) []const u8 {
 fn ratioPermille(numerator: u64, denominator: u64) u16 {
     if (denominator == 0) return 0;
     return @intCast((@as(u128, numerator) * 1000) / denominator);
+}
+
+/// The root's cycle tie-break (root.zig), the counters of one search on one line.
+pub fn writeRootTie(writer: anytype, comptime prefix: []const u8, stats: *const stats_mod.SearchStats) !void {
+    var buffer: [128]u8 = undefined;
+    var line = std.Io.Writer.fixed(&buffer);
+    try line.print(prefix ++ "roottie asked {d} refused {d} nodes {d} granted {d}\n", .{ stats.root_cycle_tie_asked, stats.root_cycle_tie_refused, stats.root_cycle_tie_nodes, stats.root_cycle_tie_granted });
+    try writer.writeAll(line.buffered());
+}
+
+/// The singular test's counters of one search, on one line (stats flavour,
+/// for drivers that set its switches over UCI).
+pub fn writeSingular(writer: anytype, comptime prefix: []const u8, stats: *const stats_mod.SearchStats, nodes: u64) !void {
+    var buffer: [512]u8 = undefined;
+    var line = std.Io.Writer.fixed(&buffer);
+    try line.print(prefix ++ "singular nodes {d} candidates {d} verifications {d} pv_verifications {d} all_verifications {d} verified {d} extensions {d} double_extensions {d} multicuts {d}\n", .{
+        nodes,
+        stats.singular_candidates,
+        stats.singular_verifications,
+        stats.singular_pv_verifications,
+        stats.singular_all_verifications,
+        stats.singular_verified,
+        stats.singular_extensions,
+        stats.singular_double_extensions,
+        stats.singular_multicuts,
+    });
+    try writer.writeAll(line.buffered());
+}
+
+/// The verified only-move extension's counters: one line per grid, cells
+/// named <node type>_<depth band>, then the scalar counters. Each line is
+/// built whole and written with one writeAll (`writer` may be a UCI output).
+/// One line of table counters for a finished search (stats flavour, UCI):
+/// what the transposition table and the raw eval cache were asked and what
+/// they kept, so table pressure can be read
+/// from real game sequences (`setoption Hash`, `go nodes`).
+/// The table's score against the static value (tt_eval.zig), the counters of one search on one line.
+pub fn writeTtEval(writer: anytype, comptime prefix: []const u8, nodes: u64, stats: *const stats_mod.SearchStats) !void {
+    var buffer: [1024]u8 = undefined;
+    var line = std.Io.Writer.fixed(&buffer);
+    try line.print(prefix ++ "tteval nodes {d} main {d} entries {d} differs {d} distance {d} differs_50 {d} differs_qs_entry {d} lower_over_beta {d} upper_under_beta {d} rfp_static {d} rfp_gained {d} rfp_refused {d} qs {d} qs_differs {d} qs_gained {d} qs_refused {d}\n", .{
+        nodes,
+        stats.tt_eval_nodes,
+        stats.tt_eval_entries,
+        stats.tt_eval_differs,
+        stats.tt_eval_distance,
+        stats.tt_eval_differs_50,
+        stats.tt_eval_differs_qs_entry,
+        stats.tt_eval_lower_over_beta,
+        stats.tt_eval_upper_under_beta,
+        stats.tt_eval_rfp_static,
+        stats.tt_eval_rfp_gained,
+        stats.tt_eval_rfp_refused,
+        stats.tt_eval_qs_nodes,
+        stats.tt_eval_qs_differs,
+        stats.tt_eval_qs_gained,
+        stats.tt_eval_qs_refused,
+    });
+    try writer.writeAll(line.buffered());
+}
+
+pub fn writeTables(writer: anytype, comptime prefix: []const u8, nodes: u64, stats: *const stats_mod.SearchStats) !void {
+    var buffer: [2048]u8 = undefined;
+    var line = std.Io.Writer.fixed(&buffer);
+    try line.print(prefix ++ "tables nodes {d} qnodes {d} tt_probes {d} tt_hits {d} tt_foreign_hits {d} tt_hit_current {d} tt_hit_old {d} tt_cutoffs {d} tt_shallow_hits {d} tt_ordering_only {d}", .{
+        nodes,
+        stats.qnodes,
+        stats.tt_probes,
+        stats.tt_hits,
+        stats.tt_foreign_hits,
+        stats.tt_hit_current_generation,
+        stats.tt_hit_old_generation,
+        stats.tt_cutoffs,
+        stats.tt_shallow_hits,
+        stats.tt_ordering_only_hits,
+    });
+    try line.print(" tt_stores {d} tt_store_skipped {d} tt_store_empty {d} tt_store_same_key {d} tt_store_replacements {d} tt_store_replaced_current {d} tt_store_replaced_old {d}", .{
+        stats.tt_stores,
+        stats.tt_store_skipped_same_generation_deeper,
+        stats.tt_store_empty,
+        stats.tt_store_same_key,
+        stats.tt_store_replacements,
+        stats.tt_store_replaced_current_generation,
+        stats.tt_store_replaced_old_generation,
+    });
+    try line.print(" iir {d} eval_cache_probes {d} eval_cache_hits {d} eval_cache_q_probes {d} eval_cache_q_hits {d} main_static_evals {d}\n", .{
+        stats.iir_reductions,
+        stats.eval_cache_probes,
+        stats.eval_cache_hits,
+        stats.eval_cache_q_probes,
+        stats.eval_cache_q_hits,
+        stats.main_static_evals,
+    });
+    try writer.writeAll(line.buffered());
+}
+
+/// The quiescence move rules' counters, one line per counter (stats flavour).
+pub fn writeQsRules(writer: anytype, comptime prefix: []const u8, qs: *const stats_mod.QsRuleStats) !void {
+    var buffer: [1024]u8 = undefined;
+    inline for (@typeInfo(stats_mod.QsRuleStats).@"struct".fields) |field| {
+        var line = std.Io.Writer.fixed(&buffer);
+        try line.print(prefix ++ "qs_rule_{s}", .{field.name});
+        if (field.type == u64) {
+            try line.print(" {d}", .{@field(qs, field.name)});
+        } else if (field.type == stats_mod.QsCheckPaths) {
+            inline for (stats_mod.QS_CHECK_PATH_NAMES, 0..) |path_name, path| {
+                try line.print(" {s} {d}", .{ path_name, @field(qs, field.name)[path] });
+            }
+        } else if (field.type == stats_mod.QsEqualBands) {
+            inline for (stats_mod.QS_EQUAL_BAND_MARGINS, 0..) |margin, band| {
+                try line.print(" m{d} {d}", .{ margin, @field(qs, field.name)[band] });
+            }
+        } else {
+            const grid = @field(qs, field.name);
+            inline for (.{ "mid", "late" }, 0..) |phase_name, late| {
+                inline for (.{ "pawn", "minor", "rook", "queen" }, 0..) |victim_name, victim| {
+                    try line.print(" {s}_{s} {d}", .{ phase_name, victim_name, grid[late][victim] });
+                }
+            }
+        }
+        try line.writeByte('\n');
+        try writer.writeAll(line.buffered());
+    }
+}
+
+pub fn writeOnlyMove(writer: anytype, comptime prefix: []const u8, om: *const stats_mod.OnlyMoveStats) !void {
+    var buffer: [2048]u8 = undefined;
+    inline for (.{ "verified", "single", "double", "cut", "shortened", "verify_nodes" }) |grid_name| {
+        const grid = @field(om, grid_name);
+        var line = std.Io.Writer.fixed(&buffer);
+        try line.print(prefix ++ "only_move_{s}", .{grid_name});
+        inline for (stats_mod.MOVE_ORDER_NODE_TYPE_NAMES, 0..) |node_name, t| {
+            inline for (stats_mod.ONLY_MOVE_DEPTH_BAND_NAMES, 0..) |depth_name, d| {
+                try line.print(" {s}_{s} {d}", .{ node_name, depth_name, grid[t][d] });
+            }
+        }
+        try line.writeByte('\n');
+        try writer.writeAll(line.buffered());
+    }
+    var line = std.Io.Writer.fixed(&buffer);
+    try line.print(prefix ++ "only_move_scalars verified_in_check {d} capped {d} ext_check {d} ext_ldse {d} ext_verified {d} root_confirms {d} root_confirms_rejected {d} root_displaced_scouts {d} root_displaced_returns {d} pv_confirms {d} pv_confirms_rejected {d}\n", .{
+        om.verified_in_check,
+        om.capped,
+        om.ext_check,
+        om.ext_ldse,
+        om.ext_verified,
+        om.root_confirms,
+        om.root_confirms_rejected,
+        om.root_displaced_scouts,
+        om.root_displaced_returns,
+        om.pv_confirms,
+        om.pv_confirms_rejected,
+    });
+    try writer.writeAll(line.buffered());
 }

@@ -15,6 +15,10 @@ const tunables = @import("tunables.zig");
 // SF-calibrated deep margins; the shallow range (<= the const below) keeps the
 // tuned shallow margin. The min-index gates stay const (structural, not tuned).
 const REVERSE_FUTILITY_SHALLOW_MAX_DEPTH: u16 = 3;
+/// Deepest node of this rule. It was the tunable RfpMaxDepth while the hint
+/// table read it; the search itself uses basin's reverse futility (root.zig),
+/// so a constant is all that is left of it.
+const REVERSE_FUTILITY_MAX_DEPTH: u16 = 6;
 
 pub fn shouldTryNullMove(
     allow_null: bool,
@@ -44,33 +48,13 @@ pub fn shouldReverseFutilityPrune(
     static_eval: ?types.Score,
     improving: bool,
 ) bool {
-    if (depth == 0 or depth > @as(u16, @intCast(tunables.active.rfp_max_depth))) return false;
+    if (depth == 0 or depth > REVERSE_FUTILITY_MAX_DEPTH) return false;
     if (in_check) return false;
     if (isPvWindow(alpha, beta)) return false;
     if (score_mod.isMateLike(alpha) or score_mod.isMateLike(beta)) return false;
 
     const eval_score = static_eval orelse return false;
     return eval_score - reverseFutilityMargin(depth, improving) >= beta;
-}
-
-/// Deepest node whose reverse-futility cutoff the hint table serves. Reads
-/// stop here, and the store side uses the same cap: deeper hints (basin RFP
-/// fires up to depth 12) were written but read only by a shallower revisit,
-/// while the depth-preferred two-slot clusters kept them over the shallow
-/// hints that are read.
-pub inline fn rfpHintMaxDepth() u16 {
-    return @intCast(tunables.active.rfp_max_depth);
-}
-
-/// The hint table memoises reverse-futility cutoffs, which fire only at zero
-/// windows, so the hint is read only there too. At a PV window it would cut
-/// the node on a heuristic its own RFP may not apply, or raise alpha so that a
-/// later fail low against the hint is returned and stored as an exact score.
-pub fn isRfpHintApplicable(depth: u16, alpha: types.Score, beta: types.Score) bool {
-    if (depth == 0 or depth > rfpHintMaxDepth()) return false;
-    if (isPvWindow(alpha, beta)) return false;
-    if (score_mod.isMateLike(alpha) or score_mod.isMateLike(beta)) return false;
-    return true;
 }
 
 pub fn shouldRazor(
@@ -307,7 +291,7 @@ test "null move stays off in pawn endings, pv windows, and low static eval nodes
 test "reverse futility pruning stays conservative" {
     // Written against the depth-cap constant so it survives margin/cap tuning.
     // Beyond the cap, RFP is off regardless of how large the eval is.
-    try @import("std").testing.expect(!shouldReverseFutilityPrune(@as(u16, @intCast(tunables.active.rfp_max_depth)) + 1, 50, 51, false, 30000, true));
+    try @import("std").testing.expect(!shouldReverseFutilityPrune(REVERSE_FUTILITY_MAX_DEPTH + 1, 50, 51, false, 30000, true));
     // Guards: PV window, null eval, and in-check nodes never RFP-prune.
     try @import("std").testing.expect(!shouldReverseFutilityPrune(2, -20, 20, true, 500, true));
     try @import("std").testing.expect(!shouldReverseFutilityPrune(2, -20, 20, false, null, true));
@@ -315,17 +299,8 @@ test "reverse futility pruning stays conservative" {
     try @import("std").testing.expect(shouldReverseFutilityPrune(2, 50, 51, false, 320, true));
     try @import("std").testing.expect(!shouldReverseFutilityPrune(2, 50, 51, false, 100, true));
     // A node at the deep cap needs a much larger margin (sound): tiny edge off, huge edge on.
-    try @import("std").testing.expect(!shouldReverseFutilityPrune(@as(u16, @intCast(tunables.active.rfp_max_depth)), 50, 51, false, 200, true));
-    try @import("std").testing.expect(shouldReverseFutilityPrune(@as(u16, @intCast(tunables.active.rfp_max_depth)), 50, 51, false, 9000, true));
-}
-
-test "the reverse-futility hint is read only at zero windows" {
-    try @import("std").testing.expect(isRfpHintApplicable(2, 49, 50));
-    try @import("std").testing.expect(!isRfpHintApplicable(2, -20, 20));
-    try @import("std").testing.expect(!isRfpHintApplicable(2, 48, 50));
-    try @import("std").testing.expect(!isRfpHintApplicable(0, 49, 50));
-    try @import("std").testing.expect(!isRfpHintApplicable(@as(u16, @intCast(tunables.active.rfp_max_depth)) + 1, 49, 50));
-    try @import("std").testing.expect(!isRfpHintApplicable(2, score_mod.MATE_THRESHOLD, score_mod.MATE_THRESHOLD + 1));
+    try @import("std").testing.expect(!shouldReverseFutilityPrune(REVERSE_FUTILITY_MAX_DEPTH, 50, 51, false, 200, true));
+    try @import("std").testing.expect(shouldReverseFutilityPrune(REVERSE_FUTILITY_MAX_DEPTH, 50, 51, false, 9000, true));
 }
 
 test "razoring stays off in pv windows checks and healthy eval nodes" {

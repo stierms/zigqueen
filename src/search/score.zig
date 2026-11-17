@@ -35,24 +35,29 @@ pub inline fn clampOrdinary(score: types.Score) types.Score {
     return std.math.clamp(score, -ORDINARY_SCORE_LIMIT, ORDINARY_SCORE_LIMIT);
 }
 
-/// The TT form of a score found `ply` plies from the root. A tablebase win or
-/// loss (`wdlScore`: TB_WIN_SCORE - ply of the probe) is stored as a distance
-/// from this node rather than from the root, so an entry read back at another
-/// ply, after a transposition or in a later search, keeps the right distance
-/// (audit A, S-TB-PLY). Every other score is stored as it is: mate scores are
-/// never trusted for cutoffs (tt_probe.zig), and ordinary scores are clamped
-/// below the tablebase band (`ORDINARY_SCORE_LIMIT`).
+/// The TT form of a score found `ply` plies from the root. A mate score
+/// (MATE_SCORE - ply of the mate) and a tablebase win or loss (`wdlScore`:
+/// TB_WIN_SCORE - ply of the probe) are stored as a distance from this node
+/// rather than from the root, so an entry read back at another ply, after a
+/// transposition or in a later search, keeps the right distance (audit A,
+/// S-TB-PLY). Ordinary scores are stored as they are; they are clamped below
+/// the tablebase band (`ORDINARY_SCORE_LIMIT`).
 pub inline fn toTt(score: types.Score, ply: usize) types.Score {
-    if (!isTablebaseDecisive(score)) return score;
+    if (!isDecisive(score)) return score;
     const distance: types.Score = @intCast(ply);
     return if (score > 0) score + distance else score - distance;
 }
 
 /// The inverse of `toTt` for an entry read at `ply`.
 pub inline fn fromTt(score: types.Score, ply: usize) types.Score {
-    if (!isTablebaseDecisive(score)) return score;
+    if (!isDecisive(score)) return score;
     const distance: types.Score = @intCast(ply);
     return if (score > 0) score - distance else score + distance;
+}
+
+/// Plies from the node at `ply` to the mate a mate score stands for.
+pub inline fn matePlies(score: types.Score, ply: usize) i32 {
+    return MATE_SCORE - absScore(score) - @as(i32, @intCast(ply));
 }
 
 pub fn scoreToMate(score: types.Score) i32 {
@@ -91,8 +96,13 @@ test "tablebase scores are stored relative to the node and read back at any ply"
     // Losses mirror wins.
     try std.testing.expectEqual(-TB_WIN_SCORE + 6, toTt(-found, 2));
     try std.testing.expectEqual(-TB_WIN_SCORE + 10, fromTt(toTt(-found, 2), 4));
-    // Evaluations, draws and mate scores are untouched at every ply.
-    for ([_]types.Score{ 0, 31, -450, TB_DECISIVE_THRESHOLD - 1, -(TB_DECISIVE_THRESHOLD - 1), MATE_SCORE - 3, -MATE_SCORE + 5 }) |score| {
+    // Mate scores rebase the same way: mate 3 plies below a ply-2 node, read at ply 6.
+    try std.testing.expectEqual(MATE_SCORE - 3, toTt(MATE_SCORE - 5, 2));
+    try std.testing.expectEqual(MATE_SCORE - 9, fromTt(MATE_SCORE - 3, 6));
+    try std.testing.expectEqual(-MATE_SCORE + 9, fromTt(toTt(-MATE_SCORE + 5, 2), 6));
+    try std.testing.expectEqual(@as(i32, 3), matePlies(fromTt(MATE_SCORE - 3, 6), 6));
+    // Evaluations and draws are untouched at every ply.
+    for ([_]types.Score{ 0, 31, -450, TB_DECISIVE_THRESHOLD - 1, -(TB_DECISIVE_THRESHOLD - 1) }) |score| {
         for ([_]usize{ 0, 1, 7, 100 }) |ply| {
             try std.testing.expectEqual(score, toTt(score, ply));
             try std.testing.expectEqual(score, fromTt(score, ply));

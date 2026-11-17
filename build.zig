@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     // Bump policy: MINOR for an accepted strength gain (each promoted baseline),
     // PATCH for fixes/tooling/perf-neutral changes, MAJOR for architecture
     // milestones. Highest version == newest.
-    const semver = "6.5.0";
+    const semver = "6.6.0";
     const version_override = b.option(
         []const u8,
         "version",

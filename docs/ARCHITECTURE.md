@@ -86,22 +86,30 @@ Iterative deepening with aspiration windows around a PVS/negamax core; once
 the window delta reaches its cap, the failing side opens fully.
 
 - **Threads.** Every thread searches the same root with its own iterative
-  deepening and shares only the transposition table; histories, eval cache,
-  hint table and accumulators are private. Thread 0 owns the clock, the root
+  deepening and shares only the transposition table; histories, eval cache
+  and accumulators are private. Thread 0 owns the clock, the root
   tablebase decision, UCI output and the final move. Helpers are created on a
   `Threads` change and park between searches.
-- **Transposition table.** Two 24-byte entries per cluster, depth-preferred
-  with generations, prefetched at make time; entries keep the raw static
-  eval. With more than one thread the clusters are 64 bytes with a sequence
-  word: a writer claims the cluster with one compare-and-swap or skips the
-  store, and a reader that sees a concurrent write treats it as a miss.
+- **Transposition table.** 64-byte clusters of five 12-byte entries (a
+  32-bit tag and a 64-bit word: move, score, raw static eval, depth, bound,
+  PV flag, generation), depth-preferred with generations, prefetched at make
+  time. `Hash` is the memory of the table and the eval caches together and
+  is never exceeded. With more than one thread a writer claims the cluster
+  through its sequence word with one compare-and-swap or skips the store,
+  and a reader that sees a concurrent write treats it as a miss. At a PV
+  node an entry only orders moves unless its score is decided; mate scores
+  are kept and bound the search.
 - **Eval cache.** Raw static evals of positions the TT evicted: 8-way sets of
-  8-byte entries in one 64-byte line, sized at a quarter of `Hash` (4–64 MB).
+  8-byte entries in one 64-byte line; a quarter of `Hash`, at most 64 MB,
+  divided among the threads.
 - **Pruning and reductions.** Late-move reductions and the pruning families
-  (null move with verification, reverse futility with a hint table,
-  futility, late-move, history and SEE pruning) share one fractional
-  depth-dose scheme ([PROVENANCE.md](PROVENANCE.md) §1); probcut and razoring
-  sit beside it. Post-PV root moves are scouted at reduced depth.
+  (null move with verification, reverse futility, futility, late-move,
+  history and SEE pruning) share one fractional depth-dose scheme
+  ([PROVENANCE.md](PROVENANCE.md) §1); probcut and razoring sit beside it.
+  Where the table holds a searched score that contradicts the static eval,
+  these rules read the searched score. A reduced move that beats alpha is
+  verified at the full depth at PV and expected all nodes, one ply short at
+  expected cut nodes. Post-PV root moves are scouted at reduced depth.
 - **Fail-soft cutoffs.** Reverse futility and the quiescence stand-pat return
   a value between beta and the static eval; null move returns its score.
 - **Correction history.** Tables for pawn structure, each side's non-pawn
@@ -109,16 +117,28 @@ the window delta reaches its cap, the failing side opens fully.
   the static eval misses. The corrected eval drives pruning, extensions and
   `improving`; the size of the correction widens the futility margins and
   shrinks reductions. The TT and eval cache keep the raw eval.
-- **Extensions.** Singular; checks at shallow depth, deeper only when the
-  static eval is at or below alpha.
-- **Move ordering.** TT move, captures by SEE, killers, countermove, quiet
-  history (four tables by attacked from/to squares), continuation history.
+- **Extensions.** Singular from depth 6: the table move is extended where
+  no other move comes near it and searched shallower where others do, and
+  the node is cut when the others already beat beta (multi-cut). Checks at
+  shallow depth, deeper only when the static eval is at or below alpha.
+- **Move ordering.** TT move, captures by SEE, then quiets by one score:
+  quiet history (four tables by attacked from/to squares), continuation
+  history, and bonuses for killers and the countermove, which is also kept
+  after captures. The root orders its moves by the nodes each one took in
+  the previous iteration.
 - **SEE.** A king captures only onto a square no longer attacked; a piece
   pinned to its own king does not capture off the pin line; promotions count.
 - **Quiescence.** Captures and promotions, plus SEE-gated quiet checks at the
   first ply.
-- **Fifty-move rule.** A node at halfmove clock 100 is a draw unless the side
-  to move is mated; no TT cutoffs from clock 90 on.
+- **Draws.** A draw found in the search scores +1 or −1 centipawn by the
+  node counter; a draw that can be claimed at the root and a tablebase draw
+  are exactly 0. A node at halfmove clock 100 is a draw unless the side to
+  move is mated; from clock 90 on there are no TT cutoffs and no reverse
+  futility cut.
+- **Progress.** Once the engine's own search has ended at +3.00 or more in
+  a game, the part of the score above that is damped as the halfmove clock
+  rises, so the search prefers lines that make progress; off again under
+  +2.00.
 
 ## Tablebases
 
@@ -137,17 +157,18 @@ below certain wins. Tablebase scores in the TT are relative to the node.
 The root is anytime: an interrupted iteration's best move counts once it is
 proven against the previous one. Base time comes from the increment and the
 clock above a reserve of about ten increments (cyclic controls use the moves
-to go). A stop rule checked at root-move boundaries and node polls reacts to
+to go and plan for one move more than the control requires). A stop rule checked at root-move boundaries and node polls reacts to
 fail-lows, best-move changes and score drops; extra time comes from the
 reserve, up to a burst cap. `Move Overhead`, a cap at the remaining clock and
-low-clock limits stay in force.
+low-clock limits stay in force. `go movetime` has one deadline, the movetime
+less `Move Overhead`.
 
 ## Performance
 
-- **Huge pages** for the TT, hint table, eval cache, histories, network
+- **Huge pages** for the TT, eval cache, histories, network
   weights and search context: `MAP_HUGETLB`, then THP via `madvise` on Linux;
   `MEM_LARGE_PAGES` on Windows when "Lock pages in memory" is granted.
-- **Prefetching** of TT and hint-table entries for the child at make time.
+- **Prefetching** of the child's TT cluster at make time.
 - **Cache-line layouts** for TT clusters, eval-cache sets, accumulators and
   weights; the hottest functions are 64-byte aligned.
 - **PGO.** The x86-64 release binaries are relinked from Zig's LTO bitcode

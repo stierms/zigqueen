@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const basin = @import("basin.zig");
 const core_types = @import("../core/types.zig");
@@ -7,8 +8,8 @@ const eval_backend = @import("../eval/backend.zig");
 const nnue768 = @import("../eval/nnue768.zig");
 const eval_cache_mod = @import("eval_cache.zig");
 const history_mod = @import("history.zig");
+const progress = @import("progress.zig");
 const repetition = @import("repetition.zig");
-const rfp_hint = @import("rfp_hint.zig");
 const score_mod = @import("score.zig");
 const search_info = @import("search_info.zig");
 const stack = @import("stack.zig");
@@ -32,7 +33,6 @@ pub const Resources = ResourcesFor(*tt.TranspositionTable);
 pub fn ResourcesFor(comptime TablePointer: type) type {
     return struct {
         tt: TablePointer,
-        rfp_hint: *rfp_hint.HintTable,
         eval_cache: *eval_cache_mod.EvalCache,
         history: *history_mod.HistoryTable,
         evaluator: *eval_backend.EngineState,
@@ -72,12 +72,33 @@ pub const SearchContext = struct {
     nodes: u64 = 0,
     seldepth: u16 = 0,
     stopped: bool = false,
+    /// Depth of the root pass being searched (the bound on accumulated
+    /// extension scales with it). Set by root.searchDepthWindow.
+    root_depth: u16 = 0,
     /// Immutable during one search. Absent from the release flavour.
     basin_config: if (build_options.tuning) *const basin.Config else void = if (build_options.tuning) undefined else {},
     /// Null-move verification (SF nmp_min_ply): while a verification search runs,
     /// null move is disabled for all plies below this marker so verify subtrees
     /// cannot recursively null-cut / re-verify (depth-efficiency v2).
     nmp_min_ply: usize = 0,
+    /// Set by root.searchTwofold / qsearch.searchTwofold for the one negamax or
+    /// quiescence entry they make: that node was counted and passed its draw
+    /// tests already, so the entry skips them.
+    twofold_resume: bool = false,
+    /// The clock pressure of progress.searchEval acts in this search: the
+    /// game's last search, of which this one is the successor
+    /// (predecessor.zig), ended ahead by basin.Params.progress_root_gate.
+    /// Set when the search starts and constant through it; a search of a
+    /// game that has not been ahead never has it and is then exactly the
+    /// search without the term. Set through setProgressPressure, with the
+    /// two fields below.
+    progress_pressure: bool = false,
+    /// The table context of this search (progress.TableContext): the pressure
+    /// off, or on for this root side with this clock bucket.
+    table_context: progress.TableContext = .{},
+    /// The context's key by halfmove clock, so a table access adds one loaded
+    /// word to the position key. All zero while the pressure is off.
+    table_keys: [progress.CLOCK_KEYS]u64 = [_]u64{0} ** progress.CLOCK_KEYS,
     record_static_search_outcomes: bool = false,
     record_move_order_outcomes: bool = false,
     /// Draw contempt (engine-scale cp): in-tree draws (repetition, 50-move,
@@ -98,6 +119,9 @@ pub const SearchContext = struct {
     /// before the caller's loop starts. So at most one frame per ply is inside
     /// its loop and no child can write a live slot. Safe builds assert it.
     tried_quiets: [stack.MAX_PLY]stack.TriedQuiets = undefined,
+    /// Test builds only: a root cycle tie-break's verifying search is running
+    /// (root.zig). Still set when the search has ended = it was cut inside one.
+    cycle_tie_verifying: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     tried_quiets_claimed: if (std.debug.runtime_safety) [stack.MAX_PLY]bool else void =
         if (std.debug.runtime_safety) [_]bool{false} ** stack.MAX_PLY else {},
 
@@ -113,6 +137,26 @@ pub const SearchContext = struct {
         if (comptime std.debug.runtime_safety) self.tried_quiets_claimed[ply] = false;
     }
 
+    /// Sets the clock pressure of this search and, with it, its table
+    /// context and the context's key for every clock. Called once, when the
+    /// search starts, after `root_color` is set (engine.zig); the pressure is
+    /// constant through a search.
+    pub fn setProgressPressure(self: *SearchContext, on: bool, clock_bucket: i32) void {
+        self.progress_pressure = on;
+        self.table_context = progress.TableContext.of(on, self.root_color, clock_bucket);
+        for (&self.table_keys, 0..) |*key, clock| key.* = self.table_context.key(@intCast(clock));
+    }
+
+    /// The key of a position in this search's table context: added to the
+    /// position key in every table access of the search (tt_probe, tt_store,
+    /// the prefetches, the root's table move). `halfmove_clock` is the clock
+    /// of the position the key is for. One load: zero while the pressure is
+    /// off, so that search reads and writes the entries a search without the
+    /// term would.
+    pub inline fn tableKey(self: *const SearchContext, halfmove_clock: u16) u64 {
+        return self.table_keys[@min(halfmove_clock, progress.MAX_CLOCK)];
+    }
+
     /// Runtime record flags, comptime-false when diagnostic stats are compiled
     /// out so the outcome-classification work in the hot loops folds away.
     pub inline fn recordMoveOrder(self: *const SearchContext) bool {
@@ -125,8 +169,19 @@ pub const SearchContext = struct {
         return self.record_static_search_outcomes;
     }
 
+    /// basin.Params.draw_dither: its default in the release flavour (a
+    /// constant), the option's value in the tuning flavour.
+    pub inline fn drawDither(self: *const SearchContext) core_types.Score {
+        if (comptime build_options.tuning) return self.basin_config.params.draw_dither;
+        return basin.defaults.draw_dither;
+    }
+
     pub fn drawScore(self: *const SearchContext, stm: core_types.Color) core_types.Score {
-        if (self.contempt == 0) return 0;
+        if (self.contempt == 0) {
+            const dither = self.drawDither();
+            if (dither == 0) return 0;
+            return dither - @as(core_types.Score, @intCast(self.nodes & 2)) * dither;
+        }
         return if (stm == self.root_color) -self.contempt else self.contempt;
     }
 
@@ -200,27 +255,6 @@ pub const SearchContext = struct {
     pub fn noteHindsightDepthReduction(self: *SearchContext) void {
         if (comptime !stats_enabled) return;
         self.stats.hindsight_depth_reductions += 1;
-    }
-
-    pub fn noteRfpHintProbe(self: *SearchContext) void {
-        if (comptime !stats_enabled) return;
-        self.stats.rfp_hint_probes += 1;
-    }
-
-    pub fn noteRfpHintCutoff(self: *SearchContext, depth: u16) void {
-        if (comptime !stats_enabled) return;
-        self.stats.rfp_hint_cutoffs += 1;
-        switch (depth) {
-            1 => self.stats.rfp_hint_cutoffs_depth_1 += 1,
-            2 => self.stats.rfp_hint_cutoffs_depth_2 += 1,
-            3 => self.stats.rfp_hint_cutoffs_depth_3 += 1,
-            else => {},
-        }
-    }
-
-    pub fn noteRfpHintAlphaRaise(self: *SearchContext) void {
-        if (comptime !stats_enabled) return;
-        self.stats.rfp_hint_alpha_raises += 1;
     }
 
     /// Raw-eval cache (perf-r11): probed only after a TT static-eval miss, so
@@ -709,6 +743,87 @@ pub const SearchContext = struct {
     pub fn noteSingularExtension(self: *SearchContext) void {
         if (comptime !stats_enabled) return;
         self.stats.singular_extensions += 1;
+    }
+
+    pub fn noteSingularDoubleExtension(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.singular_double_extensions += 1;
+    }
+
+    pub fn noteSingularMulticut(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.singular_multicuts += 1;
+    }
+
+    pub fn noteSingularVerificationAt(self: *SearchContext, pv_node: bool, cut_node: bool) void {
+        if (comptime !stats_enabled) return;
+        if (pv_node) self.stats.singular_pv_verifications += 1 else if (!cut_node) self.stats.singular_all_verifications += 1;
+    }
+
+    /// One verification search of a hash move's alternatives and its verdict
+    /// (only_move.Verdict); `verify_nodes` = nodes it searched.
+    pub fn noteOnlyMoveVerdict(self: *SearchContext, depth: u16, pv_node: bool, cut_node: bool, in_check: bool, verdict: anytype, verify_nodes: u64) void {
+        if (comptime !stats_enabled) return;
+        const t = stats.moveOrderNodeType(pv_node, cut_node);
+        const d = stats.onlyMoveDepthBand(depth);
+        const om = &self.stats.only_move;
+        om.verified[t][d] += 1;
+        om.verify_nodes[t][d] += verify_nodes;
+        if (in_check) om.verified_in_check += 1;
+        switch (verdict) {
+            .cut => om.cut[t][d] += 1,
+            .extension => |plies| {
+                if (plies == 1) om.single[t][d] += 1;
+                if (plies >= 2) om.double[t][d] += 1;
+                if (plies < 0) om.shortened[t][d] += 1;
+            },
+        }
+    }
+
+    pub const ExtensionRule = enum { check, ldse, verified };
+
+    /// An extension that the move takes after the bound on accumulated
+    /// extension; `trimmed` when the bound took plies away.
+    pub fn noteExtensionGranted(self: *SearchContext, rule: ExtensionRule, trimmed: bool) void {
+        if (comptime !stats_enabled) return;
+        const om = &self.stats.only_move;
+        if (trimmed) om.capped += 1;
+        switch (rule) {
+            .check => om.ext_check += 1,
+            .ldse => om.ext_ldse += 1,
+            .verified => om.ext_verified += 1,
+        }
+    }
+
+    pub fn noteExtensionCapped(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.only_move.capped += 1;
+    }
+
+    pub fn noteRootConfirm(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.only_move.root_confirms += 1;
+    }
+
+    pub fn noteRootConfirmRejected(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.only_move.root_confirms_rejected += 1;
+    }
+
+    pub fn notePvConfirm(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.only_move.pv_confirms += 1;
+    }
+
+    pub fn notePvConfirmRejected(self: *SearchContext) void {
+        if (comptime !stats_enabled) return;
+        self.stats.only_move.pv_confirms_rejected += 1;
+    }
+
+    pub fn noteRootDisplacedScout(self: *SearchContext, returned: bool) void {
+        if (comptime !stats_enabled) return;
+        self.stats.only_move.root_displaced_scouts += 1;
+        if (returned) self.stats.only_move.root_displaced_returns += 1;
     }
 
     pub fn notePvsScout(self: *SearchContext) void {

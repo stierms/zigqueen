@@ -160,26 +160,69 @@ pub const TmConfig = struct {
     /// target one move may draw, with / without an increment.
     v2_share_inc_pct: u32 = 40,
     v2_share_noinc_pct: u32 = 15,
+    /// ZQ_TM_V2_MTG_SPARE: with movestogo, plan the period for this many
+    /// moves more than the control requires. 0 is the 6.5.0 plan: the clock
+    /// is divided by the moves to go, and the last move before the control
+    /// gets all of it as target and as hard budget (down to the safety
+    /// margin); in 80 games at 40/60 that left 60 ms on the clock three
+    /// times. With 1 (default since 2026-11-11, docs/research/
+    /// roadmap-20261111/clock.md) the clock is divided by the moves to go
+    /// plus one, so the last move is planned like the others (half of the
+    /// clock at most), every move's burst is the usual share of the rest,
+    /// and about one average move's time is carried into the next period:
+    /// on every control in use the unspent time is not lost.
+    ///
+    /// The bound this gives, in whole milliseconds, for a clock R above 1 s.
+    /// Let U = R - Move Overhead * (moves to go + 2), not below zero (moves
+    /// to go taken as 1 to 50). Then
+    ///   hard budget <= max(1, floor(0.7 * U)),
+    /// so at least 30 % of R is left after any move of the period, the last
+    /// one included, whatever the increment. The 1 is the planner's floor:
+    /// where the margin uses the clock up (U of 0 or 1) target and hard
+    /// budget are both 1 ms. At or under 1 s this rule does not apply: the
+    /// low-clock planner (`planMovesToGo`, unchanged) plans the move. Without
+    /// increment its hard budget is at most 3/32 of the clock less one Move
+    /// Overhead, but not below its own floors of 1 ms each for the target
+    /// and its half (a 10 ms clock gets 1 and 2 ms); with an increment it
+    /// may plan the whole clock less the overhead. These are bounds on the
+    /// budget, not on the wall clock, which the search reads every 1024
+    /// nodes.
+    v2_mtg_spare_moves: u32 = 1,
     /// ZQ_TM_V2_FORCED: target percent when the root has one legal move.
     v2_forced_pct: u32 = 25,
     /// ZQ_TM_V2_C3: TM v2 step 3, graded stop urgency (design doc, "Step 3
     /// spec"). Struct default off; the engine process turns it on, and
     /// ZQ_TM_V2_C3=0 restores step 2's yes/no soft arm exactly. On a v2 clock
     /// search every completed iteration re-arms the soft deadline at
-    ///   T * clamp(K * u(streak), 0.5, burst / T)
+    ///   T * clamp(K * u(streak), floor, burst / T)
     /// where streak counts the completed iterations since the best move last
-    /// changed or the score jumped >= 80 cp, and u is the fitted relative
-    /// chance that one more doubling changes the move (`c3UrgencyPermille`).
+    /// changed or the score jumped >= 80 cp, and u is the factor of its
+    /// streak class (`v2_c3_class_permille`).
     /// The root's fail-low/challenger disarm and the forced-move 25 % target
     /// (with step 2's arm) are unchanged. Low-clock guard (`c3LowClock`):
     /// when a move that ran to the burst cap would leave less than the
     /// reserve target, the multiplier is capped at 1.0 for that move.
     v2_c3: bool = false,
-    /// ZQ_TM_V2_C3_K: the budget constant K in percent. 120 matches step 2's
-    /// spend near 1M nodes per move (about 20+0.2 on a Zen 3 core) in the warm-hash
-    /// policy simulation (vot/FIT-WARM.md). Multipliers: streak 0 -> the
-    /// burst cap, 1-3 -> 3.4 T, 4-11 -> 1.7 T, 12-19 -> 0.77 T, 20+ -> 0.5 T.
+    /// ZQ_TM_V2_C3_K: the level K in percent, on every class. 120 matches
+    /// step 2's spend near 1M nodes per move (about 20+0.2 on a Zen 3 core) in the
+    /// warm-hash policy simulation (vot/FIT-WARM.md). Deadlines at the
+    /// default floor: streak 0 -> the burst cap, 1-3 -> 3.4 T, 4-11 -> 1.7 T,
+    /// 12-19 -> 0.77 T, 20 and more -> the floor (0.5 T).
     v2_c3_k_pct: u32 = 120,
+    /// ZQ_TM_V2_C3_U: the urgency u of the six streak classes (streak 0 /
+    /// 1-3 / 4-11 / 12-19 / 20-29 / >= 30), in permille, six comma-separated
+    /// values. The soft deadline of a class is T * K * u, between the floor
+    /// and the hard budget. The fitted table (`C3_CLASS_PERMILLE`).
+    v2_c3_class_permille: [C3_CLASS_COUNT]u32 = C3_CLASS_PERMILLE,
+    /// ZQ_TM_V2_C3_FLOOR: lowest soft deadline of any class, percent of T.
+    /// 50: the classes of streak 20 and more stop at half the target. They
+    /// hold 21 % of the moves at 10+0.1, 65 % at 60+0.6 and 75 % at 40/60, so
+    /// the engine uses about 80 % of its clock at the longer controls. That
+    /// is not idle time: a fuller clock keeps every later target and burst
+    /// larger. Raising the floor to 77 % (tested 2026-11-11, docs/research/
+    /// roadmap-20261111/clock.md) spent the clock and lost 9.5 Elo at 60+0.6
+    /// in self-play and against the pool.
+    v2_c3_floor_pct: u32 = 50,
     /// ZQ_TM_TRACE: emit `info string tm ...` lines (plan, each completed
     /// iteration, stop) for clock audits and the value-of-time dataset.
     trace: bool = false,
@@ -225,11 +268,14 @@ pub fn loadTmConfigFromEnv() TmConfig {
     cfg.v2_share_inc_pct = @min(100, envU32(a, "ZQ_TM_V2_SHARE") orelse cfg.v2_share_inc_pct);
     cfg.v2_share_noinc_pct = @min(100, envU32(a, "ZQ_TM_V2_SHARE0") orelse cfg.v2_share_noinc_pct);
     cfg.v2_forced_pct = @min(100, envU32(a, "ZQ_TM_V2_FORCED") orelse cfg.v2_forced_pct);
+    cfg.v2_mtg_spare_moves = @min(8, envU32(a, "ZQ_TM_V2_MTG_SPARE") orelse cfg.v2_mtg_spare_moves);
     // Process default since the 6.5 merge (2026-10-15): TM v2 runs with C3
     // unless ZQ_TM_V2_C3=0 (step 2) or ZQ_TM_V2=0 (legacy). The struct
     // default stays off so the planner tests keep their configurations.
     cfg.v2_c3 = envFlag(a, "ZQ_TM_V2_C3") orelse true;
     cfg.v2_c3_k_pct = envU32(a, "ZQ_TM_V2_C3_K") orelse cfg.v2_c3_k_pct;
+    envU32List(a, "ZQ_TM_V2_C3_U", &cfg.v2_c3_class_permille);
+    cfg.v2_c3_floor_pct = envU32(a, "ZQ_TM_V2_C3_FLOOR") orelse cfg.v2_c3_floor_pct;
     cfg.trace = envFlag(a, "ZQ_TM_TRACE") orelse cfg.trace;
     return cfg;
 }
@@ -244,6 +290,24 @@ fn envU32(allocator: std.mem.Allocator, name: []const u8) ?u32 {
     const text = std.process.getEnvVarOwned(allocator, name) catch return null;
     defer allocator.free(text);
     return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \t\r\n"), 10) catch null;
+}
+
+/// Comma-separated list of exactly `out.len` values; anything else leaves
+/// `out` untouched.
+fn envU32List(allocator: std.mem.Allocator, name: []const u8, out: []u32) void {
+    const text = std.process.getEnvVarOwned(allocator, name) catch return;
+    defer allocator.free(text);
+    var parsed: [16]u32 = undefined;
+    if (out.len > parsed.len) return;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, std.mem.trim(u8, text, " \t\r\n"), ',');
+    while (parts.next()) |part| {
+        if (count == out.len) return;
+        parsed[count] = std.fmt.parseInt(u32, std.mem.trim(u8, part, " \t"), 10) catch return;
+        count += 1;
+    }
+    if (count != out.len) return;
+    @memcpy(out, parsed[0..out.len]);
 }
 
 fn envFlag(allocator: std.mem.Allocator, name: []const u8) ?bool {
@@ -265,7 +329,10 @@ pub const Plan = struct {
 /// deadline may not stretch past the target (`c3LowClock`). The first
 /// completed iteration replaces it with `armed`; until then it acts exactly
 /// like `disarmed`.
-pub const SoftStop = enum(u8) { off, armed, disarmed, low_clock };
+/// `fixed` is a `go movetime` search: one deadline, the movetime less the
+/// move overhead. Nothing arms, scales or projects it; the search runs until
+/// it (or to a depth, node or mate limit given beside it).
+pub const SoftStop = enum(u8) { off, armed, disarmed, low_clock, fixed };
 
 pub const Limits = struct {
     depth: ?u16 = null,
@@ -332,13 +399,15 @@ pub const GoLimits = struct {
 
         if (self.movetime_ms) |raw_ms| {
             // Exact per-move budget: neither the phase ramp nor the clamp fix
-            // applies (there is no clock to protect or redistribute).
-            // Typed: @min with a comptime-known bound narrows to u41, and the
-            // optimum's ×17 below would then overflow for clamped values.
+            // applies (there is no clock to protect or redistribute). The
+            // answer has to reach the GUI within the movetime, so the search
+            // has the movetime less the move overhead; the overhead never
+            // takes more than half of a short movetime. No soft part: time
+            // that is not used is lost (Limits.soft = .fixed).
+            // Typed: @min with a comptime-known bound narrows to u41.
             const ms: u64 = @min(raw_ms, MAX_PLAN_INPUT_MS);
-            const maximum_ms = @max(@as(u64, 1), ms);
-            const optimum_ms = @max(@as(u64, 1), (maximum_ms * 17) / 20);
-            return .{ .optimum_ms = optimum_ms, .maximum_ms = maximum_ms };
+            const budget_ms = @max(@as(u64, 1), ms - @min(move_overhead_ms, ms / 2));
+            return .{ .optimum_ms = budget_ms, .maximum_ms = budget_ms };
         }
 
         const remaining: u64 = @min(switch (side) {
@@ -390,9 +459,15 @@ pub const GoLimits = struct {
             limits.optimum_budget_ns = timing.optimum_ms * std.time.ns_per_ms;
             limits.maximum_budget_ns = timing.maximum_ms * std.time.ns_per_ms;
 
+            // A movetime is one deadline and nothing else.
+            if (self.movetime_ms != null) {
+                limits.soft = .fixed;
+                return limits;
+            }
+
             // TM v2 clock searches have one hard budget (the reserve-funded
             // burst cap) and a soft deadline armed by the search itself.
-            if (cfg.v2 and self.movetime_ms == null and self.usesV2Plan(side)) {
+            if (cfg.v2 and self.usesV2Plan(side)) {
                 limits.wider_maximum_budget_ns = limits.maximum_budget_ns;
                 limits.soft = .disarmed;
                 if (cfg.v2_c3) {
@@ -403,10 +478,10 @@ pub const GoLimits = struct {
                 return limits;
             }
 
-            // Fixed movetime and moves-to-go retain their single deadline.
+            // Moves-to-go retains its single deadline.
             // Only sudden-death clock searches store a second, instability-
             // armed ceiling; their live Controller deadline starts at 50/8.
-            if (self.movetime_ms == null and self.movestogo == null) {
+            if (self.movestogo == null) {
                 var legacy_cfg = cfg;
                 legacy_cfg.max_growth_pct = 50;
                 legacy_cfg.max_fraction_divisor = 8;
@@ -456,15 +531,20 @@ fn planV2(cfg: TmConfig, remaining: u64, increment: u64, move_overhead_ms: u64, 
     var share_pct: u64 = undefined;
     if (movestogo) |raw_mtg| {
         const mtg: u64 = std.math.clamp(raw_mtg, 1, 50);
-        const horizon: u64 = @min(mtg, if (increment > 0) cfg.v2_horizon_inc else cfg.v2_horizon_noinc);
+        const longest: u64 = if (increment > 0) cfg.v2_horizon_inc else cfg.v2_horizon_noinc;
+        const horizon: u64 = @min(mtg, longest);
         const safety = move_overhead_ms * (mtg + 2);
         const pool = (remaining + increment * (horizon - 1)) -| safety;
-        target = pool / horizon;
-        // Future increments are not on the clock yet: before the last move of
-        // the period, never plan more than half of what is (review finding).
-        if (mtg >= 2) target = @min(target, (remaining -| safety) / 2);
+        const spare: u64 = cfg.v2_mtg_spare_moves;
+        // The pool divided by the moves it has to last for: the moves to go,
+        // plus the spare ones, up to the longest horizon.
+        target = pool / @min(mtg + spare, @max(horizon, longest));
+        // Future increments are not on the clock yet: never plan more than
+        // half of what is (review finding). The 6.5.0 plan exempts the last
+        // move of the period.
+        if (mtg >= 2 or spare > 0) target = @min(target, (remaining -| safety) / 2);
         bank = (remaining -| safety) -| target;
-        share_pct = @max(cfg.v2_share_inc_pct, 100 / horizon);
+        share_pct = if (spare == 0) @max(cfg.v2_share_inc_pct, 100 / horizon) else cfg.v2_share_inc_pct;
     } else if (increment > 0) {
         const reserve = increment * cfg.v2_reserve_inc_pct / 100;
         const horizon: u64 = cfg.v2_horizon_inc;
@@ -612,12 +692,27 @@ pub fn signalScalePct(cfg: TmConfig, sig: SignalInputs) u32 {
 /// tm-v2-2026-10-13/vot/FIT-WARM.md). Warm hash stretches the streak, so
 /// the long-streak range keeps three classes.
 pub fn c3UrgencyPermille(streak: u32) u32 {
-    if (streak == 0) return 5540;
-    if (streak <= 3) return 2870;
-    if (streak <= 11) return 1410;
-    if (streak <= 19) return 640;
-    if (streak <= 29) return 360;
-    return 80;
+    return C3_CLASS_PERMILLE[c3ClassIndex(streak)];
+}
+
+pub const C3_CLASS_COUNT = 6;
+
+/// The warm-hash fit of 2026-10-14: the relative chance that a doubling of
+/// the search changes the move, by streak class. On 9,000 traced positions
+/// of 2026-11-11 the move changed in the next 41 % of time at rates of 27 /
+/// 13 / 7 / 3.6 / 1.1 / 0.1 % for the six classes, and no reshaping of the
+/// table beat it in the replay (docs/research/roadmap-20261111/clock.md).
+pub const C3_CLASS_PERMILLE = [C3_CLASS_COUNT]u32{ 5540, 2870, 1410, 640, 360, 80 };
+
+/// Streak class: 0 / 1-3 / 4-11 / 12-19 / 20-29 / >= 30 completed iterations
+/// since the best move last changed or the score jumped.
+pub fn c3ClassIndex(streak: u32) usize {
+    if (streak == 0) return 0;
+    if (streak <= 3) return 1;
+    if (streak <= 11) return 2;
+    if (streak <= 19) return 3;
+    if (streak <= 29) return 4;
+    return 5;
 }
 
 /// TM v2 C3 low-clock guard. C3 may stretch its deadline past the target T
@@ -641,12 +736,13 @@ pub fn v2InitialSoft(cfg: TmConfig, remaining_ms: u64, increment_ms: u64, movest
     return .disarmed;
 }
 
-/// TM v2 C3 soft deadline: target * clamp(K * u, 0.5, burst / target), in ns.
+/// TM v2 C3 soft deadline: target * clamp(K * u, floor, burst / target), in
+/// ns, the floor in percent of the target.
 /// Wide arithmetic: the planner saturates inputs at MAX_PLAN_INPUT_MS.
-pub fn c3SoftDeadlineNs(target_ns: u64, burst_ns: u64, k_pct: u32, u_permille: u32) u64 {
+pub fn c3SoftDeadlineFlooredNs(target_ns: u64, burst_ns: u64, k_pct: u32, u_permille: u32, floor_pct: u32) u64 {
     const scaled = @as(u128, target_ns) * k_pct * u_permille / 100_000;
-    const floored = @max(scaled, target_ns / 2);
-    return @intCast(@min(floored, burst_ns));
+    const floor = @as(u128, target_ns) * floor_pct / 100;
+    return @intCast(@min(@max(scaled, floor), burst_ns));
 }
 
 pub const StopNowReason = enum {
@@ -656,8 +752,9 @@ pub const StopNowReason = enum {
     soft_budget,
 };
 
-/// Audit D (U-STOP-D1) backstop: the first iteration's clock hold ends after
-/// this many nodes, a multiple of the 1024-node clock-check interval. Depth 1
+/// Audit D (U-STOP-D1) backstop: the first iteration's hold (of the clock and
+/// of a stop request) ends after this many nodes, a multiple of the 1024-node
+/// clock-check interval. Depth 1
 /// of an ordinary position costs far fewer (at most 1,281 nodes in a census of
 /// 71,975 opening and game positions). An impossible dense-queen board can
 /// need millions or never finish; it then answers at the later of its planned
@@ -670,9 +767,13 @@ pub const Controller = struct {
     limits: Limits,
     legacy_maximum_budget_ns: ?u64 = null,
     timer: ?runtime.Timer = null,
-    /// U-STOP-D1: the clock may not stop the search (holdClockUntilFirstIteration).
-    /// Kept out of Limits, whose size is pinned.
+    /// U-STOP-D1: neither the clock nor a stop request may end the search
+    /// (holdClockUntilFirstIteration). Kept out of Limits, whose size is pinned.
     clock_held: bool = false,
+    /// ZQ_TM_TRACE: the root reports every change of what the running pass
+    /// proves about the incumbent (`info string tm verdict ...`), so a trace
+    /// shows the move an interruption at any node would have played.
+    trace_verdicts: bool = false,
 
     pub fn init(stop_flag: *const std.atomic.Value(bool), limits: Limits) Controller {
         return .{
@@ -698,17 +799,24 @@ pub const Controller = struct {
         return 0;
     }
 
-    /// Audit D (U-STOP-D1): the clock does not stop the search before the
-    /// first iteration completes, so the move played is a searched one and not
-    /// the first generated move (a 1 ms cap, a zero or negative clock, or the
-    /// first `go` of a process used to stop at node 0). Depth 1 costs up to
-    /// about 200 nodes on ordinary positions. The hold is bounded: from
-    /// FIRST_ITERATION_CLOCK_HOLD_NODES nodes on, the planned hard deadline
-    /// applies again. `stop`, `quit` and node limits end the search at once
-    /// throughout; the soft deadline is never armed before a completed
-    /// iteration. The limits, the hard deadline included, are not touched.
+    /// Audit D (U-STOP-D1): neither the clock nor a stop request ends the
+    /// search before the first iteration completes, so the move played is a
+    /// searched one and not the first generated move (a 1 ms cap, a zero or
+    /// negative clock, the first `go` of a process, or a `stop`, `position`,
+    /// `quit` or end of input directly behind the `go` used to stop at node
+    /// 0). Depth 1 costs up to about 200 nodes on ordinary positions. The hold
+    /// is bounded: from FIRST_ITERATION_CLOCK_HOLD_NODES nodes on, a stop
+    /// request and the planned hard deadline apply again. Node limits end the
+    /// search at once throughout; the soft deadline is never armed before a
+    /// completed iteration. The limits, the hard deadline included, are not
+    /// touched.
     pub fn holdClockUntilFirstIteration(self: *Controller) void {
         self.clock_held = true;
+    }
+
+    /// The first iteration is still protected at this node count.
+    pub inline fn firstIterationHeld(self: *const Controller, nodes: u64) bool {
+        return self.clock_held and nodes < FIRST_ITERATION_CLOCK_HOLD_NODES;
     }
 
     /// The engine ends the hold at every completed iteration, before any
@@ -718,7 +826,9 @@ pub const Controller = struct {
     }
 
     pub fn stopReasonNow(self: *Controller, nodes: u64) ?StopNowReason {
-        if (self.stop_flag.load(.acquire)) return .external;
+        if (self.stop_flag.load(.acquire)) {
+            if (!self.firstIterationHeld(nodes)) return .external;
+        }
         if (self.limits.node_limit) |limit| {
             if (nodes >= limit) return .node_limit;
         }
@@ -727,7 +837,7 @@ pub const Controller = struct {
         // every node; the time deadline can overshoot by <=1023 nodes (<~1ms at our
         // nps), which is negligible vs any move budget. Fixed-nodes search is unaffected.
         if (nodes & 1023 != 0) return null;
-        if (self.clock_held and nodes < FIRST_ITERATION_CLOCK_HOLD_NODES) return null;
+        if (self.firstIterationHeld(nodes)) return null;
         if (self.limits.maximum_budget_ns) |budget_ns| {
             if (self.elapsedNs() >= budget_ns) return .maximum_budget;
         }
@@ -742,11 +852,19 @@ pub const Controller = struct {
 
     /// TM v2: the soft deadline is live only while the search is stable.
     pub fn softMode(self: *const Controller) bool {
-        return self.limits.soft != .off;
+        return switch (self.limits.soft) {
+            .off, .fixed => false,
+            .armed, .disarmed, .low_clock => true,
+        };
+    }
+
+    /// A `go movetime` search: only its one deadline ends it.
+    pub fn fixedBudget(self: *const Controller) bool {
+        return self.limits.soft == .fixed;
     }
 
     pub fn setSoftArmed(self: *Controller, armed: bool) void {
-        if (self.limits.soft == .off) return;
+        if (!self.softMode()) return;
         self.limits.soft = if (armed) .armed else .disarmed;
     }
 
@@ -759,23 +877,23 @@ pub const Controller = struct {
 
     /// TM v2: scale the soft target (one legal root move).
     pub fn scaleSoftTarget(self: *Controller, pct: u32) void {
-        if (self.limits.soft == .off) return;
+        if (!self.softMode()) return;
         if (self.limits.optimum_budget_ns) |soft_ns| {
             self.limits.optimum_budget_ns = @max(@as(u64, 1), soft_ns / 100 * pct + (soft_ns % 100) * pct / 100);
         }
     }
 
     /// TM v2 C3, at a completed iteration: arm the soft deadline of this
-    /// iteration's urgency class against the plan's target. The root may
-    /// disarm it again (fail-low, challenger) until the next completed
-    /// iteration. `capped` (low-clock guard) limits the deadline to the
-    /// target instead of the hard budget. Returns u in permille; no-op
-    /// outside TM v2.
-    pub fn armUrgency(self: *Controller, target_ns: u64, k_pct: u32, streak: u32, capped: bool) u32 {
-        const u = c3UrgencyPermille(streak);
-        if (self.limits.soft == .off) return u;
+    /// iteration's streak class against the plan's target, with the class
+    /// table, level and floor of `cfg`. The root may disarm it again
+    /// (fail-low, challenger) until the next completed iteration. `capped`
+    /// (low-clock guard) limits the deadline to the target instead of the
+    /// hard budget. Returns u in permille; no-op outside TM v2.
+    pub fn armUrgencyWith(self: *Controller, cfg: *const TmConfig, target_ns: u64, streak: u32, capped: bool) u32 {
+        const u = cfg.v2_c3_class_permille[c3ClassIndex(streak)];
+        if (!self.softMode()) return u;
         const ceiling_ns = if (capped) target_ns else (self.limits.maximum_budget_ns orelse std.math.maxInt(u64));
-        self.limits.optimum_budget_ns = c3SoftDeadlineNs(target_ns, ceiling_ns, k_pct, u);
+        self.limits.optimum_budget_ns = c3SoftDeadlineFlooredNs(target_ns, ceiling_ns, cfg.v2_c3_k_pct, u, cfg.v2_c3_floor_pct);
         self.limits.soft = .armed;
         return u;
     }
@@ -893,48 +1011,141 @@ test "TM v2 C3 urgency follows the fitted streak classes" {
     try std.testing.expect(!(TmConfig{}).v2_c3);
 }
 
-test "TM v2 C3 deadline is the target times K u, clamped to half the target and the burst" {
+test "TM v2 C3 deadline is the target times K u, between the floor and the burst" {
     const t: u64 = 4_000 * std.time.ns_per_ms;
     const burst = 5 * t;
-    // K 120 %: streak 1-3 gives 3.444 T, 4-11 1.692 T, 12-19 0.768 T.
-    try std.testing.expectEqual(t * 3444 / 1000, c3SoftDeadlineNs(t, burst, 120, 2870));
-    try std.testing.expectEqual(t * 1692 / 1000, c3SoftDeadlineNs(t, burst, 120, 1410));
-    try std.testing.expectEqual(t * 768 / 1000, c3SoftDeadlineNs(t, burst, 120, 640));
-    // Streaks of 20 and more are floored at half the target.
-    try std.testing.expectEqual(t / 2, c3SoftDeadlineNs(t, burst, 120, 360));
-    try std.testing.expectEqual(t / 2, c3SoftDeadlineNs(t, burst, 120, 80));
+    // K 120 %: streak 1-3 gives 3.444 T, 4-11 1.692 T.
+    try std.testing.expectEqual(t * 3444 / 1000, c3SoftDeadlineFlooredNs(t, burst, 120, 2870, 77));
+    try std.testing.expectEqual(t * 1692 / 1000, c3SoftDeadlineFlooredNs(t, burst, 120, 1410, 77));
+    // Streaks of 12 and more ask for 0.768, 0.432 and 0.096 T and get the 0.77 T floor.
+    try std.testing.expectEqual(t * 77 / 100, c3SoftDeadlineFlooredNs(t, burst, 120, 640, 77));
+    try std.testing.expectEqual(t * 77 / 100, c3SoftDeadlineFlooredNs(t, burst, 120, 360, 77));
+    try std.testing.expectEqual(t * 77 / 100, c3SoftDeadlineFlooredNs(t, burst, 120, 80, 77));
+    // 6.5.0's floor of half the target: class 12-19 keeps its own 0.768 T.
+    try std.testing.expectEqual(t * 768 / 1000, c3SoftDeadlineFlooredNs(t, burst, 120, 640, 50));
+    try std.testing.expectEqual(t / 2, c3SoftDeadlineFlooredNs(t, burst, 120, 360, 50));
     // Never past the burst cap (streak 0 asks for 6.648 T).
-    try std.testing.expectEqual(burst, c3SoftDeadlineNs(t, burst, 120, 5540));
-    try std.testing.expectEqual(2 * t, c3SoftDeadlineNs(t, 2 * t, 120, 2870));
+    try std.testing.expectEqual(burst, c3SoftDeadlineFlooredNs(t, burst, 120, 5540, 77));
+    try std.testing.expectEqual(2 * t, c3SoftDeadlineFlooredNs(t, 2 * t, 120, 2870, 77));
     // Saturated planner inputs cannot wrap.
     const huge = MAX_PLAN_INPUT_MS * std.time.ns_per_ms;
-    try std.testing.expectEqual(huge, c3SoftDeadlineNs(huge, huge, 1_000, 5540));
-    try std.testing.expectEqual(huge / 2, c3SoftDeadlineNs(huge, 5 * huge, 120, 80));
+    try std.testing.expectEqual(huge, c3SoftDeadlineFlooredNs(huge, huge, 1_000, 5540, 77));
+    try std.testing.expectEqual(huge / 100 * 77 + (huge % 100) * 77 / 100, c3SoftDeadlineFlooredNs(huge, 5 * huge, 120, 80, 77));
+}
+
+test "TM v2 C3 class table, level and floor come from the configuration" {
+    var stop_flag = std.atomic.Value(bool).init(false);
+    const t: u64 = 4_000 * std.time.ns_per_ms;
+    var cfg = TmConfig{};
+    cfg.v2_c3_k_pct = 100;
+    cfg.v2_c3_class_permille = .{ 3000, 2000, 1400, 1000, 850, 600 };
+    cfg.v2_c3_floor_pct = 70;
+    const Case = struct { streak: u32, permille: u64 };
+    const cases = [_]Case{
+        .{ .streak = 0, .permille = 3000 }, .{ .streak = 1, .permille = 2000 },  .{ .streak = 3, .permille = 2000 },
+        .{ .streak = 4, .permille = 1400 }, .{ .streak = 11, .permille = 1400 }, .{ .streak = 12, .permille = 1000 },
+        .{ .streak = 20, .permille = 850 }, .{ .streak = 29, .permille = 850 },
+        // the last class asks for 0.6 T and is lifted to the 0.7 T floor
+         .{ .streak = 30, .permille = 700 },
+    };
+    for (cases) |case| {
+        var controller = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = 5 * t, .soft = .disarmed });
+        _ = controller.armUrgencyWith(&cfg, t, case.streak, false);
+        try std.testing.expectEqual(SoftStop.armed, controller.limits.soft);
+        try std.testing.expectEqual(@as(?u64, t * case.permille / 1000), controller.limits.optimum_budget_ns);
+    }
+    // Under the low-clock guard no class plans past the target.
+    var guarded = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = 5 * t, .soft = .low_clock });
+    _ = guarded.armUrgencyWith(&cfg, t, 0, true);
+    try std.testing.expectEqual(@as(?u64, t), guarded.limits.optimum_budget_ns);
+    // The defaults are 6.5.0's: K 120 with the fitted table and a floor of half the target.
+    const defaults = TmConfig{};
+    try std.testing.expectEqual(C3_CLASS_PERMILLE, defaults.v2_c3_class_permille);
+    try std.testing.expectEqual(@as(u32, 120), defaults.v2_c3_k_pct);
+    try std.testing.expectEqual(@as(u32, 50), defaults.v2_c3_floor_pct);
+    var by_default = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = 5 * t, .soft = .disarmed });
+    try std.testing.expectEqual(@as(u32, 1410), by_default.armUrgencyWith(&defaults, t, 7, false));
+    try std.testing.expectEqual(@as(?u64, t * 1692 / 1000), by_default.limits.optimum_budget_ns);
+    _ = by_default.armUrgencyWith(&defaults, t, 15, false);
+    try std.testing.expectEqual(@as(?u64, t * 768 / 1000), by_default.limits.optimum_budget_ns);
+    for ([_]u32{ 20, 29, 30, 200 }) |streak| {
+        _ = by_default.armUrgencyWith(&defaults, t, streak, false);
+        try std.testing.expectEqual(@as(?u64, t / 2), by_default.limits.optimum_budget_ns);
+    }
+    _ = by_default.armUrgencyWith(&defaults, t, 0, false);
+    try std.testing.expectEqual(@as(?u64, 5 * t), by_default.limits.optimum_budget_ns);
+    // A higher floor is a configuration: at 77 % every streak of 12 and more gets 0.77 T.
+    var raised = TmConfig{};
+    raised.v2_c3_floor_pct = 77;
+    var other = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = 5 * t, .soft = .disarmed });
+    for ([_]u32{ 12, 19, 20, 30 }) |streak| {
+        _ = other.armUrgencyWith(&raised, t, streak, false);
+        try std.testing.expectEqual(@as(?u64, t * 77 / 100), other.limits.optimum_budget_ns);
+    }
+}
+
+test "TM v2 with movestogo: a spare move keeps part of the clock at the control" {
+    const overhead: u64 = DEFAULT_MOVE_OVERHEAD_MS;
+    const remaining: u64 = 5_000;
+    const last = GoLimits{ .wtime_ms = remaining, .movestogo = 1 };
+    const usable = remaining - 3 * overhead;
+    // 6.5.0 (no spare move): target and hard budget are the whole clock above the safety margin.
+    const full = last.planWithConfig(.{ .v2 = true, .v2_mtg_spare_moves = 0 }, .white, overhead, 48).?;
+    try std.testing.expectEqual(usable, full.optimum_ms);
+    try std.testing.expectEqual(usable, full.maximum_ms);
+    // One spare move (the default): half of it as target, 40 % of the rest as burst, 30 % kept.
+    const spare = TmConfig{ .v2 = true };
+    try std.testing.expectEqual(@as(u32, 1), spare.v2_mtg_spare_moves);
+    const keep = last.planWithConfig(spare, .white, overhead, 48).?;
+    try std.testing.expectEqual(usable / 2, keep.optimum_ms);
+    try std.testing.expectEqual(usable / 2 + (usable - usable / 2) * 40 / 100, keep.maximum_ms);
+    // Every move of a period: the clock above the margin over the moves to go
+    // plus one (28 at most without increment), and at least 30 % of it left
+    // after a move that runs to its hard budget.
+    for ([_]u32{ 1, 2, 3, 5, 12, 27, 28, 40 }) |mtg| {
+        var clock: u64 = 1_001;
+        while (clock < 2_000_000) : (clock = clock * 3 / 2 + 11) {
+            const limits = GoLimits{ .wtime_ms = clock, .movestogo = mtg };
+            const plan = limits.planWithConfig(spare, .white, overhead, 30).?;
+            const above = clock - overhead * (mtg + 2);
+            try std.testing.expectEqual(@max(@as(u64, 1), above / @min(@as(u64, mtg) + 1, 28)), plan.optimum_ms);
+            try std.testing.expect(plan.maximum_ms <= above * 7 / 10 + 1);
+            try std.testing.expect(clock - plan.maximum_ms >= clock * 3 / 10);
+            // From 28 moves to go on, the 6.5.0 plan is unchanged.
+            if (mtg >= 28) try std.testing.expectEqual(limits.planWithConfig(.{ .v2 = true, .v2_mtg_spare_moves = 0 }, .white, overhead, 30).?, plan);
+        }
+    }
+    // With an increment the divisor is capped at the increment horizon.
+    const inc = GoLimits{ .wtime_ms = 60_000, .winc_ms = 500, .movestogo = 10 };
+    const inc_plan = inc.planWithConfig(spare, .white, overhead, 30).?;
+    try std.testing.expectEqual((60_000 + 500 * 9 - overhead * 12) / 11, inc_plan.optimum_ms);
 }
 
 test "TM v2 C3 re-arms the graded deadline at every completed iteration" {
     var stop_flag = std.atomic.Value(bool).init(false);
     const t: u64 = 2;
     var controller = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = std.math.maxInt(u64), .soft = .disarmed });
-    // A completed iteration arms its class's deadline, whatever the legacy gate said.
-    try std.testing.expectEqual(@as(u32, 80), controller.armUrgency(t, 120, 30, false));
+    const cfg = TmConfig{};
+    // A completed iteration arms its class's deadline, whatever the legacy gate said
+    // (streak 30: the floor of half the target).
+    try std.testing.expectEqual(@as(u32, 80), controller.armUrgencyWith(&cfg, t, 30, false));
     try std.testing.expectEqual(SoftStop.armed, controller.limits.soft);
-    try std.testing.expectEqual(@as(?u64, t / 2), controller.limits.optimum_budget_ns);
+    try std.testing.expectEqual(@as(?u64, 1), controller.limits.optimum_budget_ns);
     try std.testing.expectEqual(@as(?StopNowReason, .soft_budget), controller.stopReasonNow(1024));
     // Root trouble disarms it until the next completed iteration ...
     controller.disarmSoft();
     try std.testing.expectEqual(@as(?StopNowReason, null), controller.stopReasonNow(1024));
     // ... which re-arms at its own class (streak 0 after a change): 2 ns * 6.648.
-    try std.testing.expectEqual(@as(u32, 5540), controller.armUrgency(t, 120, 0, false));
+    try std.testing.expectEqual(@as(u32, 5540), controller.armUrgencyWith(&cfg, t, 0, false));
     try std.testing.expectEqual(SoftStop.armed, controller.limits.soft);
     try std.testing.expectEqual(@as(?u64, 13), controller.limits.optimum_budget_ns);
     // A far deadline does not fire.
-    _ = controller.armUrgency(std.math.maxInt(u64) / 8, 120, 0, false);
+    _ = controller.armUrgencyWith(&cfg, std.math.maxInt(u64) / 8, 0, false);
     try std.testing.expectEqual(@as(?StopNowReason, null), controller.stopReasonNow(1024));
 
     // Legacy controllers never arm.
     var legacy = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = std.math.maxInt(u64) });
-    _ = legacy.armUrgency(t, 120, 30, false);
+    _ = legacy.armUrgencyWith(&cfg, t, 30, false);
     try std.testing.expectEqual(SoftStop.off, legacy.limits.soft);
     try std.testing.expectEqual(@as(?u64, t), legacy.limits.optimum_budget_ns);
     try std.testing.expectEqual(@as(?StopNowReason, null), legacy.stopReasonNow(1024));
@@ -993,16 +1204,19 @@ test "TM v2 C3 capped deadline never stretches past the target" {
     var stop_flag = std.atomic.Value(bool).init(false);
     const t: u64 = 4_000 * std.time.ns_per_ms;
     var controller = Controller.init(&stop_flag, .{ .optimum_budget_ns = t, .maximum_budget_ns = 5 * t, .soft = .low_clock });
+    const cfg = TmConfig{};
     // Streak 0 asks for 6.648 T: the burst cap uncapped, the target capped.
-    _ = controller.armUrgency(t, 120, 0, false);
+    _ = controller.armUrgencyWith(&cfg, t, 0, false);
     try std.testing.expectEqual(@as(?u64, 5 * t), controller.limits.optimum_budget_ns);
-    _ = controller.armUrgency(t, 120, 0, true);
+    _ = controller.armUrgencyWith(&cfg, t, 0, true);
     try std.testing.expectEqual(@as(?u64, t), controller.limits.optimum_budget_ns);
     try std.testing.expectEqual(SoftStop.armed, controller.limits.soft);
+    _ = controller.armUrgencyWith(&cfg, t, 6, true);
+    try std.testing.expectEqual(@as(?u64, t), controller.limits.optimum_budget_ns);
     // Below 1.0 the class still applies: 12-19 gives 0.768 T, 30+ the floor.
-    _ = controller.armUrgency(t, 120, 12, true);
+    _ = controller.armUrgencyWith(&cfg, t, 12, true);
     try std.testing.expectEqual(@as(?u64, t * 768 / 1000), controller.limits.optimum_budget_ns);
-    _ = controller.armUrgency(t, 120, 30, true);
+    _ = controller.armUrgencyWith(&cfg, t, 30, true);
     try std.testing.expectEqual(@as(?u64, t / 2), controller.limits.optimum_budget_ns);
 }
 
@@ -1034,12 +1248,34 @@ test "the first-iteration clock hold keeps the hard deadline and ends at its nod
     controller.releaseClockHold();
     try std.testing.expectEqual(@as(?StopNowReason, .maximum_budget), controller.stopReasonNow(1024));
 
-    // stop and node limits stay ahead of the hold.
+    // Node limits stay ahead of the hold; a stop request waits with the clock
+    // (the next test).
     var limited = Controller.init(&stop_flag, .{ .node_limit = 1, .maximum_budget_ns = 1 });
     limited.holdClockUntilFirstIteration();
     try std.testing.expectEqual(@as(?StopNowReason, .node_limit), limited.stopReasonNow(1));
-    stop_flag.store(true, .release);
-    try std.testing.expectEqual(@as(?StopNowReason, .external), limited.stopReasonNow(0));
+}
+
+test "a stop request waits for the first iteration, up to the hold's node budget" {
+    // A `stop`, `position`, `quit` or end of input directly behind `go` sets
+    // the flag before the search has visited a node. The move answered must
+    // still be a searched one.
+    var stop_flag = std.atomic.Value(bool).init(true);
+    var controller = Controller.init(&stop_flag, .{ .optimum_budget_ns = std.time.ns_per_hour, .maximum_budget_ns = std.time.ns_per_hour, .soft = .disarmed });
+    // Without the hold (any later iteration) a stop request ends the search at once.
+    try std.testing.expectEqual(@as(?StopNowReason, .external), controller.stopReasonNow(0));
+    controller.holdClockUntilFirstIteration();
+    try std.testing.expectEqual(@as(?StopNowReason, null), controller.stopReasonNow(0));
+    try std.testing.expectEqual(@as(?StopNowReason, null), controller.stopReasonNow(1));
+    try std.testing.expectEqual(@as(?StopNowReason, null), controller.stopReasonNow(FIRST_ITERATION_CLOCK_HOLD_NODES - 1));
+    // The backstop: a first iteration that does not finish is stopped there.
+    try std.testing.expectEqual(@as(?StopNowReason, .external), controller.stopReasonNow(FIRST_ITERATION_CLOCK_HOLD_NODES));
+    // A completed iteration ends the hold: the request applies at the next node.
+    controller.releaseClockHold();
+    try std.testing.expectEqual(@as(?StopNowReason, .external), controller.stopReasonNow(1));
+    // A node limit is exact even under a held stop request.
+    var limited = Controller.init(&stop_flag, .{ .node_limit = 1 });
+    limited.holdClockUntilFirstIteration();
+    try std.testing.expectEqual(@as(?StopNowReason, .node_limit), limited.stopReasonNow(1));
 }
 
 test "opt_pct: default ships 130, 100 recovers legacy exactly" {
@@ -1278,7 +1514,7 @@ test "clamp changes a plan only where the unclamped plan is past the clock" {
 test "absurd clock values saturate instead of wrapping" {
     const huge = std.math.maxInt(u64);
     const movetime = (GoLimits{ .movetime_ms = 18_446_744_073_710 }).planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
-    try std.testing.expectEqual(MAX_PLAN_INPUT_MS, movetime.maximum_ms);
+    try std.testing.expectEqual(MAX_PLAN_INPUT_MS - DEFAULT_MOVE_OVERHEAD_MS, movetime.maximum_ms);
     const sudden = (GoLimits{ .wtime_ms = huge, .winc_ms = huge }).planWithConfig(.{}, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
     try std.testing.expect(sudden.optimum_ms <= sudden.maximum_ms);
     try std.testing.expect(sudden.maximum_ms <= MAX_PLAN_INPUT_MS);
@@ -1349,6 +1585,26 @@ test "phase ramp never overrides the low-time emergency cap" {
     try std.testing.expectEqual(@as(u64, 261), unclamped.optimum_ms);
     const plan = limits.planWithConfig(.{ .phase = true }, .white, DEFAULT_MOVE_OVERHEAD_MS, 1).?;
     try std.testing.expectEqual(@as(u64, 180), plan.optimum_ms);
+}
+
+test "go movetime: the budget is the whole movetime less the move overhead" {
+    // UCI: "search exactly x mseconds". The answer has to be with the GUI by
+    // then, so the search has the movetime less the move overhead (which
+    // never takes more than half of a short movetime), and it has all of
+    // that: there is no clock to save the rest for.
+    const plain = (GoLimits{ .movetime_ms = 1_000 }).planWithConfig(.{}, .white, 20, 1).?;
+    try std.testing.expectEqual(@as(u64, 980), plain.maximum_ms);
+    try std.testing.expectEqual(@as(u64, 980), plain.optimum_ms);
+    const slow_gui = (GoLimits{ .movetime_ms = 1_000 }).planWithConfig(.{}, .white, 200, 1).?;
+    try std.testing.expectEqual(@as(u64, 800), slow_gui.maximum_ms);
+    try std.testing.expectEqual(@as(u64, 800), slow_gui.optimum_ms);
+    const short = (GoLimits{ .movetime_ms = 30 }).planWithConfig(.{}, .white, 20, 1).?;
+    try std.testing.expectEqual(@as(u64, 15), short.maximum_ms);
+    const none = (GoLimits{ .movetime_ms = 0 }).planWithConfig(.{}, .white, 20, 1).?;
+    try std.testing.expectEqual(@as(u64, 1), none.maximum_ms);
+    // The same with TM v2 and with a clock given beside it.
+    const beside = (GoLimits{ .movetime_ms = 1_000, .wtime_ms = 60_000, .winc_ms = 600 }).planWithConfig(.{ .v2 = true }, .white, 20, 1).?;
+    try std.testing.expectEqual(plain, beside);
 }
 
 test "phase ramp leaves movetime budgets alone" {
@@ -1470,6 +1726,22 @@ test "go limit conversion carries node limits and deadlines" {
     try std.testing.expectEqual(@as(?u64, 128), converted.node_limit);
     try std.testing.expect(converted.optimum_budget_ns != null);
     try std.testing.expect(converted.maximum_budget_ns != null);
+    // A movetime is a fixed budget: one deadline, never armed or scaled.
+    try std.testing.expectEqual(SoftStop.fixed, converted.soft);
+    try std.testing.expectEqual(converted.maximum_budget_ns, converted.optimum_budget_ns);
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var controller = Controller.init(&stop_flag, converted);
+    try std.testing.expect(!controller.softMode() and controller.fixedBudget());
+    controller.setSoftArmed(true);
+    controller.scaleSoftTarget(25);
+    _ = controller.armUrgencyWith(&TmConfig{ .v2 = true, .v2_c3 = true }, 1, 30, false);
+    try std.testing.expectEqual(SoftStop.fixed, controller.limits.soft);
+    try std.testing.expectEqual(converted.optimum_budget_ns, controller.limits.optimum_budget_ns);
+    // A clock beside the movetime changes nothing.
+    const beside = (GoLimits{ .movetime_ms = 20, .wtime_ms = 60_000, .winc_ms = 600 }).toControllerLimits(.white, DEFAULT_MOVE_OVERHEAD_MS, 1);
+    try std.testing.expectEqual(SoftStop.fixed, beside.soft);
+    try std.testing.expectEqual(converted.maximum_budget_ns, beside.maximum_budget_ns);
+    try std.testing.expectEqual(@as(?u64, null), beside.wider_maximum_budget_ns);
 }
 
 test "go infinite remains marked as unlimited after conversion" {

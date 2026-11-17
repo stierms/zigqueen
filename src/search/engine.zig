@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime = @import("../util/search_runtime.zig");
 const build_options = @import("build_options");
 const types = @import("../core/types.zig");
@@ -7,11 +8,13 @@ const eval_backend = @import("../eval/backend.zig");
 const move_mod = @import("../core/move.zig");
 const piece = @import("../core/piece.zig");
 const position = @import("../core/position.zig");
+const predecessor_mod = @import("predecessor.zig");
+const progress = @import("progress.zig");
 const pv = @import("pv.zig");
 const repetition = @import("repetition.zig");
-const rfp_hint_mod = @import("rfp_hint.zig");
 const rule50 = @import("rule50.zig");
 const eval_cache_mod = @import("eval_cache.zig");
+const table_budget = @import("table_budget.zig");
 const hugealloc = @import("../util/hugealloc.zig");
 const root = @import("root.zig");
 const qsearch = @import("qsearch.zig");
@@ -69,6 +72,9 @@ pub const SearchDiagnostics = struct {
     /// TM v2 C1: an interrupted iteration supplied the played move (a
     /// challenger proven against the previous iteration's best move).
     interrupted_challenger: bool = false,
+    /// Test builds only: the search was cut while a root cycle tie-break's
+    /// verifying search was running (context.cycle_tie_verifying).
+    cut_in_cycle_tie: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 };
 
 pub const SearchResult = struct {
@@ -95,11 +101,9 @@ pub const loadDefaultNet = eval_backend.loadDefaultNet;
 
 pub const Engine = struct {
     tt: tt.TranspositionTable,
-    rfp_hint: rfp_hint_mod.HintTable,
     /// Raw-eval memo (perf-r11): position-keyed cache of the exact raw static
-    /// eval, sized off Hash (Hash/4, clamped [4,64] MB; 2-way since perf-r12;
-    /// split across engines at Threads > 1, see PrivateTableSizes).
-    /// No UCI option.
+    /// eval, sized off Hash and counted inside it (table_budget.zig; split
+    /// across engines at Threads > 1, see PrivateTableSizes). No UCI option.
     eval_cache: eval_cache_mod.EvalCache,
     history: history_mod.HistoryTable = .{},
     evaluator: eval_backend.EngineState,
@@ -125,6 +129,11 @@ pub const Engine = struct {
     /// Optional UCI info sink, forwarded into the search context each search.
     /// Null unless the UCI worker installs one (tools/tests stay silent).
     info_emitter: ?search_info.InfoEmitter = null,
+    /// The game's last search, for what the next one decides before it
+    /// starts (predecessor.zig; today the clock pressure's gate). Owned by
+    /// the engine that publishes results: a helper's stays empty. Cleared
+    /// wherever the tables are cleared or replaced.
+    predecessor: predecessor_mod.Predecessor = .{},
 
     pub fn init(allocator: std.mem.Allocator, hash_mb: u32) !Engine {
         return initWithOptions(allocator, hash_mb, .{});
@@ -137,7 +146,7 @@ pub const Engine = struct {
     }
 
     /// Per-thread search state around a SHARED read-only net (datagen
-    /// --threads): TT/hint/eval-cache/history/context are private per engine,
+    /// --threads): TT/eval-cache/history/context are private per engine,
     /// only the weight blob is borrowed. The caller owns `net`, must keep it
     /// alive for this engine's lifetime, and frees it after deinit.
     pub fn initWithSharedNet(allocator: std.mem.Allocator, hash_mb: u32, net: *const eval_backend.Net) !Engine {
@@ -174,9 +183,7 @@ pub const Engine = struct {
         @import("startup.zig").ensure();
         var tt_table = if (serial_table) try tt.TranspositionTable.init(allocator, hash_mb) else tt.TranspositionTable{ .allocator = allocator };
         errdefer tt_table.deinit();
-        var hint_table = try rfp_hint_mod.HintTable.init(allocator, sizes.hint_mb);
-        errdefer hint_table.deinit();
-        var eval_cache = try eval_cache_mod.EvalCache.init(allocator, sizes.eval_mb);
+        var eval_cache = try eval_cache_mod.EvalCache.init(allocator, sizes.eval_kb);
         errdefer eval_cache.deinit();
         var history = history_mod.HistoryTable{};
         try history.initContinuation(allocator);
@@ -192,7 +199,6 @@ pub const Engine = struct {
         const ctx = &ctx_backed.items[0];
         return .{
             .tt = tt_table,
-            .rfp_hint = hint_table,
             .eval_cache = eval_cache,
             .history = history,
             .evaluator = evaluator.*,
@@ -206,7 +212,6 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         self.evaluator.deinit();
         self.tt.deinit();
-        self.rfp_hint.deinit();
         self.eval_cache.deinit();
         self.history.deinitContinuation(self.allocator);
         self.history.deinitCorrection(self.allocator);
@@ -216,9 +221,9 @@ pub const Engine = struct {
 
     pub fn reset(self: *Engine) void {
         self.tt.clear();
-        self.rfp_hint.clear();
         self.eval_cache.clear();
         self.history.clear();
+        self.predecessor.clear();
     }
 
     pub fn setNnueScalePercent(self: *Engine, nnue_scale_percent: u16) void {
@@ -268,11 +273,9 @@ pub const Engine = struct {
     /// whole by the UCI worker, with its per-thread table shares.
     fn resizeHashWithFactory(self: *Engine, hash_mb: u32, factory: anytype) !void {
         const sizes = PrivateTableSizes.forThreads(hash_mb, 1);
-        const hint_mb = sizes.hint_mb;
-        const eval_mb = sizes.eval_mb;
+        const eval_kb = sizes.eval_kb;
         if (hash_mb == self.tt.hashSizeMb() and
-            hint_mb == self.rfp_hint.hintSizeMb() and
-            eval_mb == self.eval_cache.cacheSizeMb())
+            eval_kb == self.eval_cache.cacheSizeKb())
         {
             self.reset();
             return;
@@ -280,17 +283,14 @@ pub const Engine = struct {
 
         var new_tt = try factory.create(tt.TranspositionTable, self.tt.allocator, hash_mb);
         errdefer new_tt.deinit();
-        var new_hint = try factory.create(rfp_hint_mod.HintTable, self.rfp_hint.allocator, hint_mb);
-        errdefer new_hint.deinit();
-        const new_eval = try factory.create(eval_cache_mod.EvalCache, self.eval_cache.allocator, eval_mb);
+        const new_eval = try factory.create(eval_cache_mod.EvalCache, self.eval_cache.allocator, eval_kb);
 
         self.tt.deinit();
-        self.rfp_hint.deinit();
         self.eval_cache.deinit();
         self.tt = new_tt;
-        self.rfp_hint = new_hint;
         self.eval_cache = new_eval;
         self.history.clear();
+        self.predecessor.clear();
     }
 
     pub fn hashSizeMb(self: *const Engine) u32 {
@@ -319,8 +319,12 @@ pub const Engine = struct {
         stop_flag: *const std.atomic.Value(bool),
         root_moves: ?*const move_mod.MoveList,
     ) SearchResult {
+        self.tt.policy = @import("tunables.zig").tablePolicy();
         self.tt.newSearch();
-        return self.searchWithTable(pos, root_history, limits, stop_flag, root_moves, &self.tt, null);
+        const last = self.predecessor.take(pos, limits.infinite);
+        const result = self.searchWithTable(pos, root_history, limits, stop_flag, root_moves, &self.tt, null, last);
+        self.predecessor.leave(pos, result.best_move, result.depth, result.score, self.ctx.progress_pressure, limits.infinite);
+        return result;
     }
 
     /// Single-worker shared-TT integration entry. The caller owns the table's
@@ -336,13 +340,18 @@ pub const Engine = struct {
         root_moves: ?*const move_mod.MoveList,
         table: *@import("shared_tt.zig").View,
     ) SearchResult {
-        return self.searchWithTable(pos, root_history, limits, stop_flag, root_moves, table, null);
+        const last = self.predecessor.take(pos, limits.infinite);
+        const result = self.searchWithTable(pos, root_history, limits, stop_flag, root_moves, table, null, last);
+        self.predecessor.leave(pos, result.best_move, result.depth, result.score, self.ctx.progress_pressure, limits.infinite);
+        return result;
     }
 
     pub fn searchParallel(self: *Engine, comptime coordinator: bool, execution: *@import("shared_job.zig").Execution(coordinator)) SearchResult {
         const job = execution.job;
         const root_moves = if (job.root_moves) |*moves| moves else null;
-        return self.searchWithTable(&job.position, &job.history, job.limits, job.control.external_stop, root_moves, &job.table, execution);
+        // The coordinator took the predecessor's verdict before the job was
+        // published (parallel_pool.Pool.run); every thread searches with it.
+        return self.searchWithTable(&job.position, &job.history, job.limits, job.control.external_stop, root_moves, &job.table, execution, job.predecessor);
     }
 
     fn searchWithTable(
@@ -354,6 +363,9 @@ pub const Engine = struct {
         root_moves: ?*const move_mod.MoveList,
         table: anytype,
         execution: anytype,
+        /// What the game's last search left when this search is its
+        /// successor (predecessor.zig), else null.
+        predecessor: ?predecessor_mod.Last,
     ) SearchResult {
         const parallel = @TypeOf(execution) != @TypeOf(null);
         const helper = if (parallel) @TypeOf(execution.*).is_helper else false;
@@ -382,7 +394,14 @@ pub const Engine = struct {
         ctx.contempt = self.contempt_cp;
         if (comptime build_options.tuning) ctx.basin_config = &self.basin_config;
         ctx.root_color = working.side_to_move;
+        // The clock pressure is on for the whole of this search or not at
+        // all: on when the game's last search ended at or above the gate.
+        const progress_params: *const basin.Params = if (comptime build_options.tuning) &self.basin_config.params else &basin.defaults;
+        const progress_open = if (predecessor) |last| progress.gateOpen(progress_params, last.score, last.pressure) else false;
+        ctx.setProgressPressure(progress_open, progress_params.progress_clock_bucket);
         if (ctx.repetition.count == 0) ctx.repetition.push(working.zobrist_key);
+        // Keys below the root's are game history (repetition.History.root).
+        ctx.repetition.root = ctx.repetition.count - 1;
         self.evaluator.prepareRoot(&ctx.stack, &working, &ctx.finny, &ctx.ft);
 
         var fallback = fallbackMove(&working, ctx.repetition.isRepetition(working.halfmove_clock), ctx.repetition.currentPreviousCycleChildKey(working.halfmove_clock), root_moves);
@@ -405,7 +424,9 @@ pub const Engine = struct {
         }
 
         if (comptime parallel) {
-            if (limits.node_limit == 0 or fallback == null or execution.job.control.stopping()) {
+            // A stop request does not end the coordinator before its first
+            // iteration (time.Controller.holdClockUntilFirstIteration).
+            if (limits.node_limit == 0 or fallback == null or (helper and execution.job.control.stopping())) {
                 if (fallback == null and legal.isInCheck(&working, working.side_to_move)) best.score = -score_mod.MATE_SCORE;
                 return best;
             }
@@ -436,7 +457,7 @@ pub const Engine = struct {
             // root is searched inside its outcome-preserving move set.
             if (p.instant) |mv| {
                 if (comptime parallel) {
-                    if (!execution.job.control.count(true, execution.account)) return best;
+                    if (!execution.job.control.count(true, execution.account, false)) return best;
                     ctx.nodes = 1;
                 }
                 best.best_move = mv;
@@ -455,14 +476,12 @@ pub const Engine = struct {
         }
         const resources = if (parallel) .{
             .tt = table,
-            .rfp_hint = &self.rfp_hint,
             .eval_cache = &self.eval_cache,
             .history = &self.history,
             .evaluator = &self.evaluator,
             .execution = execution,
         } else context_mod.ResourcesFor(@TypeOf(table)){
             .tt = table,
-            .rfp_hint = &self.rfp_hint,
             .eval_cache = &self.eval_cache,
             .history = &self.history,
             .evaluator = &self.evaluator,
@@ -490,15 +509,18 @@ pub const Engine = struct {
                 c3_capped = ctx.control.limits.soft == .low_clock;
             }
         }
-        if (!helper and tm_cfg.trace) traceSearchStart(ctx);
-        // Only stop/quit and node limits may interrupt depth 1; the clock waits
-        // for its completion, up to the hold's node budget
+        if (!helper and tm_cfg.trace) {
+            traceSearchStart(ctx);
+            ctx.control.trace_verdicts = true;
+        }
+        // Only node limits may interrupt depth 1; the clock and a stop request
+        // wait for its completion, up to the hold's node budget
         // (time.Controller.holdClockUntilFirstIteration).
         ctx.control.holdClockUntilFirstIteration();
         var depth: u16 = 1;
         search_loop: while (depth <= max_depth) : (depth += 1) {
             if (comptime parallel) {
-                if (execution.job.control.stopping()) break;
+                if (execution.job.control.stopping() and (helper or !ctx.control.firstIterationHeld(ctx.nodes))) break;
             }
             if (ctx.control.stopReasonNow(ctx.nodes)) |reason| {
                 ctx.noteHardStop(reason);
@@ -600,7 +622,7 @@ pub const Engine = struct {
             best.depth = iteration.depth;
             best.seldepth = ctx.seldepth;
             best.nodes = ctx.nodes;
-            pv.reconstructFromRootMoveLimited(&working, &ctx.repetition, table, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
+            pv.reconstructFromRootMoveLimited(&working, &ctx.repetition, table, ctx.table_context, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
 
             const current_trace = IterationTrace{
                 .depth = iteration.depth,
@@ -665,7 +687,7 @@ pub const Engine = struct {
             // TM v2 C3: every completed iteration arms the deadline of its
             // urgency class instead of step 2's stable-only arm.
             const urgency: ?u32 = if (c3_target_ns) |target|
-                ctx.control.armUrgency(target, tm_cfg.v2_c3_k_pct, urgencyStreak(stable_iteration_streak), c3_capped)
+                ctx.control.armUrgencyWith(&tm_cfg, target, urgencyStreak(stable_iteration_streak), c3_capped)
             else
                 null;
             const soft_armed = iteration_stable or urgency != null;
@@ -679,6 +701,8 @@ pub const Engine = struct {
                 null
             else if (ctx.control.softMode())
                 softIterationStopReason(&ctx.control, soft_armed, ctx.control.elapsedNs())
+            else if (ctx.control.fixedBudget())
+                fixedBudgetStopReason(ctx.control.limits, ctx.control.elapsedNs())
             else
                 iterationStopReasonWithPolicy(ctx.control.limits, previous_trace, current_trace, @as(i128, ctx.control.elapsedNs()), iteration_elapsed_ns, soft_policy);
             if (stop_reason) |reason| {
@@ -704,7 +728,7 @@ pub const Engine = struct {
         // time and nodes (single-thread; the SMP worker writes its own final
         // line). An adopted challenger already emitted its line.
         if (comptime !parallel) {
-            if (ctx.stopped and ctx.control.softMode() and best.depth > 0 and !best.diagnostics.interrupted_challenger) emitInterruptedFinal(ctx, table, &best);
+            if (ctx.stopped and (ctx.control.softMode() or ctx.control.fixedBudget()) and best.depth > 0 and !best.diagnostics.interrupted_challenger) emitInterruptedFinal(ctx, table, &best);
         }
         if (!helper and tm_cfg.trace) traceSearchStop(ctx, &best, tm_cfg.v2);
         // Depth 64 is the engine's structural ID ceiling, not permission for
@@ -714,6 +738,7 @@ pub const Engine = struct {
             while (!stop_flag.load(.acquire)) runtime.Thread.sleep(std.time.ns_per_ms);
         }
         best.diagnostics.stats = ctx.stats;
+        if (comptime builtin.is_test) best.diagnostics.cut_in_cycle_tie = ctx.cycle_tie_verifying;
         return best;
     }
 };
@@ -728,31 +753,18 @@ const HashTableFactory = struct {
     }
 };
 
-fn hintSizeFor(hash_mb: u32) u32 {
-    const half = hash_mb / 2;
-    if (half < rfp_hint_mod.MIN_HINT_MB) return rfp_hint_mod.MIN_HINT_MB;
-    if (half > rfp_hint_mod.MAX_HINT_MB) return rfp_hint_mod.MAX_HINT_MB;
-    return half;
-}
-
-/// Sizes of one engine's private, Hash-derived tables: the RFP-hint table and
-/// the raw-eval cache. Both stay private per thread (the eval cache writes its
-/// LRU bit on hits; hints carry thread-local search results), so with
-/// Threads = N there are N copies. UCI Hash is the process budget: the
-/// Threads = 1 sizes (hint Hash/2 in [1, 1024] MB, eval Hash/4 in [4, 64] MB)
-/// are the budget of all private copies together, split N ways. Threads = 1 is
-/// the identity. The per-table floors (1 MB hint, 4 MB eval) can exceed the
-/// split budget by at most 5 MB per engine (e.g. eval at T32 >= Hash 256).
+/// Size of one engine's private, Hash-derived table: the raw-eval cache. It
+/// stays private per thread (it writes its LRU order on hits), so with
+/// Threads = N there are N copies. UCI Hash is the process budget
+/// (table_budget.zig): the transposition table takes Hash less the eval
+/// caches' share, and that share is split N ways, each part rounded down to
+/// a power of two, so the copies together stay inside it at every supported
+/// Hash and thread count. Threads = 1 is the identity.
 pub const PrivateTableSizes = struct {
-    hint_mb: u32,
-    eval_mb: u32,
+    eval_kb: u32,
 
     pub fn forThreads(hash_mb: u32, threads: u32) PrivateTableSizes {
-        const ways = @max(threads, 1);
-        return .{
-            .hint_mb = @max(hintSizeFor(hash_mb) / ways, rfp_hint_mod.MIN_HINT_MB),
-            .eval_mb = @max(eval_cache_mod.sizeForHash(hash_mb) / ways, eval_cache_mod.MIN_CACHE_MB),
-        };
+        return .{ .eval_kb = table_budget.evalKbPerEngine(hash_mb, threads) };
     }
 };
 
@@ -902,6 +914,14 @@ fn softIterationStopReason(control: *time.Controller, stable: bool, elapsed_ns: 
     return null;
 }
 
+/// `go movetime` at a completed iteration: the search goes on until the
+/// deadline itself. No projection (an iteration that cannot finish may still
+/// find a proven challenger, and the time cannot be saved) and no soft part.
+fn fixedBudgetStopReason(limits: time.Limits, elapsed_ns: u64) ?IterationStopReason {
+    const maximum = limits.maximum_budget_ns orelse return null;
+    return if (elapsed_ns >= maximum) .maximum_elapsed else null;
+}
+
 /// Legal root moves the search may choose from (the searchmoves/TB-safe set
 /// when one applies).
 noinline fn rootMoveCount(pos: *const position.Position, allowed: ?*const move_mod.MoveList) usize {
@@ -952,7 +972,7 @@ noinline fn traceSearchStart(ctx: *context_mod.SearchContext) void {
     // v2-legacy-plan (ZQ_TM_V2 on but movetime/depth/nodes/infinite or the
     // low-clock regime: the legacy plan applies).
     emitTrace(ctx, "tm plan mode {s} soft_ms {d} hard_ms {d}", .{
-        if (limits.soft != .off) "v2" else if (time.tmConfig().v2) "v2-legacy-plan" else "legacy",
+        if (limits.soft == .fixed) "movetime" else if (limits.soft != .off) "v2" else if (time.tmConfig().v2) "v2-legacy-plan" else "legacy",
         (limits.optimum_budget_ns orelse 0) / std.time.ns_per_ms,
         (limits.maximum_budget_ns orelse 0) / std.time.ns_per_ms,
     });
@@ -1035,7 +1055,7 @@ noinline fn adoptInterruptedChallenger(
     best.depth = depth;
     best.seldepth = ctx.seldepth;
     best.nodes = ctx.nodes;
-    pv.reconstructFromRootMoveLimited(working, &ctx.repetition, table, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
+    pv.reconstructFromRootMoveLimited(working, &ctx.repetition, table, ctx.table_context, best.best_move, &best.pv, pv.DEFAULT_ENGINE_PV_LIMIT);
     best.diagnostics.interrupted_challenger = true;
     ctx.noteInterruptedChallenger();
     if (ctx.info_emitter) |emitter| {
@@ -1360,6 +1380,84 @@ test "iterative deepening searches through an early TB decision to a short mate"
     try std.testing.expectEqual(@as(usize, 14), result.diagnostics.trace_len);
 }
 
+test "the clock pressure is on in a search only when the game's last search ended ahead" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+    const Game = struct {
+        /// Searches `pos`; returns whether the pressure was on and the position after the best move and a reply.
+        fn search(eng: *Engine, stop: *std.atomic.Value(bool), pos: *const position.Position, limits: time.Limits) !struct { on: bool, next: position.Position, score: types.Score } {
+            var history = repetition.History{};
+            history.push(pos.zobrist_key);
+            const result = eng.search(pos, &history, limits, stop);
+            var next = pos.*;
+            var state = make_unmake.StateInfo{};
+            _ = make_unmake.makeMove(&next, result.best_move.?, &state);
+            var replies = move_mod.MoveList.init();
+            legal.generate(&next, &replies);
+            try std.testing.expect(replies.count != 0);
+            var reply_state = make_unmake.StateInfo{};
+            _ = make_unmake.makeMove(&next, replies.moves[0], &reply_state);
+            return .{ .on = eng.ctx.progress_pressure, .next = next, .score = result.score };
+        }
+    };
+    const won = try fen.parse("4k3/pppp4/8/8/8/8/PPPP4/RNBQK3 w Q - 0 20");
+    const level = try fen.parse("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 20");
+
+    // A game that is ahead: the first search has no predecessor, the ones
+    // after it do, as long as each root is the last one's best move and a
+    // reply.
+    const first = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    try std.testing.expect(!first.on and first.score >= basin.defaults.progress_root_gate);
+    const second = try Game.search(&engine, &stop_flag, &first.next, .{ .depth = 3 });
+    try std.testing.expect(second.on);
+    const third = try Game.search(&engine, &stop_flag, &second.next, .{ .depth = 3 });
+    try std.testing.expect(third.on);
+
+    // Review witness 1: an unrelated position at the same move number and side.
+    _ = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    try std.testing.expect(!(try Game.search(&engine, &stop_flag, &level, .{ .depth = 3 })).on);
+    // The same position again; a position two of its own moves on.
+    const again = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    try std.testing.expect(!again.on);
+    try std.testing.expect(!(try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 })).on);
+
+    // Review witness 2: a Hash resize replaces the tables and the record with them.
+    const before_resize = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    try engine.resizeHash(2);
+    try std.testing.expect(!(try Game.search(&engine, &stop_flag, &before_resize.next, .{ .depth = 3 })).on);
+    // The same size again clears as well.
+    const before_same = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    try engine.resizeHash(2);
+    try std.testing.expect(!(try Game.search(&engine, &stop_flag, &before_same.next, .{ .depth = 3 })).on);
+
+    // A new game forgets the last search.
+    const before_reset = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    engine.reset();
+    try std.testing.expect(!(try Game.search(&engine, &stop_flag, &before_reset.next, .{ .depth = 3 })).on);
+
+    // Analysis: an infinite search never has the pressure and leaves no
+    // record, even on the game's own next position. (The stop flag is set,
+    // so the search returns at once.)
+    const before_analysis = try Game.search(&engine, &stop_flag, &won, .{ .depth = 3 });
+    stop_flag.store(true, .release);
+    var history = repetition.History{};
+    history.push(before_analysis.next.zobrist_key);
+    _ = engine.search(&before_analysis.next, &history, .{ .infinite = true }, &stop_flag);
+    try std.testing.expect(!engine.ctx.progress_pressure);
+    try std.testing.expect(!engine.predecessor.valid);
+    stop_flag.store(false, .release);
+
+    // A level game never has it.
+    engine.reset();
+    const opening = try Game.search(&engine, &stop_flag, &level, .{ .depth = 3 });
+    try std.testing.expect(!opening.on and opening.score < basin.defaults.progress_root_gate);
+    try std.testing.expect(!(try Game.search(&engine, &stop_flag, &opening.next, .{ .depth = 3 })).on);
+}
+
 test "engine tracks selective depth during search" {
     const fen = @import("../core/fen.zig");
 
@@ -1474,6 +1572,51 @@ test "default soft policy reproduces the legacy stop decision" {
         @as(?IterationStopReason, null),
         iterationStopReasonWithPolicy(limits, previous, changed, 60 * std.time.ns_per_ms, 2 * std.time.ns_per_ms, .{}),
     );
+}
+
+test "the pressure's gate has two lines: on from the gate, and then on until below the leave line" {
+    @import("startup.zig").ensure();
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, 1);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+    // First-principles review, fp-leaves D2: with one line a score that
+    // moves 2.90, 3.10, 2.95 changes the table context at every move. The
+    // record of the last search (its root, its best move Qh5, its score and
+    // whether it ran under the pressure) is written by hand; the search is
+    // of a successor position.
+    const last_root = try fen.parse("4k3/pppp4/8/8/8/8/PPPP4/RNBQK3 w Q - 4 20");
+    const successor = try fen.parse("3k4/pppp4/8/7Q/8/8/PPPP4/RNB1K3 w Q - 6 21");
+    const best = move_mod.Move.init(.d1, .h5, .quiet);
+    const gate = basin.defaults.progress_root_gate;
+    const leave_line = basin.defaults.progress_root_leave;
+    try std.testing.expect(leave_line < gate);
+    const Case = struct { score: types.Score, pressure: bool, on: bool };
+    for ([_]Case{
+        // Off before: only the gate opens it.
+        .{ .score = gate - 1, .pressure = false, .on = false },
+        .{ .score = gate, .pressure = false, .on = true },
+        .{ .score = leave_line, .pressure = false, .on = false },
+        // On before: it stays on down to the leave line.
+        .{ .score = gate - 1, .pressure = true, .on = true },
+        .{ .score = leave_line, .pressure = true, .on = true },
+        .{ .score = leave_line - 1, .pressure = true, .on = false },
+        .{ .score = -500, .pressure = true, .on = false },
+    }) |case| {
+        engine.predecessor.leave(&last_root, best, 9, case.score, case.pressure, false);
+        var history = repetition.History{};
+        history.push(successor.zobrist_key);
+        const result = engine.search(&successor, &history, .{ .depth = 2 }, &stop_flag);
+        std.testing.expectEqual(case.on, engine.ctx.progress_pressure) catch |err| {
+            std.debug.print("last search at {d}, pressure {}: expected {}\n", .{ case.score, case.pressure, case.on });
+            return err;
+        };
+        // The record this search leaves carries its own state.
+        try std.testing.expect(result.best_move != null);
+        try std.testing.expect(engine.predecessor.valid);
+        try std.testing.expectEqual(case.on, engine.predecessor.last.pressure);
+    }
 }
 
 test "bm policy replaces the binary best-move gate with the graded factor" {
@@ -1607,19 +1750,35 @@ test "engine searches with the pure-NNUE evaluator" {
 test "engine search is stable across repeated fixed-depth runs" {
     const fen = @import("../core/fen.zig");
 
-    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
-    defer engine.deinit();
-
     const pos = try fen.startpos();
     var history = repetition.History{};
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(false);
 
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
     const first = engine.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
-    const second = engine.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
-
     try std.testing.expect(first.best_move != null);
-    try std.testing.expectEqual(first.best_move.?, second.best_move.?);
+
+    // A cold repeat is the same search: a second engine, fresh tables, gives
+    // the same move, score and node count.
+    var other = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer other.deinit();
+    const cold = other.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
+    try std.testing.expectEqual(first.best_move.?, cold.best_move.?);
+    try std.testing.expectEqual(first.score, cold.score);
+    try std.testing.expectEqual(first.nodes, cold.nodes);
+
+    // A warm repeat (the same engine again, its table and histories kept) need
+    // not pick the same move since the root is ordered by the nodes each move
+    // took in the last iteration (RootNodeOrder): a warm table changes those
+    // counts, and between moves of nearly equal value the order decides. What
+    // must hold is that it finds a move and that its value is the first
+    // search's within WARM_REPEAT_SLACK (about two centipawns).
+    const WARM_REPEAT_SLACK: i32 = 4;
+    const warm = engine.search(&pos, &history, .{ .depth = 2 }, &stop_flag);
+    try std.testing.expect(warm.best_move != null);
+    try std.testing.expect(@abs(warm.score - first.score) <= WARM_REPEAT_SLACK);
 }
 
 test "engine respects node limit and still returns a legal move" {
@@ -1663,14 +1822,22 @@ test "interrupted iterations only replace the move with a proven challenger" {
         "8/1pp2bp1/2k4p/4p3/2P1N2b/1K2PP2/P3B2P/8 w - - 36 47",
         "rn1qk2r/ppp2ppp/3b4/3npb2/8/1P2PP2/PB1PN1PP/RN1QKB1R w KQkq - 1 8",
     };
-    const limits = [_]u64{ 5_000, 10_000, 20_000, 35_000, 50_000, 75_000 };
+    // A sweep of budgets (31 a position: 5,000 to 80,000 in steps of 2,500),
+    // not six hand-picked ones: a change of the tree moved every proof off
+    // the six this test had (5,000 10,000 20,000 35,000 50,000 75,000), twice
+    // in two days (the shallower table move's three plies, 2026-11-16; the
+    // four ideas of bundle A together, none of them alone, 2026-11-17).
+    const FIRST_LIMIT: u64 = 5_000;
+    const LAST_LIMIT: u64 = 80_000;
+    const LIMIT_STEP: u64 = 2_500;
 
     var engine = try Engine.init(std.testing.allocator, 16);
     defer engine.deinit();
     var adopted: usize = 0;
     for (fens) |text| {
         const pos = try fen.parse(text);
-        for (limits) |node_limit| {
+        var node_limit: u64 = FIRST_LIMIT;
+        while (node_limit <= LAST_LIMIT) : (node_limit += LIMIT_STEP) {
             engine.reset();
             var history = repetition.History{};
             history.push(pos.zobrist_key);
@@ -1752,6 +1919,8 @@ test "engine treats fifty-move root as draw" {
     var stop_flag = std.atomic.Value(bool).init(false);
 
     const result = engine.search(&pos, &history, .{ .depth = 3 }, &stop_flag);
+    // The root's own draw (a claim that is already there) is exactly 0: the
+    // dither is for draws found in the tree.
     try std.testing.expectEqual(@as(i32, 0), result.score);
     try std.testing.expect(result.best_move != null);
 }
@@ -1822,7 +1991,7 @@ test "checkmate outranks the fifty-move clock" {
         history.push(pos.zobrist_key);
         engine.reset();
         const result = engine.search(&pos, &history, .{ .depth = 4 }, &stop_flag);
-        try std.testing.expectEqual(@as(i32, 0), result.score);
+        try std.testing.expect(basin.isDrawAtDefault(result.score));
     }
 }
 
@@ -1844,6 +2013,8 @@ test "engine treats repeated root position as draw" {
     var drawn = pos;
     drawn.halfmove_clock = 4;
     const result = engine.search(&drawn, &history, .{ .depth = 3 }, &stop_flag);
+    // The root's own draw (a claim that is already there) is exactly 0: the
+    // dither is for draws found in the tree.
     try std.testing.expectEqual(@as(i32, 0), result.score);
     try std.testing.expect(result.best_move != null);
 }
@@ -1879,7 +2050,74 @@ test "repetition fallback prefers quiet non-pawn moves over first legal pawn pus
     try std.testing.expect(isRepetitionSafeFallback(&pos, safe));
 }
 
-test "engine stopped before iteration uses repetition-safe fallback" {
+test "a found mate is kept by the table and bounds the next iterations" {
+    // Fresh look 2026-11-10 (ladder, block F): table mate scores never cut and
+    // nothing bounded the search by the mate already found, so every iteration
+    // searched the mate tree again (this mate in 2: 20,087 nodes to depth 12,
+    // 140,947 to depth 16; searches of mated positions ran to billions).
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    const pos = try fen.parse("7k/8/5K2/8/8/8/8/R7 w - - 0 1");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    const result = engine.search(&pos, &history, .{ .depth = 16 }, &stop_flag);
+    try std.testing.expectEqual(score_mod.MATE_SCORE - 3, result.score);
+    try std.testing.expect(result.nodes < 5_000);
+
+    // The mated side: Kh8 Kf7 Kh7 Rh1 mate, four plies.
+    const mated = try fen.parse("6k1/8/5K2/8/8/8/8/R7 b - - 1 1");
+    var mated_history = repetition.History{};
+    mated_history.push(mated.zobrist_key);
+    try engine.resizeHash(tt.DEFAULT_HASH_MB);
+    const mated_result = engine.search(&mated, &mated_history, .{ .depth = 16 }, &stop_flag);
+    try std.testing.expectEqual(-score_mod.MATE_SCORE + 4, mated_result.score);
+    try std.testing.expect(mated_result.nodes < 5_000);
+}
+
+test "a second occurrence of a game-history position is not a draw the opponent must accept" {
+    // Code-read finding 4 (2026-11-10): after Qh6+ Kg8 Qg6+ the reply Kh8
+    // repeats the start position once; White then mates with Qg7 instead of
+    // repeating. The search scored Kh8 as a draw (cp 0 in 15 nodes at depth 7).
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    var pos = try fen.parse("7k/8/5KQ1/8/8/8/8/8 w - - 0 1");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    for ([_][]const u8{ "g6h6", "h8g8", "h6g6" }) |text| {
+        var moves = move_mod.MoveList.init();
+        legal.generate(&pos, &moves);
+        var played = false;
+        for (moves.slice()) |mv| {
+            var buffer: [5]u8 = undefined;
+            if (std.mem.eql(u8, mv.toUci(&buffer), text)) {
+                var state = make_unmake.StateInfo{};
+                history.push(make_unmake.makeMove(&pos, mv, &state));
+                played = true;
+                break;
+            }
+        }
+        try std.testing.expect(played);
+    }
+    const result = engine.search(&pos, &history, .{ .depth = 5 }, &stop_flag);
+    try std.testing.expectEqual(-score_mod.MATE_SCORE + 2, result.score);
+
+    // The same board without the history is the same mate.
+    var fresh = repetition.History{};
+    fresh.push(pos.zobrist_key);
+    try engine.resizeHash(tt.DEFAULT_HASH_MB);
+    const control = engine.search(&pos, &fresh, .{ .depth = 5 }, &stop_flag);
+    try std.testing.expectEqual(-score_mod.MATE_SCORE + 2, control.score);
+}
+
+test "an answer without a search uses the repetition-safe fallback" {
     const fen = @import("../core/fen.zig");
 
     var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
@@ -1892,14 +2130,16 @@ test "engine stopped before iteration uses repetition-safe fallback" {
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(true);
 
-    const result = engine.search(&pos, &history, .{ .depth = 4 }, &stop_flag);
+    // A node limit of zero is the one request that is answered unsearched (a
+    // stop request waits for depth 1: U-STOP-D1).
+    const result = engine.search(&pos, &history, .{ .depth = 4, .node_limit = 0 }, &stop_flag);
     try std.testing.expectEqual(@as(u64, 0), result.nodes);
     try std.testing.expect(result.best_move != null);
     try std.testing.expect(result.best_move.? != move_mod.Move.init(.c5, .c6, .quiet));
     try std.testing.expect(isRepetitionSafeFallback(&pos, result.best_move.?));
 }
 
-test "engine stopped before iteration prefers previous repetition cycle move" {
+test "an answer without a search prefers the previous repetition cycle move" {
     const fen = @import("../core/fen.zig");
 
     var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
@@ -1917,9 +2157,95 @@ test "engine stopped before iteration prefers previous repetition cycle move" {
     history.push(pos.zobrist_key);
     var stop_flag = std.atomic.Value(bool).init(true);
 
-    const result = engine.search(&pos, &history, .{ .depth = 4 }, &stop_flag);
+    const result = engine.search(&pos, &history, .{ .depth = 4, .node_limit = 0 }, &stop_flag);
     try std.testing.expectEqual(@as(u64, 0), result.nodes);
     try std.testing.expectEqual(cycle_move, result.best_move.?);
+}
+
+test "the move that repeats the earlier cycle is not preferred when the opponent need not repeat" {
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+
+    // White draws by perpetual (Qe8+); Kh1 is mated in two (Ra1+). The game
+    // has just gone Kh1 Rb3 Kg1 Rb2, so Kh1 would repeat the earlier cycle
+    // and its position has occurred once: at a window that ends at the draw
+    // the child returns the draw without searching, and the tie-break took
+    // that upper bound for the move's score.
+    var pos = try fen.parse("6k1/6p1/n7/n6Q/8/8/rr3PPP/6K1 w - - 0 1");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    const game = [_]move_mod.Move{
+        move_mod.Move.init(.g1, .h1, .quiet),
+        move_mod.Move.init(.b2, .b3, .quiet),
+        move_mod.Move.init(.h1, .g1, .quiet),
+        move_mod.Move.init(.b3, .b2, .quiet),
+    };
+    for (game) |mv| {
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&pos, mv, &state);
+        history.push(pos.zobrist_key);
+    }
+    try std.testing.expectEqual(@as(u16, 4), pos.halfmove_clock);
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    const result = engine.search(&pos, &history, .{ .node_limit = 300_000 }, &stop_flag);
+    try std.testing.expect(result.best_move != null);
+    try std.testing.expect(result.best_move.? != move_mod.Move.init(.g1, .h1, .quiet));
+    try std.testing.expectEqual(move_mod.Move.init(.h5, .e8, .quiet), result.best_move.?);
+    try std.testing.expect(basin.isDrawAtDefault(result.score));
+}
+
+test "a cycle tie-break whose verifying search is cut by the limit is not granted" {
+    const fen = @import("../core/fen.zig");
+
+    // The witness of the test above at node limits from 1,500 to 6,000 in
+    // steps of 5. Whether a limit ended the search inside a verifying search
+    // is read from the search itself (test builds keep a flag for it), so the
+    // test knows in every flavour that it tested the case. The step follows
+    // the length of the verifying searches: when the test was written 20 of
+    // 181 limits in steps of 25 ended inside one; with bundle A's four ideas
+    // together (2026-11-17) the verifying searches of this range are 1, 34
+    // and 14 nodes long (limits 3,213, 3,883 to 3,916 and 4,847 to 4,860, in
+    // the passes at depth 12, 13 and 14), a step of 25 meets two of them and
+    // a step of 5 ten. At every limit the answer is the search so far: the
+    // perpetual, a draw's score.
+    var start = try fen.parse("6k1/6p1/n7/n6Q/8/8/rr3PPP/6K1 w - - 0 1");
+    var history = repetition.History{};
+    history.push(start.zobrist_key);
+    const game = [_]move_mod.Move{
+        move_mod.Move.init(.g1, .h1, .quiet),
+        move_mod.Move.init(.b2, .b3, .quiet),
+        move_mod.Move.init(.h1, .g1, .quiet),
+        move_mod.Move.init(.b3, .b2, .quiet),
+    };
+    for (game) |mv| {
+        var state = make_unmake.StateInfo{};
+        _ = make_unmake.makeMove(&start, mv, &state);
+        history.push(start.zobrist_key);
+    }
+    const perpetual = move_mod.Move.init(.h5, .e8, .quiet);
+    var cut_inside: usize = 0;
+    var limit: u64 = 1_500;
+    while (limit <= 6_000) : (limit += 5) {
+        var engine = try Engine.init(std.testing.allocator, 1);
+        defer engine.deinit();
+        var stop_flag = std.atomic.Value(bool).init(false);
+        const pos = start;
+        const result = engine.search(&pos, &history, .{ .node_limit = limit }, &stop_flag);
+        try std.testing.expectEqual(perpetual, result.best_move.?);
+        try std.testing.expect(basin.isDrawAtDefault(result.score));
+        if (result.diagnostics.cut_in_cycle_tie) cut_inside += 1;
+        if (comptime context_mod.stats_enabled) {
+            // The counters agree with the flag: asked and neither refused nor granted.
+            const s = &result.diagnostics.stats;
+            const open = s.root_cycle_tie_asked > s.root_cycle_tie_refused + s.root_cycle_tie_granted;
+            try std.testing.expectEqual(result.diagnostics.cut_in_cycle_tie, open);
+        }
+    }
+    // The case was tested: several limits ended inside a verifying search.
+    try std.testing.expect(cut_inside >= 3);
 }
 
 test "engine reconstructs legal pv on representative search" {
@@ -1967,10 +2293,45 @@ test "engine stops after a finite movetime and returns completed iteration" {
     try std.testing.expect(result.nodes > 0);
 }
 
+test "a go movetime search ends at its deadline, not at a projection" {
+    // The search used to end at a completed iteration when twice the last
+    // iteration no longer fitted into the movetime (or into 85 % of it for a
+    // stable search): at 54 to 100 % of the time, 77 % in the median. A
+    // movetime that is not used is lost.
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    var stop_flag = std.atomic.Value(bool).init(false);
+
+    for ([_][]const u8{
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 b - - 5 8",
+        "r2q1rk1/1b1nbppp/p2ppn2/1p6/3NPP2/1BN1B3/PPP1Q1PP/R4RK1 w - - 0 12",
+    }) |text| {
+        engine.reset();
+        const pos = try fen.parse(text);
+        var history = repetition.History{};
+        history.push(pos.zobrist_key);
+        const limits = (time.GoLimits{ .movetime_ms = 60 }).toControllerLimits(pos.side_to_move, time.DEFAULT_MOVE_OVERHEAD_MS, pos.fullmove_number);
+        var timer = try runtime.Timer.start();
+        const result = engine.search(&pos, &history, limits, &stop_flag);
+        const elapsed = timer.read();
+        try std.testing.expect(result.best_move != null);
+        try std.testing.expect(result.depth >= 1);
+        // Ended by the deadline: inside an iteration (no reason recorded) or
+        // at a completed one with the budget gone; never by a projection and
+        // never at a soft part of the budget.
+        if (result.diagnostics.iteration_stop_reason) |reason| try std.testing.expectEqual(IterationStopReason.maximum_elapsed, reason);
+        try std.testing.expect(elapsed >= limits.maximum_budget_ns.?);
+    }
+}
+
 test "a clock that is gone before depth 1 still plays a searched depth-1 move" {
     // Audit D (U-STOP-D1): an expired deadline used to stop at node 0 and play
-    // the first generated move. The clock now waits for depth 1; an external
-    // stop still ends the search at once (the stopped-before-iteration tests).
+    // the first generated move. The clock now waits for depth 1, and so does a
+    // stop request (the test after the next).
     const fen = @import("../core/fen.zig");
 
     var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
@@ -2025,6 +2386,40 @@ test "after the held depth 1 only the hard budget can stop the search, and it do
     }
 }
 
+test "a stop request set before the first node still answers a searched move" {
+    // U-STOP-D1 for stop requests: `go` with a `stop`, `position`, `quit` or
+    // end of input directly behind it reaches the search with the flag set.
+    // White wins the queen on g5; the first generated move does not.
+    const fen = @import("../core/fen.zig");
+
+    var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
+    defer engine.deinit();
+    const pos = try fen.parse("rnb1kbnr/pppp1ppp/8/4p1q1/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+
+    var running = std.atomic.Value(bool).init(false);
+    const searched = engine.search(&pos, &history, .{ .depth = 1 }, &running);
+    try std.testing.expectEqual(@as(u16, 1), searched.depth);
+    const unsearched = fallbackMove(&pos, false, null, null).?;
+    try std.testing.expect(!std.meta.eql(searched.best_move.?, unsearched));
+
+    var stop_flag = std.atomic.Value(bool).init(true);
+    const clock = (time.GoLimits{ .wtime_ms = 8000, .btime_ms = 8000, .winc_ms = 80, .binc_ms = 80 }).toControllerLimits(.white, time.DEFAULT_MOVE_OVERHEAD_MS, 3);
+    for ([_]time.Limits{ clock, .{ .infinite = true }, .{ .depth = 12 } }) |limits| {
+        engine.reset();
+        const stopped = engine.search(&pos, &history, limits, &stop_flag);
+        try std.testing.expectEqual(@as(u16, 1), stopped.depth);
+        try std.testing.expect(stopped.nodes > 0);
+        try std.testing.expect(std.meta.eql(searched.best_move.?, stopped.best_move.?));
+    }
+
+    // A node limit of zero still answers at once, without a search.
+    engine.reset();
+    const none = engine.search(&pos, &history, .{ .node_limit = 0 }, &stop_flag);
+    try std.testing.expectEqual(@as(u64, 0), none.nodes);
+}
+
 test "a first iteration that cannot finish answers at the hold's node budget" {
     // Judge B J2: on impossible dense-queen boards depth 1 takes 159k or 2.4M
     // nodes (48 queens: it never ends). The hold ends after
@@ -2060,7 +2455,7 @@ test "a first iteration that cannot finish answers at the hold's node budget" {
     }
 }
 
-test "stop and node limits still end a held depth 1 at once" {
+test "node limits still end a held depth 1 at once; a stop request waits for it" {
     const fen = @import("../core/fen.zig");
 
     var engine = try Engine.init(std.testing.allocator, tt.DEFAULT_HASH_MB);
@@ -2080,7 +2475,8 @@ test "stop and node limits still end a held depth 1 at once" {
     try std.testing.expect(zero.best_move != null);
     var stopped = std.atomic.Value(bool).init(true);
     const halted = engine.search(&pos, &history, .{ .maximum_budget_ns = 1 }, &stopped);
-    try std.testing.expectEqual(@as(u64, 0), halted.nodes);
+    try std.testing.expectEqual(@as(u16, 1), halted.depth);
+    try std.testing.expect(halted.nodes > 0);
     try std.testing.expect(halted.best_move != null);
 }
 
@@ -2168,37 +2564,31 @@ const FailingHashTableFactory = struct {
 };
 
 test "hash resize failure at every preparation stage preserves live resources" {
-    // Hash 1 -> 2 keeps the temporary TT and hint allocations below the huge
+    // Hash 2 -> 1 keeps the temporary TT allocation (1 MB) below the huge
     // mapping threshold, so testing.allocator also detects failed-stage leaks.
-    var engine = try Engine.init(std.testing.allocator, 1);
+    var engine = try Engine.init(std.testing.allocator, 2);
     defer engine.deinit();
-    engine.tt.entries[0].entries[0] = .{ .key = 17, .depth = 7, .score = 31 };
-    engine.rfp_hint.entries[0].entries[0] = .{ .key = 19, .depth = 5, .score = 37 };
+    engine.tt.clusters[0].tags[0] = 17;
     engine.eval_cache.sets[0].slots[0] = 23 << 16 | 41;
     engine.history.quiet[0][0][0][0] = 43;
     engine.tt.generation = 11;
     const old_tt = engine.tt;
-    const old_hint = engine.rfp_hint;
     const old_eval = engine.eval_cache;
-    for (0..3) |stage| {
+    for (0..2) |stage| {
         var factory = FailingHashTableFactory{ .fail_at = stage };
-        try std.testing.expectError(error.OutOfMemory, engine.resizeHashWithFactory(2, &factory));
+        try std.testing.expectError(error.OutOfMemory, engine.resizeHashWithFactory(1, &factory));
         try std.testing.expectEqual(stage + 1, factory.calls);
-        try std.testing.expectEqual(old_tt.entries.ptr, engine.tt.entries.ptr);
-        try std.testing.expectEqual(old_tt.entries.len, engine.tt.entries.len);
-        try std.testing.expectEqual(old_tt.mask, engine.tt.mask);
+        try std.testing.expectEqual(old_tt.clusters.ptr, engine.tt.clusters.ptr);
+        try std.testing.expectEqual(old_tt.clusters.len, engine.tt.clusters.len);
         try std.testing.expectEqual(old_tt.generation, engine.tt.generation);
-        try std.testing.expectEqual(@as(u32, 1), engine.hashSizeMb());
-        try std.testing.expectEqual(old_hint.entries.ptr, engine.rfp_hint.entries.ptr);
-        try std.testing.expectEqual(old_hint.mask, engine.rfp_hint.mask);
+        try std.testing.expectEqual(@as(u32, 2), engine.hashSizeMb());
         try std.testing.expectEqual(old_eval.sets.ptr, engine.eval_cache.sets.ptr);
         try std.testing.expectEqual(old_eval.index_shift, engine.eval_cache.index_shift);
-        try std.testing.expectEqual(@as(u64, 17), engine.tt.entries[0].entries[0].key);
-        try std.testing.expectEqual(@as(u64, 19), engine.rfp_hint.entries[0].entries[0].key);
+        try std.testing.expectEqual(@as(u32, 17), engine.tt.clusters[0].tags[0]);
         try std.testing.expectEqual(@as(u64, 23 << 16 | 41), engine.eval_cache.sets[0].slots[0]);
         try std.testing.expectEqual(@as(i16, 43), engine.history.quiet[0][0][0][0]);
     }
-    // The original engine remains usable after all three failures.
+    // The original engine remains usable after both failures.
     const pos = try @import("../core/fen.zig").startpos();
     var history = repetition.History{};
     history.push(pos.zobrist_key);
@@ -2214,16 +2604,13 @@ test "hash resize commits all tables" {
     const net = engine.evaluator.net;
     const context = engine.ctx;
     for ([_]u32{ 2, 4, 1 }) |mb| {
-        engine.tt.entries[0].entries[0].key = 17;
-        engine.rfp_hint.entries[0].entries[0].key = 19;
+        engine.tt.clusters[0].tags[0] = 17;
         engine.eval_cache.sets[0].slots[0] = 23;
         engine.history.quiet[0][0][0][0] = 43;
         try engine.resizeHash(mb);
         try std.testing.expectEqual(mb, engine.hashSizeMb());
-        try std.testing.expectEqual(hintSizeFor(mb), engine.rfp_hint.hintSizeMb());
-        try std.testing.expectEqual(eval_cache_mod.sizeForHash(mb), engine.eval_cache.cacheSizeMb());
-        try std.testing.expectEqual(@as(u64, 0), engine.tt.entries[0].entries[0].key);
-        try std.testing.expectEqual(@as(u64, 0), engine.rfp_hint.entries[0].entries[0].key);
+        try std.testing.expectEqual(table_budget.evalKbTotal(mb), engine.eval_cache.cacheSizeKb());
+        try std.testing.expectEqual(@as(u32, 0), engine.tt.clusters[0].tags[0]);
         try std.testing.expectEqual(@as(u64, 0), engine.eval_cache.sets[0].slots[0]);
         try std.testing.expectEqual(@as(i16, 0), engine.history.quiet[0][0][0][0]);
         try std.testing.expectEqual(net, engine.evaluator.net);
@@ -2231,38 +2618,37 @@ test "hash resize commits all tables" {
     }
 }
 
-test "private table sizes are the serial sizes at one thread and a split budget beyond" {
+test "private table sizes are the whole eval share at one thread and a split of it beyond" {
     // Threads = 1 is the identity on every Hash a GUI can send (bit-identical
     // single-thread search depends on it).
     var mb: u32 = 1;
     while (mb <= 65_536) : (mb += if (mb < 4_096) 1 else 61) {
         const serial = PrivateTableSizes.forThreads(mb, 1);
-        try std.testing.expectEqual(hintSizeFor(mb), serial.hint_mb);
-        try std.testing.expectEqual(eval_cache_mod.sizeForHash(mb), serial.eval_mb);
+        try std.testing.expectEqual(table_budget.evalKbTotal(mb), serial.eval_kb);
     }
-    // CCRL-style configurations: each engine gets 1/T of the serial budget.
-    const cases = [_]struct { hash: u32, threads: u32, hint: u32, eval: u32 }{
-        .{ .hash = 1024, .threads = 4, .hint = 128, .eval = 16 },
-        .{ .hash = 2048, .threads = 8, .hint = 128, .eval = 8 },
-        .{ .hash = 256, .threads = 8, .hint = 16, .eval = 8 },
-        .{ .hash = 2048, .threads = 32, .hint = 32, .eval = 4 }, // eval floor (64/32 = 2)
-        .{ .hash = 16, .threads = 32, .hint = 1, .eval = 4 }, // both floors
-        .{ .hash = 65_536, .threads = 2, .hint = 512, .eval = 32 },
+    // CCRL-style configurations: each engine gets 1/T of the eval share.
+    const cases = [_]struct { hash: u32, threads: u32, eval_kb: u32 }{
+        .{ .hash = 1024, .threads = 4, .eval_kb = 16 * 1024 },
+        .{ .hash = 2048, .threads = 8, .eval_kb = 8 * 1024 },
+        .{ .hash = 256, .threads = 8, .eval_kb = 8 * 1024 },
+        .{ .hash = 2048, .threads = 32, .eval_kb = 2 * 1024 },
+        .{ .hash = 16, .threads = 32, .eval_kb = 128 },
+        .{ .hash = 1, .threads = 32, .eval_kb = 8 }, // 256 KB / 32, the smallest share
+        .{ .hash = 65_536, .threads = 2, .eval_kb = 32 * 1024 },
     };
     for (cases) |c| {
         const sizes = PrivateTableSizes.forThreads(c.hash, c.threads);
-        try std.testing.expectEqual(c.hint, sizes.hint_mb);
-        try std.testing.expectEqual(c.eval, sizes.eval_mb);
+        try std.testing.expectEqual(c.eval_kb, sizes.eval_kb);
     }
-    // All private copies together never exceed the serial budget by more than
-    // the per-table floors (1 MB hint + 4 MB eval per engine).
+    // All private copies together never exceed the eval share (the
+    // exhaustive check over every Hash is table_budget.zig's).
     for ([_]u32{ 1, 16, 64, 256, 1024, 2048, 4096, 65_536 }) |hash| {
         const serial = PrivateTableSizes.forThreads(hash, 1);
         for (1..33) |t| {
             const threads: u32 = @intCast(t);
             const sizes = PrivateTableSizes.forThreads(hash, threads);
-            try std.testing.expect(threads * sizes.hint_mb <= serial.hint_mb + threads * rfp_hint_mod.MIN_HINT_MB);
-            try std.testing.expect(threads * sizes.eval_mb <= serial.eval_mb + threads * eval_cache_mod.MIN_CACHE_MB);
+            try std.testing.expect(sizes.eval_kb >= eval_cache_mod.MIN_CACHE_KB);
+            try std.testing.expect(threads * sizes.eval_kb <= serial.eval_kb);
         }
     }
 }
@@ -2272,51 +2658,48 @@ test "parallel engines size their private tables from the thread share" {
     defer owner.deinit();
     var serial = try Engine.initWithBorrowedEvaluator(std.testing.allocator, 32, &owner);
     defer serial.deinit();
-    try std.testing.expectEqual(@as(u32, 16), serial.rfp_hint.hintSizeMb());
-    try std.testing.expectEqual(@as(u32, 8), serial.eval_cache.cacheSizeMb());
+    try std.testing.expectEqual(@as(u32, 8 * 1024), serial.eval_cache.cacheSizeKb());
     var one = try Engine.initForParallel(std.testing.allocator, 32, 1, &owner);
     defer one.deinit();
-    try std.testing.expectEqual(serial.rfp_hint.entries.len, one.rfp_hint.entries.len);
     try std.testing.expectEqual(serial.eval_cache.sets.len, one.eval_cache.sets.len);
     var quarter = try Engine.initForParallel(std.testing.allocator, 32, 4, &owner);
     defer quarter.deinit();
-    try std.testing.expectEqual(@as(u32, 4), quarter.rfp_hint.hintSizeMb());
-    try std.testing.expectEqual(@as(u32, 4), quarter.eval_cache.cacheSizeMb());
-    try std.testing.expectEqual(serial.rfp_hint.entries.len / 4, quarter.rfp_hint.entries.len);
-    try std.testing.expectEqual(@as(usize, 0), quarter.tt.entries.len);
+    try std.testing.expectEqual(@as(u32, 2 * 1024), quarter.eval_cache.cacheSizeKb());
+    try std.testing.expectEqual(serial.eval_cache.sets.len / 4, quarter.eval_cache.sets.len);
+    try std.testing.expectEqual(@as(usize, 0), quarter.tt.clusters.len);
 }
 
 test "same hash reset requires no replacement allocations" {
     var engine = try Engine.init(std.testing.allocator, 1);
     defer engine.deinit();
-    engine.tt.entries[0].entries[0].key = 17;
+    engine.tt.clusters[0].tags[0] = 17;
     engine.tt.generation = 11;
     engine.history.quiet[0][0][0][0] = 43;
-    const ptr = engine.tt.entries.ptr;
+    const ptr = engine.tt.clusters.ptr;
     var factory = FailingHashTableFactory{ .fail_at = 0 };
     try engine.resizeHashWithFactory(1, &factory);
     try std.testing.expectEqual(@as(usize, 0), factory.calls);
-    try std.testing.expectEqual(ptr, engine.tt.entries.ptr);
-    try std.testing.expectEqual(@as(u64, 0), engine.tt.entries[0].entries[0].key);
+    try std.testing.expectEqual(ptr, engine.tt.clusters.ptr);
+    try std.testing.expectEqual(@as(u32, 0), engine.tt.clusters[0].tags[0]);
     try std.testing.expectEqual(@as(u8, 0), engine.tt.generation);
     try std.testing.expectEqual(@as(i16, 0), engine.history.quiet[0][0][0][0]);
 }
 
 test "real allocator failure preserves the original hash allocation" {
-    var engine = try Engine.init(std.testing.allocator, 1);
+    var engine = try Engine.init(std.testing.allocator, 2);
     defer engine.deinit();
-    engine.tt.entries[0].entries[0].key = 17;
-    const old_entries = engine.tt.entries;
+    engine.tt.clusters[0].tags[0] = 17;
+    const old_entries = engine.tt.clusters;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    // The 2-MB request rounds down to a 1.5-MB TT: hugealloc uses its real
+    // A 1-MB TT is below the huge mapping threshold: hugealloc uses its real
     // fallback allocator, so this induces an actual allocation failure.
     engine.tt.allocator = failing.allocator();
     defer engine.tt.allocator = std.testing.allocator;
-    try std.testing.expectError(error.OutOfMemory, engine.resizeHash(2));
+    try std.testing.expectError(error.OutOfMemory, engine.resizeHash(1));
     try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(old_entries.len, engine.tt.entries.len);
-    try std.testing.expectEqual(old_entries.ptr, engine.tt.entries.ptr);
-    try std.testing.expectEqual(@as(u64, 17), engine.tt.entries[0].entries[0].key);
+    try std.testing.expectEqual(old_entries.len, engine.tt.clusters.len);
+    try std.testing.expectEqual(old_entries.ptr, engine.tt.clusters.ptr);
+    try std.testing.expectEqual(@as(u32, 17), engine.tt.clusters[0].tags[0]);
 }
 
 fn netWeightHash(net: *const Net) u64 {
@@ -2386,8 +2769,7 @@ test "shared const net searches keep mutable worker resources independent" {
         engine.reset();
         for (engines[0..i]) |*other| {
             try std.testing.expect(engine.ctx != other.ctx);
-            try std.testing.expect(engine.tt.entries.ptr != other.tt.entries.ptr);
-            try std.testing.expect(engine.rfp_hint.entries.ptr != other.rfp_hint.entries.ptr);
+            try std.testing.expect(engine.tt.clusters.ptr != other.tt.clusters.ptr);
             try std.testing.expect(engine.eval_cache.sets.ptr != other.eval_cache.sets.ptr);
         }
     }
@@ -2521,7 +2903,7 @@ test "TB root: no instant win into a threefold, no rounded boundary win, no summ
     // (a DTZ-1 "win") no longer overrides the moves' own states.
     try replayForTest("8/8/Q7/6p1/8/8/8/3K2k1 w - - 97 1", &.{ "a6a2", "g1h1" }, &pos, &history);
     const cursed = engine.search(&pos, &history, .{ .depth = 6 }, &stop);
-    try std.testing.expectEqual(@as(i32, 0), cursed.score);
+    try std.testing.expect(basin.isDrawAtDefault(cursed.score));
     try std.testing.expect(cursed.nodes > 1);
 }
 
@@ -2574,7 +2956,7 @@ test "TB root: an unproven boundary win keeps the searched score" {
     only.add(move_mod.Move.init(.a6, .a2, .quiet));
     const searched = engine.searchWithRootMoves(&pos, &history, .{ .depth = 8 }, &stop, &only);
     try std.testing.expectEqual(only.moves[0], searched.best_move.?);
-    try std.testing.expectEqual(@as(i32, 0), searched.score);
+    try std.testing.expect(basin.isDrawAtDefault(searched.score));
     // Early stops: the pre-iteration fallback and interrupted iterations
     // carry no TB score either.
     for ([_]u64{ 1, 2, 64, 200 }) |n| {
@@ -2660,7 +3042,7 @@ test "NNUE Scale Percent 360: an evaluation keeps its value through a TT store a
         engine.evaluator.prepareRoot(&engine.ctx.stack, &pos, &engine.ctx.finny, &engine.ctx.ft);
         const eval = engine.evaluator.evaluate(&engine.ctx.stack, 0, &pos, &engine.ctx.finny, &engine.ctx.ft);
         try std.testing.expectEqual(case[1] * score_mod.ORDINARY_SCORE_LIMIT, eval);
-        tt_store.storeLowerBound(null, &engine.tt, pos.zobrist_key, 6, eval, null, tt.STATIC_EVAL_NONE, false, 2);
+        tt_store.storeLowerBound(null, &engine.tt, pos.zobrist_key, 6, eval, null, tt.STATIC_EVAL_NONE, false, 2, 0);
         var probe: tt_probe.Result = undefined;
         tt_probe.probeInto(&probe, engine.ctx, &engine.tt, pos.zobrist_key, 6, -30_000, 30_000, null, 0, 4);
         try std.testing.expectEqual(eval, probe.entry.?.score);
@@ -2682,7 +3064,7 @@ test "drawn Horsie root cannot accept false TB loss or stop on its streak" {
     history.push(pos.zobrist_key);
     var stop = std.atomic.Value(bool).init(false);
     const result = engine.search(&pos, &history, .{ .node_limit = 20000 }, &stop);
-    try std.testing.expectEqual(@as(i32, 0), result.score);
+    try std.testing.expect(basin.isDrawAtDefault(result.score));
     try std.testing.expect(result.best_move != null);
     try std.testing.expectEqual(@as(u64, 20000), engine.ctx.nodes);
     var job = syzygy.beginJob();

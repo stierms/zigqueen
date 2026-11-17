@@ -38,7 +38,7 @@ pub fn main() !void {
     var stop = std.atomic.Value(bool).init(false);
     const history = repetition.History{};
     std.debug.print("capacity serial_entries={d} shared_entries={d} serial_bytes={d} shared_bytes={d}\n", .{
-        engine.tt.entryCount(), table.entryCount(), engine.tt.entries.len * @sizeOf(@import("search/tt.zig").Cluster), table.allocatedBytes(),
+        engine.tt.entryCount(), table.entryCount(), engine.tt.clusters.len * @sizeOf(@import("search/tt.zig").Cluster), table.allocatedBytes(),
     });
     if (compare and engine.tt.entryCount() != table.entryCount()) return error.CapacityMismatch;
     for (0..reps) |rep| {

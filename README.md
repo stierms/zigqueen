@@ -1,4 +1,4 @@
-# zigqueen 6.5.0
+# zigqueen 6.6.0
 
 <p align="center"><img src="docs/logo/zigqueen-logo.png" alt="zigqueen logo" width="220"></p>
 
@@ -25,6 +25,7 @@ only if the CPU has both the dotprod and i8mm extensions.
 
 | Version | Our gauntlet, 1 thread | [CCRL Blitz](https://computerchess.org.uk/ccrl/404/) | [CCRL 40/15](https://computerchess.org.uk/ccrl/4040/) | [CCI](https://github.com/computer-chess-index/cci/blob/main/engines/Zigqueen.md) VLTC |
 |---|---|---|---|---|
+| 6.6.0 | 3738 (95%: 3734–3742) | — | — | — |
 | 6.5.0 | 3717 (95%: 3713–3721) | 3709 ±15 | — | 3707 ±37 |
 | 6.4.0 | 3701 (95%: 3694–3707) | — | 3566 ±19 | 3684 |
 | 6.3.0 | 3676 (95%: 3670–3683) | — | — | 3525 † |
@@ -35,10 +36,10 @@ only if the CPU has both the dotprod and i8mm extensions.
 
 Our gauntlets are our own estimates against CCRL-rated engines, not official
 numbers. The field changed between versions, so the rows are not directly
-comparable ([docs/STRENGTH.md](docs/STRENGTH.md)). External lists as of
-2026-11-11. The Computer Chess Index tests on several machines: the values
-are from its E1 list, those marked † from its older T1 list, and the two are
-not comparable.
+comparable; only 6.6.0 and 6.5.0 played the same field and openings
+([docs/STRENGTH.md](docs/STRENGTH.md)). External lists as of 2026-11-11. The
+Computer Chess Index tests on several machines: the values are from its E1
+list, those marked † from its older T1 list, and the two are not comparable.
 
 ## Features
 
@@ -59,7 +60,7 @@ not comparable.
 
 | Option | Default | Description |
 |---|---|---|
-| `Hash` | 256 | Hash table in MB (1–65536), shared by all threads. |
+| `Hash` | 256 | Hash table in MB (1–65536), shared by all threads; since 6.6.0 the table's real memory. |
 | `Threads` | 1 | Search threads (1–32). |
 | `Move Overhead` | 20 | Time reserve per move in ms for GUI latency (0–1000). |
 | `NNUE Scale Percent` | 44 | Evaluation scale; keep the default for the embedded network. |
@@ -77,7 +78,7 @@ zig build -Doptimize=ReleaseFast   # ./zig-out/bin/zigqueen, for the native CPU
 zig build test
 ```
 
-Every 6.5.0 build gives `bench 16` = 162,091 nodes.
+Every 6.6.0 build gives `bench 16` = 121,579 nodes.
 
 `scripts/package-release.sh` builds the six release binaries, the x86-64 ones
 as PGO builds from the profiles in `scripts/pgo/profiles/`; the method is
@@ -95,7 +96,7 @@ gauntlets against other engines. The rules are in
 
 ## Documentation
 
-- [Release notes](docs/RELEASE_NOTES_6.5.0.md), [strength](docs/STRENGTH.md),
+- [Release notes](docs/RELEASE_NOTES_6.6.0.md), [strength](docs/STRENGTH.md),
   [architecture](docs/ARCHITECTURE.md), [network](docs/NETWORK.md)
 - [Android](docs/ANDROID.md), [Windows builds](docs/WINDOWS_BUILD.md),
   [all documents](docs/README.md)

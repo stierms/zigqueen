@@ -177,7 +177,7 @@ index c62b507e4de9f48adf08be9c118c23c72fd9bdd9..179457671fce935e6ae50dba95f17014
  bulletformat = "1.8.0"
  montyformat = "0.9.2"
  sfbinpack = "0.6.0"
-+zq-bt4-loader = { path = "/home/mstie/projects/zq-bt4-prefetch-20260914/tools/bt4-loader" }
++zq-bt4-loader = { path = "/path/to/zq-bt4-prefetch-20260914/tools/bt4-loader" }
  viriformat = "2.0.1"
  
  [features]

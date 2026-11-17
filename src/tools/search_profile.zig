@@ -27,9 +27,8 @@ pub fn runWithOptions(writer: anytype, pos: *const position.Position, depth: u16
     const elapsed_ms: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_ms));
     try eval_backend_info.write(writer, &engine.evaluator);
     var thp_buf: [128]u8 = undefined;
-    try writer.print("hugepages tt {s} rfp_hint {s} conthist {s} thp_enabled \"{s}\"\n", .{
+    try writer.print("hugepages tt {s} conthist {s} thp_enabled \"{s}\"\n", .{
         engine.tt.alloc_method.name(),
-        engine.rfp_hint.alloc_method.name(),
         engine.history.continuation_method.name(),
         hugealloc.thpEnabledSetting(&thp_buf) orelse "unavailable",
     });
@@ -45,8 +44,8 @@ pub fn runWithOptions(writer: anytype, pos: *const position.Position, depth: u16
     // perf-r12: eval-cache configuration + end-of-search occupancy (does the
     // search even fill the table?) for the sizing/replacement sweeps.
     const eval_cache_occ = engine.eval_cache.occupancy();
-    try writer.print("eval_cache_config size_mb {d} assoc {d} entries {d} filled {d} fill_permille {d}\n", .{
-        engine.eval_cache.cacheSizeMb(),
+    try writer.print("eval_cache_config size_kb {d} assoc {d} entries {d} filled {d} fill_permille {d}\n", .{
+        engine.eval_cache.cacheSizeKb(),
         engine.eval_cache.assocWays(),
         eval_cache_occ.total,
         eval_cache_occ.filled,

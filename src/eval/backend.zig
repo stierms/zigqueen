@@ -248,7 +248,7 @@ pub const EngineState = struct {
     /// LAZY (nps package, 2026-07-17; R4b reconstruction, 2026-07-18): record only
     /// the move and mark the child dirty — the 6KB+ accumulator update is deferred
     /// until an eval actually needs it (ensureMaterialized). Nodes that cut before
-    /// evaluating (TT/RFP-hint cutoffs, TT-eval reuse) never pay the update at all.
+    /// evaluating (TT cutoffs, TT-eval reuse) never pay the update at all.
     /// The POST-move boards applyMove needs are no longer snapshotted eagerly
     /// (~210B Position copy per make, a store-forward-stall family in the make
     /// path); they are reconstructed on demand at materialization time from the

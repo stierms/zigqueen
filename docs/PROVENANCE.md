@@ -1,6 +1,6 @@
 # Provenance and licensing record
 
-**Updated October 2026 for 6.5.0.** This record distinguishes inherited
+**Updated November 2026 for 6.6.0.** This record distinguishes inherited
 ideas and initial parameters, local implementations and retunes, trained
 weights, data transformations and redistributed third-party code.
 
@@ -30,7 +30,7 @@ https://github.com/stierms/zigqueen/issues.
 |---|---|---|
 | zigqueen itself | GPL-3.0-or-later (`LICENSE`), © 2026 stierms | — |
 | Stormphrax 8.0.0 (Ciekce) | GPL-3.0 | Search-shaping parameter set initialised from its published defaults (§1); threat-conditioned quiet history is a published idea it also uses (§1, 6.3.0); fail-firm cutoff returns, correction-history classes and the \|correction\| terms in pruning and reductions are published ideas it also uses (§1, 6.4.0); ray-space threat updates (idea, §3). No code. GPL-compatible. |
-| Stockfish 18 and 19 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§1, §2, §3); pawn-pair input concept (SFNNv16, credited to Pawnocchio's author; §2, 6.4.0); threat updates around the changed squares (idea, 6.5.0). No code. Training data: see next row. |
+| Stockfish 18 and 19 (the Stockfish developers) | GPL-3.0 | Published forms only: HalfKA-family features, SFNNv5-style layer stack, PSQT head, threat-input concept, null-move verification form, corrhist form (§1, §2, §3); pawn-pair input concept (SFNNv16, credited to Pawnocchio's author; §2, 6.4.0); threat updates around the changed squares (idea, 6.5.0); the current singular-extension form, the table score as a node's value, the dithered draw score and evaluation damping by the fifty-move counter (ideas, §1, 6.6.0). No code. Training data: see next row. |
 | Stockfish project relabelled training collections (`vondele/from_kaggle_1_relabel`, `vondele/from_kaggle_2_relabel`, `vondele/linrock_relabel_1`, `vondele/linrock_relabel_2`, `vondele/master-binpacks_relabel`, Hugging Face) | **No license stated** on the dataset cards (checked 2026-09-03 and 2026-09-14); publisher and underlying LCZero/Stockfish notices are recorded in §4; upstream provenance is not independently established for every row | Training data for the 6.4.0 and 6.3.0 networks (40 of their 42 components, same database) and for the 6.2.0 network (§4), with local score alterations. Notice and alteration offer below. |
 | `xushawn/test80-bt4-relabel` (Hugging Face) | **ODbL-1.0** | Training data (§4), the two 2024 components. |
 | Lc0-derived data (`leela96-filt-v2`, LCZero self-play rescored by Stockfish) | ODbL-1.0 / DBCL-1.0 (LCZero) | LCZero-derived components of the training mix (§4). ODbL notice below. |
@@ -56,7 +56,8 @@ are scaled by one factor chosen here (`UNIT_PERCENT = 25`); dimensionless terms 
 zigqueen's, and everything else in the search — time management, SEE, transposition table, eval cache, quiescence,
 aspiration, probcut, singular extensions, move ordering and the history tables — uses zigqueen's own designs and
 constants. The historical parameter port is confined to this policy module; the local
-retune is recorded below.
+retune is recorded below. Published ideas adopted in later releases are
+credited in the per-release parts that follow.
 
 **Local retuning in 6.2.0.** A zigqueen SPSA experiment selected the following
 12 pruning coordinates; 11 endpoint values differ from the original
@@ -201,6 +202,44 @@ review that included an originality check.
   around the changed squares (Stockfish).
 
 The other 6.5.0 changes are our own work or general engine practice.
+
+**Changes in 6.6.0.** No code of another engine. The inherited values in the
+tables above are unchanged; every parameter added in 6.6.0 is an untuned
+first choice of ours or comes from our own measurements.
+
+Published ideas, in our own implementation:
+
+- *Singular extensions, full form:* the test at every node type from depth 6,
+  a second ply of extension, a negative extension and multi-cut. Singular
+  extensions are Anantharaman, Campbell and Hsu's (1988), multi-cut is
+  Björnsson and Marsland's (1998); the combined form is the one Stockfish
+  and most open-source engines use.
+- *The table's score as a node's value:* where a table entry too shallow to
+  cut contradicts the static evaluation, the pruning rules read its score,
+  as Stockfish does. Which rules read it is our choice.
+- *Dithered draw score:* a draw found in the search scores +1 or −1 by a
+  bit of the node counter instead of 0. Idea and form are Stockfish's.
+- *Progress in won positions:* damping the evaluation as the fifty-move
+  counter rises is a published idea that Stockfish and other engines use.
+  Ours presses only the engine's own side, only once a search of the game
+  has ended at +3.00 or more; a bare king is driven by the classical mop-up
+  idea.
+- *Countermove:* the heuristic is Jos Uiterwijk's (1992), killer moves are
+  older still. Keeping the countermove after captures, and scoring both as
+  bonuses in one quiet-move score sized by measured cut rates, came from our
+  own review; we do not claim either as new.
+- *General engine practice,* with our own thresholds: no table cutoff at PV
+  nodes, mate-distance pruning, a bound on accumulated extensions, table
+  entries that keep their move, per-move futility of captures in
+  quiescence, the root ordered by the previous iteration's node counts, the
+  full-depth re-search of a reduced move that beat alpha.
+
+Our own work, with no outside source: the compact transposition table (a
+32-bit tag and a 64-bit word, five entries to a 64-byte cluster; the
+reverse-futility hint table is gone and `Hash` counts all the memory it
+sizes), the time-manager changes (a spare move with `movestogo`, one
+deadline for `go movetime`, a stop request waits for the first iteration)
+and the fixes to repetition, fifty-move, stalemate and mate-score handling.
 
 ## 2. NNUE evaluation: published forms, our own implementation
 
@@ -352,8 +391,8 @@ engine.
   offered under ODbL-1.0 and individual contents under DbCL-1.0; we added no
   individual contents. The same `data-r2` offer covers the 6.4.0 network,
   which was trained on the same derivative database; the archive is attached
-  unchanged to the 6.4.0 release, and again to 6.5.0, which ships the same
-  network. The `data-r1` offer covers the 6.2.0
+  unchanged to the 6.4.0 release, and again to 6.5.0 and 6.6.0, which ship
+  the same network. The `data-r1` offer covers the 6.2.0
   network only.
 
 ## 5. Third-party code compiled or packaged with zigqueen
@@ -436,3 +475,6 @@ at https://github.com/stierms/zigqueen/issues.
 - October 2026, 6.5.0: own Syzygy prober and its format description (Fathom
   now only in a test tool); credits for the ray-space and changed-square
   threat updates; PGO release tooling. The network is unchanged.
+- November 2026, 6.6.0: origins of the 6.6.0 search changes; compact
+  transposition table (hint table removed); time-manager fixes. The network,
+  its data and the third-party code are unchanged.

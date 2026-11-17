@@ -2,6 +2,7 @@
 const std = @import("std");
 const runtime = @import("util/search_runtime.zig");
 const shared = @import("search/shared_tt.zig");
+const tt = @import("search/tt.zig");
 
 const Task = struct {
     view: shared.View,
@@ -24,14 +25,15 @@ const Task = struct {
             mixed = (mixed ^ (mixed >> 27)) *% 0x94d049bb133111eb;
             const raw = mixed ^ (mixed >> 31);
             // Contended trace compresses indexing into sixteen clusters while
-            // retaining varied full keys; uniform trace spans the whole table.
-            const key = if (self.contended) raw & (~self.view.mask | 15) else raw;
-            const value: i32 = @intCast((key >> 32) & 32767);
+            // retaining varied tags; uniform trace spans the whole table. The
+            // value names the tag, so an entry found under it must carry it.
+            const key = if (self.contended) tt.keyFor(@intCast(raw & 15), self.view.clusters.len, @truncate(raw >> 32)) else raw;
+            const value: i32 = tt.tagOf(key) & 32767;
             const result = self.view.storeResult(key, 3, value, .exact, null, @intCast(value), true);
             if (result.skip == .none) self.stores += 1 else self.skipped += 1;
             if (self.view.lookup(key)) |entry| {
                 self.hits += 1;
-                if (entry.key != key or entry.score != value or entry.static_eval != value or
+                if (entry.score != value or entry.static_eval != value or
                     entry.generation != self.view.generation) self.invalid = true;
             } else self.misses += 1;
         }

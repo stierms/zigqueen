@@ -15,56 +15,56 @@ time, Hash 256 MB and 3–6 piece Syzygy tables for every engine that supports
 them. Opponent forfeits count as their losses. The field changes between
 versions, so ratings from different fields cannot be subtracted.
 
-## 6.5.0
+## 6.6.0
 
-**3717 (95%: 3713–3721)** from 3,256 games against 22 engines centred on
-3700. Score: 345 wins, 2,721 draws, 190 losses = 1705.5/3256 (52.4%),
-including seven opponent time forfeits (Minke five, Hobbes two). No zigqueen
-forfeits. Build `617e40d5b` (our private history), the PGO build of the AVX2
-binary, built-in network, October 20–21, 2026.
+**3738 (95%: 3734–3742)** from 3,256 games against 22 engines centred on 3700,
+against 3717 for 6.5.0 on the same openings: **+21 (95%: +15 to +26)**. Score:
+433 wins, 2,737 draws, 86 losses = 1801.5/3256 (55.3%), including ten opponent
+time forfeits (Minke seven, Hobbes three). No zigqueen forfeits. Build
+`e92e0170d` (our private history), the PGO build of the AVX2 binary, built-in
+network, November 17–18, 2026.
 
-- Field: CCRL Blitz single-CPU list of 2026-10-03, 22 engines from 3614 to
-  3774 (mean 3700.4), exact listed versions; nine of them were also in the
-  6.4.0 field. Engines without a usable Linux release were built from their
-  tagged source and checked against that version's bench signature.
-- Openings: 74 eight-move openings per opponent from the same book, disjoint
-  from every earlier run, each played with both colours (148 games per
-  opponent).
-- 6.4.0's 3701 was measured against a weaker field (mean 3667), so the two
-  ratings are not directly comparable.
+- Field, anchors, clock and machine are those of the 6.5.0 run: CCRL Blitz
+  single-CPU list of 2026-10-03, 22 engines from 3614 to 3774 (mean 3700.4),
+  exact listed versions.
+- Openings: the same 74 eight-move openings per opponent as in the 6.5.0 run,
+  in the same order, each played with both colours (148 games per opponent).
+  The difference to 6.5.0 and its interval are taken game for game over the
+  1,628 opening pairs both runs played.
 
-The implied rating is the rating at which the expected score against that
-one opponent equals the actual score.
+The implied rating is the rating at which the expected score against that one
+opponent equals the actual score.
 
-| Opponent | Anchor | W–D–L | Points / 148 | Implied rating |
-|---|---:|---:|---:|---:|
-| PlentyChess 8.0.0 | 3774 | 0–136–12 | 68 | 3746 |
-| Reckless 0.9.0 | 3766 | 0–128–20 | 64 | 3719 |
-| Integral 8 | 3753 | 3–122–23 | 64 | 3706 |
-| Stormphrax 8.0.0 | 3745 | 2–129–17 | 66.5 | 3710 |
-| Triumviratus 6.0 | 3744 | 1–138–9 | 70 | 3725 |
-| Berserk 14 | 3738 | 1–129–18 | 65.5 | 3698 |
-| Hobbes 2.1 | 3723 | 14–116–18 | 72 | 3714 |
-| Horsie 1.1.0 | 3709 | 8–132–8 | 74 | 3709 |
-| Raphael 4.1.1 | 3708 | 12–128–8 | 76 | 3717 |
-| Devre 7.0 | 3705 | 5–130–13 | 70 | 3686 |
-| Minke 7.0.0 | 3701 | 17–122–9 | 78 | 3720 |
-| Igel 3.7.0 | 3694 | 15–130–3 | 80 | 3722 |
-| Lizard 11.2 | 3694 | 22–123–3 | 83.5 | 3739 |
-| Renegade 1.3.0 | 3693 | 10–130–8 | 75 | 3698 |
-| RubiChess 20240817 | 3692 | 11–133–4 | 77.5 | 3708 |
-| Starzix 6.0 | 3690 | 13–133–2 | 79.5 | 3716 |
-| Uralochka 3.42a | 3689 | 18–121–9 | 78.5 | 3710 |
-| Tcheran 13.0 | 3683 | 19–128–1 | 83 | 3725 |
-| Clover 6.1 | 3639 | 26–118–4 | 85 | 3691 |
-| Clarity 8.0.0 | 3632 | 53–94–1 | 100 | 3760 |
-| Arasan 25.1 | 3622 | 50–98–0 | 99 | 3744 |
-| Caissa 1.13.1 | 3614 | 45–103–0 | 96.5 | 3723 |
+| Opponent | Anchor | W–D–L | Points / 148 | Implied rating | 6.5.0 points / 148 |
+|---|---:|---:|---:|---:|---:|
+| PlentyChess 8.0.0 | 3774 | 0–133–15 | 66.5 | 3739 | 68 |
+| Reckless 0.9.0 | 3766 | 2–136–10 | 70 | 3747 | 64 |
+| Integral 8 | 3753 | 6–128–14 | 70 | 3734 | 64 |
+| Stormphrax 8.0.0 | 3745 | 1–140–7 | 71 | 3731 | 66.5 |
+| Triumviratus 6.0 | 3744 | 2–143–3 | 73.5 | 3742 | 70 |
+| Berserk 14 | 3738 | 5–136–7 | 73 | 3733 | 65.5 |
+| Hobbes 2.1 | 3723 | 12–133–3 | 78.5 | 3744 | 72 |
+| Horsie 1.1.0 | 3709 | 13–131–4 | 78.5 | 3730 | 74 |
+| Raphael 4.1.1 | 3708 | 14–129–5 | 78.5 | 3729 | 76 |
+| Devre 7.0 | 3705 | 13–132–3 | 79 | 3729 | 70 |
+| Minke 7.0.0 | 3701 | 20–125–3 | 82.5 | 3741 | 78 |
+| Igel 3.7.0 | 3694 | 17–130–1 | 82 | 3732 | 80 |
+| Lizard 11.2 | 3694 | 19–129–0 | 83.5 | 3739 | 83.5 |
+| Renegade 1.3.0 | 3693 | 23–120–5 | 83 | 3735 | 75 |
+| RubiChess 20240817 | 3692 | 23–123–2 | 84.5 | 3742 | 77.5 |
+| Starzix 6.0 | 3690 | 23–124–1 | 85 | 3742 | 79.5 |
+| Uralochka 3.42a | 3689 | 17–130–1 | 82 | 3727 | 78.5 |
+| Tcheran 13.0 | 3683 | 18–129–1 | 82.5 | 3723 | 83 |
+| Clover 6.1 | 3639 | 37–111–0 | 92.5 | 3728 | 85 |
+| Clarity 8.0.0 | 3632 | 60–88–0 | 104 | 3781 | 100 |
+| Arasan 25.1 | 3622 | 51–97–0 | 99.5 | 3747 | 99 |
+| Caissa 1.13.1 | 3614 | 57–90–1 | 102 | 3752 | 96.5 |
 
 ## Earlier versions
 
 | Version | Date | Field | Games | Rating | Details |
 |---|---|---|---:|---|---|
+| 6.5.0 | 2026-10-21 | 22 engines around 3700, CCRL Blitz of 2026-10-03; the field and openings of 6.6.0 | 3,256 | 3717 (95%: 3713–3721) | [6.5.0 STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.5.0/docs/STRENGTH.md) |
 | 6.4.0 | 2026-10-09 | 22 engines around 3667, CCRL Blitz of 2026-09-21 | 1,628 | 3701 (95%: 3694–3707) | [6.4.0 STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.4.0/docs/STRENGTH.md) |
 | 6.3.0 | 2026-09-25 | the same field | 1,628 | 3676 (95%: 3670–3683) | [6.3.0 STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/STRENGTH.md) |
 | 6.2.0 | 2026-09-09 | 27-engine roster, CCRL Blitz of 2026-07-19, 180s+1s | 1,620 | 3672 (1σ: 3661–3683) | [6.2.0 STRENGTH.md](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/STRENGTH.md) |

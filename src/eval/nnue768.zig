@@ -230,6 +230,9 @@ pub const Net = struct {
     // layer weights are dequantised to f32 at load (l1 from i8/qb; l2/l3 already f32),
     // output-major [out][in]. Empty/unused for ZQB1/2/3 (output_weights path instead).
     multilayer: bool = false,
+    /// How many values of the layers after the first were below TAIL_FLUSH in
+    /// the file and were read as zero (readTailF32); bench reports it.
+    tail_flushed: u32 = 0,
     l2_size: usize = 0, // l1 output width (== l2 input)
     l3_size: usize = 0, // l2 output width (== l3 input)
     l1_weights: []align(64) i8 = &.{}, // [l2_size*hidden], output-major; raw i8 (scale qb) for a vpdpbusd dot
@@ -758,6 +761,7 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
     net.mirror = mirror_u != 0;
     net.table = table;
     net.multilayer = is_v4 or is_v8 or is_v9;
+    net.tail_flushed = 0;
     net.l2_size = l2_size;
     net.l3_size = l3_size;
     net.threats = is_v5 or is_v6 or is_v7 or is_v8 or is_v9;
@@ -819,11 +823,11 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
         // the blob is [l1w all][l1b all][l2w all][l2b all][l3w all][l3b all], each
         // tensor bucket-major internally. Read each tensor in full.
         for (net.l1_weights) |*w| w.* = readI8(bytes, &idx); // raw i8 (scale qb)
-        for (net.l1_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l2_weights) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l2_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l3_weights) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l3_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
+        for (net.l1_bias) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l2_weights) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l2_bias) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l3_weights) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l3_bias) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
         if (!layerstackScoreFits(net)) return error.UnsupportedShape;
         return net;
     }
@@ -872,11 +876,11 @@ fn loadFromBytesInner(allocator: std.mem.Allocator, bytes: []const u8) !*Net {
         for (net.feature_weights) |*w| w.* = readI16(bytes, &idx);
         for (net.feature_bias) |*w| w.* = readI16(bytes, &idx);
         for (net.l1_weights) |*w| w.* = readI8(bytes, &idx);
-        for (net.l1_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l2_weights) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l2_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l3_weights) |*w| w.* = try readFiniteF32(bytes, &idx);
-        for (net.l3_bias) |*w| w.* = try readFiniteF32(bytes, &idx);
+        for (net.l1_bias) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l2_weights) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l2_bias) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l3_weights) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
+        for (net.l3_bias) |*w| w.* = try readTailF32(bytes, &idx, &net.tail_flushed);
         for (net.threat_w8) |*w| w.* = readI8(bytes, &idx);
         for (net.psqtw[0..feat_rows]) |*w| w.* = try readPsqtQ20(bytes, &idx);
         for (net.psqtb) |*b| b.* = try readPsqtQ20(bytes, &idx);
@@ -4848,6 +4852,25 @@ fn readFiniteF32(bytes: []const u8, idx: *usize) error{UnsupportedShape}!f32 {
     return v;
 }
 
+/// Magnitudes below this in the layers after the first are read as zero.
+pub const TAIL_FLUSH: f32 = 1e-20;
+
+/// One float of the layers after the first (their biases and weights). A unit
+/// that died in training leaves vanished values rather than zeros: the
+/// shipped net holds 1,866 of them between 9e-41 and 2e-28 (98 denormal),
+/// where its smallest working weight is 8e-4. They are below any effect on a
+/// score, but they make the float tail compute with denormal operands and
+/// results at every evaluation, which costs a microcode assist per operation
+/// on processors that do not handle denormals in hardware. Read as exact
+/// zeros they cost nothing anywhere; the evaluations are the same. `flushed`
+/// counts the nonzero values read as zero (Net.tail_flushed).
+fn readTailF32(bytes: []const u8, idx: *usize, flushed: *u32) error{UnsupportedShape}!f32 {
+    const v = try readFiniteF32(bytes, idx);
+    if (@abs(v) >= TAIL_FLUSH) return v;
+    if (v != 0) flushed.* += 1;
+    return 0;
+}
+
 /// One serialized PSQT float as Q20. 2048 * 2^20 is the first value past i32.
 fn readPsqtQ20(bytes: []const u8, idx: *usize) error{UnsupportedShape}!i32 {
     const v = try readFiniteF32(bytes, idx);
@@ -4956,6 +4979,7 @@ test "nnue768 evaluates a material imbalance from the side to move" {
     net.threats = false;
     net.full_threats = false;
     net.multilayer = false;
+    net.tail_flushed = 0;
     net.threat_w8 = &.{};
     net.pawn_inputs = 0;
     net.pawn_w8 = &.{};
@@ -5008,6 +5032,34 @@ test "nnue768 embedded default net loads and is materially aware" {
     // ~HCE centipawns: startpos near 0, a queen up is decisively positive.
     try std.testing.expect(@abs(evaluate(net, &start, 54)) < 120);
     try std.testing.expect(evaluate(net, &up_queen, 54) > 300);
+}
+
+test "tail floats below the flush threshold read as exact zero" {
+    const values = [_]f32{ 5.34e-35, -1.6e-28, 9.3e-41, 8.5e-4, -0.105, 0.0, 1e-20 };
+    const expect = [_]f32{ 0, 0, 0, 8.5e-4, -0.105, 0, 1e-20 };
+    var bytes: [values.len * 4]u8 = undefined;
+    for (values, 0..) |v, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(v), .little);
+    var idx: usize = 0;
+    var flushed: u32 = 0;
+    for (expect) |want| {
+        const got = try readTailF32(&bytes, &idx, &flushed);
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+    }
+    // The three vanished values count; the stored zero does not.
+    try std.testing.expectEqual(@as(u32, 3), flushed);
+    const nan = [_]u8{ 0, 0, 0xc0, 0x7f };
+    idx = 0;
+    try std.testing.expectError(error.UnsupportedShape, readTailF32(&nan, &idx, &flushed));
+}
+
+test "the embedded net's layers after the first hold no vanished value" {
+    const allocator = std.testing.allocator;
+    const net = try loadDefault(allocator);
+    defer net.destroy(allocator);
+    try std.testing.expect(net.multilayer);
+    inline for (.{ "l1_bias", "l2_weights", "l2_weights_t", "l2_bias", "l3_weights", "l3_bias" }) |name| {
+        for (@field(net, name)) |w| try std.testing.expect(w == 0 or @abs(w) >= TAIL_FLUSH);
+    }
 }
 
 const TreeVerifier = struct {
@@ -5884,6 +5936,7 @@ fn buildTestNet(allocator: std.mem.Allocator, hidden: usize, king_buckets: usize
     net.threats = false;
     net.full_threats = false;
     net.multilayer = false;
+    net.tail_flushed = 0;
     net.threat_w8 = &.{};
     net.pawn_inputs = 0;
     net.pawn_w8 = &.{};

@@ -3,6 +3,7 @@ const legal = @import("../movegen/legal.zig");
 const make_unmake = @import("../movegen/make_unmake.zig");
 const move_mod = @import("../core/move.zig");
 const position = @import("../core/position.zig");
+const progress = @import("progress.zig");
 const repetition = @import("repetition.zig");
 const stack = @import("stack.zig");
 const tt = @import("tt.zig");
@@ -53,20 +54,24 @@ pub fn isLegal(pos: *const position.Position, history: *const repetition.History
     return true;
 }
 
+/// `context` is the table context of the search that wrote the line
+/// (SearchContext.table_context; `.{}` for a search without the clock pressure).
 pub fn reconstructFromRootMove(
     pos: *const position.Position,
     history: *const repetition.History,
     table: anytype,
+    context: progress.TableContext,
     root_move: ?move_mod.Move,
     out: *Line,
 ) void {
-    reconstructFromRootMoveLimited(pos, history, table, root_move, out, MAX_PV);
+    reconstructFromRootMoveLimited(pos, history, table, context, root_move, out, MAX_PV);
 }
 
 pub fn reconstructFromRootMoveLimited(
     pos: *const position.Position,
     history: *const repetition.History,
     table: anytype,
+    context: progress.TableContext,
     root_move: ?move_mod.Move,
     out: *Line,
     max_len: usize,
@@ -89,7 +94,7 @@ pub fn reconstructFromRootMoveLimited(
     if (temp.halfmove_clock >= 100 or temp_history.isRepetition(temp.halfmove_clock)) return;
 
     var tail = Line{};
-    reconstructLimited(&temp, &temp_history, table, &tail, max_len - out.len);
+    reconstructLimited(&temp, &temp_history, table, context, &tail, max_len - out.len);
     for (tail.slice()) |tail_move| {
         if (out.len >= max_len or out.len >= out.moves.len) break;
         out.push(tail_move);
@@ -100,15 +105,21 @@ pub fn reconstruct(
     pos: *const position.Position,
     history: *const repetition.History,
     table: anytype,
+    context: progress.TableContext,
     out: *Line,
 ) void {
-    reconstructLimited(pos, history, table, out, MAX_PV);
+    reconstructLimited(pos, history, table, context, out, MAX_PV);
 }
 
+/// Follows the table's moves from `pos`: the entries of `context` first; a
+/// position that context has no entry for continues with the entry of the
+/// context without the pressure (the line is for display and the ponder
+/// move; no score is read).
 pub fn reconstructLimited(
     pos: *const position.Position,
     history: *const repetition.History,
     table: anytype,
+    context: progress.TableContext,
     out: *Line,
     max_len: usize,
 ) void {
@@ -121,7 +132,8 @@ pub fn reconstructLimited(
     var ply: usize = 0;
     const limit = @min(max_len, MAX_PV);
     while (ply < limit) : (ply += 1) {
-        const mv = table.bestMove(temp.zobrist_key) orelse break;
+        const mv = table.bestMove(temp.zobrist_key ^ context.key(temp.halfmove_clock)) orelse
+            (if (context.base != 0) table.bestMove(temp.zobrist_key) else null) orelse break;
         if (!legal.isLegalMove(&temp, mv)) break;
 
         out.push(mv);
@@ -159,7 +171,7 @@ test "pv reconstruction follows legal tt moves" {
     table.store(next.zobrist_key, 1, 0, .exact, second);
 
     var line = Line{};
-    reconstruct(&pos, &history, &table, &line);
+    reconstruct(&pos, &history, &table, .{}, &line);
 
     try std.testing.expectEqual(@as(usize, 2), line.len);
     try std.testing.expectEqual(first, line.slice()[0]);
@@ -187,10 +199,42 @@ test "root-preserving pv reconstruction keeps chosen best move first" {
     table.store(next.zobrist_key, 3, 0, .exact, child);
 
     var line = Line{};
-    reconstructFromRootMoveLimited(&pos, &history, &table, first, &line, 2);
+    reconstructFromRootMoveLimited(&pos, &history, &table, .{}, first, &line, 2);
 
     try std.testing.expectEqual(first, line.slice()[0]);
     try std.testing.expectEqual(child, line.slice()[1]);
+}
+
+test "pv reconstruction reads the line of its table context and falls back to the plain one" {
+    const fen = @import("../core/fen.zig");
+
+    var table = try tt.TranspositionTable.init(std.testing.allocator, 1);
+    defer table.deinit();
+
+    const pos = try fen.startpos();
+    var history = repetition.History{};
+    history.push(pos.zobrist_key);
+    const context = progress.TableContext.of(true, .white, 16);
+
+    const plain_first = move_mod.Move.init(.e2, .e4, .double_push);
+    const context_first = move_mod.Move.init(.d2, .d4, .double_push);
+    const reply = move_mod.Move.init(.d7, .d5, .double_push);
+    table.store(pos.zobrist_key, 2, 0, .exact, plain_first);
+    table.store(pos.zobrist_key ^ context.key(pos.halfmove_clock), 2, 0, .exact, context_first);
+    var next = pos;
+    var state = make_unmake.StateInfo{};
+    _ = make_unmake.makeMove(&next, context_first, &state);
+    // The reply exists only as an entry of the plain context.
+    table.store(next.zobrist_key, 1, 0, .exact, reply);
+
+    var line = Line{};
+    reconstruct(&pos, &history, &table, context, &line);
+    try std.testing.expectEqual(@as(usize, 2), line.len);
+    try std.testing.expectEqual(context_first, line.slice()[0]);
+    try std.testing.expectEqual(reply, line.slice()[1]);
+
+    reconstruct(&pos, &history, &table, .{}, &line);
+    try std.testing.expectEqual(plain_first, line.slice()[0]);
 }
 
 test "pv reconstruction stops immediately in drawn positions" {
@@ -205,6 +249,6 @@ test "pv reconstruction stops immediately in drawn positions" {
     table.store(pos.zobrist_key, 1, 0, .exact, move_mod.Move.init(.e2, .f4, .quiet));
 
     var line = Line{};
-    reconstruct(&pos, &history, &table, &line);
+    reconstruct(&pos, &history, &table, .{}, &line);
     try std.testing.expectEqual(@as(usize, 0), line.len);
 }

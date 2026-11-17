@@ -37,6 +37,10 @@ pub const StackEntry = struct {
     /// used to key continuation history. Null only after a null move / at root.
     prev_cont_piece: ?piece.PieceType = null,
     static_eval: ?types.Score = null,
+    /// Positive extension, in plies, granted on the line from the root to
+    /// this node (extension_bound.zig bounds it). Written by the parent before it
+    /// searches the node.
+    ext_sum: u8 = 0,
     /// LMR reduction used by the parent to reach this child. The release
     /// flavour stores no field bytes; shallow_arms' accessors compile away.
     parent_lmr_reduction: if (build_options.tuning) u16 else void = if (build_options.tuning) 0 else {},

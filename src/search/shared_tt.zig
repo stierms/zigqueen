@@ -1,4 +1,5 @@
-//! Process-owned shared TT. The reviewed SC cluster is reused unchanged.
+//! Process-owned shared TT: the serial table's clusters (tt.Cluster), read and
+//! written under the sequence lock of probes/tt_snapshot.zig.
 //! One control thread owns lifecycle transitions; every view must stop being
 //! used before endSearch. A live view permits only atomic snapshot/store access.
 const std = @import("std");
@@ -14,6 +15,9 @@ pub const SharedTable = struct {
     configured_hash_mb: u32 = 0,
     generation: u8 = 0,
     active: bool = false,
+    /// Given to the views of the next search; the pool sets it from the
+    /// tunables (tuning flavour).
+    policy: tt.Policy = .{},
 
     pub fn init(allocator: std.mem.Allocator, hash_mb: u32) !SharedTable {
         var table = SharedTable{ .allocator = allocator };
@@ -31,8 +35,8 @@ pub const SharedTable = struct {
     /// primitives. Refusing an active job catches an accidental early resize.
     pub fn clear(self: *SharedTable) !void {
         if (self.active) return error.TableInUse;
-        // Cluster{} has depth -1 and STATIC_EVAL_NONE. Byte-zero is NOT empty.
-        for (self.clusters) |*cluster| cluster.* = .{};
+        // A zeroed cluster is empty, with its sequence word even.
+        @memset(self.clusters, .{});
         self.generation = 0;
     }
 
@@ -47,7 +51,7 @@ pub const SharedTable = struct {
         }
         // Prepare before commit. Allocation failure preserves data and metadata.
         const fresh = try hugealloc.alloc(protocol.Cluster, self.allocator, len);
-        for (fresh.items) |*cluster| cluster.* = .{};
+        @memset(fresh.items, .{});
         hugealloc.free(protocol.Cluster, self.allocator, .{ .items = self.clusters, .method = self.backing });
         self.clusters = fresh.items;
         self.backing = fresh.method;
@@ -60,7 +64,7 @@ pub const SharedTable = struct {
         if (self.clusters.len == 0) return error.NoTable;
         self.generation +%= 1;
         self.active = true;
-        return .{ .clusters = self.clusters, .mask = self.clusters.len - 1, .generation = self.generation };
+        return .{ .clusters = self.clusters, .generation = self.generation, .policy = self.policy };
     }
 
     /// The caller has joined/drained EVERY borrower before this transition.
@@ -70,7 +74,7 @@ pub const SharedTable = struct {
     }
 
     pub fn entryCount(self: *const SharedTable) usize {
-        return 2 * self.clusters.len;
+        return tt.WAYS * self.clusters.len;
     }
 
     pub fn allocatedBytes(self: *const SharedTable) usize {
@@ -83,15 +87,26 @@ pub const SharedTable = struct {
 /// SC protocol even for PV reconstruction and hashfull sampling.
 pub const View = struct {
     clusters: []protocol.Cluster,
-    mask: u64,
     generation: u8,
+    policy: tt.Policy = .{},
+
+    inline fn activePolicy(self: *const View) tt.Policy {
+        if (comptime @import("build_options").tuning) return self.policy;
+        return .{};
+    }
 
     pub inline fn prefetch(self: *const View, key: u64) void {
-        @prefetch(&self.clusters[@intCast(key & self.mask)], .{ .rw = .read, .locality = 3, .cache = .data });
+        @prefetch(&self.clusters[tt.clusterIndex(key, self.clusters.len)], .{ .rw = .read, .locality = 3, .cache = .data });
     }
 
     pub inline fn lookup(self: *const View, key: u64) ?tt.Entry {
-        return self.clusters[@intCast(key & self.mask)].lookup(key);
+        return protocol.lookup(&self.clusters[tt.clusterIndex(key, self.clusters.len)], tt.tagFor(key, self.activePolicy()), self.generation);
+    }
+
+    /// The search's own probe (tt.TranspositionTable.probe).
+    pub inline fn probe(self: *const View, key: u64) ?tt.Entry {
+        const policy = self.activePolicy();
+        return protocol.probe(&self.clusters[tt.clusterIndex(key, self.clusters.len)], tt.tagFor(key, policy), self.generation, policy.refresh_on_hit);
     }
 
     pub fn bestMove(self: *const View, key: u64) ?moves.Move {
@@ -104,7 +119,7 @@ pub const View = struct {
 
     /// Keep skip reasons available to cold probes without shared hot counters.
     pub inline fn storeResult(self: *const View, key: u64, depth: i16, score: i32, bound: tt.Bound, mv: ?moves.Move, static_eval: i16, was_pv: bool) protocol.Result {
-        return self.clusters[@intCast(key & self.mask)].store(.{
+        return protocol.store(&self.clusters[tt.clusterIndex(key, self.clusters.len)], .{
             .key = key,
             .depth = depth,
             .score = score,
@@ -113,26 +128,20 @@ pub const View = struct {
             .static_eval = static_eval,
             .was_pv = was_pv,
             .generation = self.generation,
-        });
+        }, self.activePolicy());
     }
 
     pub fn hashfullPermille(self: *const View) u16 {
         const len: usize = @min(self.clusters.len, 1000);
         if (len == 0) return 0;
         var used: usize = 0;
-        for (self.clusters[0..len]) |*cluster| {
-            const entries = cluster.snapshot() orelse continue;
-            for (entries) |entry| {
-                if (entry.depth >= 0) used += 1;
-            }
-        }
-        return @intCast(used * 1000 / (len * 2));
+        for (self.clusters[0..len]) |*cluster| used += protocol.occupied(cluster) orelse 0;
+        return @intCast(used * 1000 / (len * tt.WAYS));
     }
 };
 
 fn clusterCount(hash_mb: u32) usize {
-    const bytes = @as(u64, hash_mb) * 1024 * 1024;
-    return @intCast(std.math.floorPowerOfTwo(u64, bytes / @sizeOf(protocol.Cluster)));
+    return tt.clusterCountForHash(hash_mb);
 }
 
 test "shared table explicitly initializes empty payload on allocation clear and resize" {
@@ -144,11 +153,12 @@ test "shared table explicitly initializes empty payload on allocation clear and 
         try std.testing.expect(view.lookup(0) == null);
         try std.testing.expectEqual(@as(u16, 0), view.hashfullPermille());
         for (view.clusters) |*cluster| {
-            const entries = cluster.snapshot().?;
-            for (entries) |entry| {
-                try std.testing.expectEqual(@as(i16, -1), entry.depth);
-                try std.testing.expectEqual(tt.STATIC_EVAL_NONE, entry.static_eval);
+            const slots = protocol.snapshot(cluster).?;
+            for (slots.tags, slots.data) |tag, word| {
+                try std.testing.expectEqual(@as(tt.Tag, 0), tag);
+                try std.testing.expectEqual(@as(u64, 0), word);
             }
+            try std.testing.expectEqual(@as(u32, 0), cluster.sequence);
         }
         try std.testing.expect(view.storeWithOutcome(0, 0, 42, .exact, null, 17, false).stored);
         try std.testing.expectEqual(@as(i32, 42), view.lookup(0).?.score);
@@ -198,9 +208,9 @@ test "shared table failed allocation preserves the old resource" {
 }
 
 test "shared table reports capacity instead of assuming equal Hash implies equal storage" {
-    try std.testing.expectEqual(@as(usize, 16384), clusterCount(1));
-    try std.testing.expectEqual(@as(usize, 1048576), clusterCount(100));
-    try std.testing.expectEqual(@as(usize, 4194304), clusterCount(256));
+    try std.testing.expectEqual(@as(usize, 12_288), clusterCount(1));
+    try std.testing.expectEqual(@as(usize, 1_376_256), clusterCount(100));
+    try std.testing.expectEqual(@as(usize, 3_145_728), clusterCount(256));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(protocol.Cluster));
     try std.testing.expectEqual(@as(usize, 64), @alignOf(protocol.Cluster));
 }
@@ -214,12 +224,15 @@ const Stress = struct {
     fn run(self: *@This()) void {
         self.gate.wait();
         for (0..20000) |iteration| {
-            // Several distinct full keys hit the same 16 clusters.
-            const key = (self.id << 48) | (@as(u64, @intCast(iteration & 255)) << 24) | (iteration & 15);
-            const score: i32 = @intCast((key >> 24) & 255);
+            // Each thread's 256 tags, distinct from the other threads', hit
+            // the same 16 clusters; the score is the tag, so an entry found
+            // under a tag must be the one stored under it.
+            const tag: u16 = @intCast((self.id << 8) | (iteration & 255));
+            const key = tt.keyFor(iteration & 15, self.view.clusters.len, tag);
+            const score: i32 = tag;
             _ = self.view.storeWithOutcome(key, 3, score, .exact, null, @intCast(score + 1), true);
             if (self.view.lookup(key)) |entry| {
-                if (entry.key != key or entry.score != score or entry.static_eval != score + 1 or
+                if (entry.score != score or entry.static_eval != score + 1 or entry.depth != 3 or
                     entry.generation != self.view.generation or !entry.was_pv) self.failed = true;
             }
             if (self.view.hashfullPermille() > 1000) self.failed = true;

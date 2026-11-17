@@ -15,25 +15,26 @@
 //!     LRU by move-to-front inside the set: a hit or a store puts its entry
 //!     first, a store of a new key drops the last.
 //!   - An entry is the key's low 48 bits (the tag) above the i16 eval. Sets are
-//!     indexed by the HIGH key bits (key >> (64 - log2(sets))), at least 16 of
+//!     indexed by the HIGH key bits (key >> (64 - log2(sets))), at least 6 of
 //!     them at every allowed size (asserted at resize), so tag and index
-//!     together are the FULL 64-bit key: a hit returns the raw eval of that
-//!     exact position up to a full zobrist collision, the risk class the TT
-//!     already accepts for Entry.static_eval reuse. d13 node identity vs the
-//!     uncached binary is the standing proof.
-//!   - The TT and rfp-hint tables index by the LOW key bits; the high-bit index
-//!     decorrelates this table's conflict sets from theirs at zero cost.
+//!     together verify 54 key bits at the smallest table and the FULL 64-bit
+//!     key from 4 MB up: a hit returns the raw eval of that exact position up
+//!     to a zobrist collision. d13 node identity vs the uncached binary is
+//!     the standing proof.
+//!   - The TT indexes by the LOW key bits; the high-bit index decorrelates
+//!     this table's conflict sets from its at zero cost.
 //!   - A zero entry is empty; a key whose low 48 bits are all zero (p ~ 2^-48)
 //!     is simply never cached (probe misses, store skips).
-//!   - Sized off UCI Hash: Hash/4 clamped to [4, 64] MB. No UCI option of its
-//!     own; ucinewgame clears it (via Engine.reset), Hash resize re-sizes it.
-//!     At Threads = N every engine keeps a private copy of 1/N of that size
-//!     (floor 4 MB; engine.zig PrivateTableSizes).
-//!   - Allocation routed through util/hugealloc like the TT/rfp-hint tables
+//!   - Sized off UCI Hash and counted inside it (table_budget.zig): Hash/4,
+//!     a power of two up to 64 MB. No UCI option of its own; ucinewgame
+//!     clears it (via Engine.reset), Hash resize re-sizes it. At Threads = N
+//!     every engine keeps a private copy of 1/N of that size, rounded down
+//!     to a power of two (engine.zig PrivateTableSizes).
+//!   - Allocation routed through util/hugealloc like the TT
 //!     (zobrist-indexed random access over MBs -> same dTLB story).
 //!
 //! Stats builds only (release builds fold it away): ZQ_EVAL_CACHE_MB overrides
-//! the table size (clamped [4, 256] MB) for sizing sweeps at fixed Hash.
+//! the table size (megabytes, up to 256) for sizing sweeps at fixed Hash.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -45,20 +46,17 @@ pub const experiment_overrides_enabled: bool = build_options.search_stats;
 /// Entries per set (one 64-byte line).
 pub const WAYS: usize = 8;
 
-/// Absolute table bounds (resize clamp). The wide 256MB ceiling exists for
-/// stats-build sizing sweeps; the SHIPPED size always comes from sizeForHash,
-/// whose own clamp below is much tighter.
-pub const MIN_CACHE_MB: u32 = 4;
-pub const MAX_CACHE_MB: u32 = 256;
+/// Absolute table bounds in kilobytes (resize clamp). The wide 256 MB ceiling
+/// exists for stats-build sizing sweeps; the SHIPPED size always comes from
+/// table_budget.zig, whose own bounds are much tighter.
+pub const MIN_CACHE_KB: u32 = 4;
+pub const MAX_CACHE_KB: u32 = 256 * 1024;
 
-/// Hash-derived sizing clamp (the shipped config): Hash/4 in [4, 64] MB.
-pub const HASH_DERIVED_MIN_MB: u32 = 4;
-pub const HASH_DERIVED_MAX_MB: u32 = 64;
-
-/// Key bits stored in an entry; the set index must supply the other 16.
+/// Key bits stored in an entry. The set index supplies at least
+/// MIN_INDEX_BITS more, and the other 16 from 4 MB up.
 const TAG_BITS = 48;
 const TAG_MASK: u64 = (@as(u64, 1) << TAG_BITS) - 1;
-const MIN_INDEX_BITS = 64 - TAG_BITS;
+const MIN_INDEX_BITS = 6;
 
 /// One line: entries most recently used first. An entry is
 /// `tag << 16 | (eval as u16)`; 0 is empty.
@@ -68,33 +66,32 @@ pub const Set = extern struct {
 
 comptime {
     std.debug.assert(@sizeOf(Set) == 64 and @alignOf(Set) == 64);
-    // The smallest table still has enough index bits for full-key equivalence.
-    std.debug.assert(std.math.log2_int(u64, setCountFor(MIN_CACHE_MB)) >= MIN_INDEX_BITS);
+    std.debug.assert(std.math.log2_int(u64, setCountFor(MIN_CACHE_KB)) >= MIN_INDEX_BITS);
 }
 
 pub const Occupancy = struct { filled: usize, total: usize };
 
 pub const EvalCache = struct {
     allocator: std.mem.Allocator,
-    configured_mb: u32 = 0,
+    configured_kb: u32 = 0,
     sets: []Set = &.{},
     /// How `sets` is backed; frees must go through hugealloc with this.
     alloc_method: hugealloc.Method = .heap,
     /// Right-shift that maps a key's HIGH bits onto [0, sets.len).
     index_shift: u6 = 63,
 
-    pub fn init(allocator: std.mem.Allocator, cache_mb: u32) !EvalCache {
+    pub fn init(allocator: std.mem.Allocator, cache_kb: u32) !EvalCache {
         var cache = EvalCache{ .allocator = allocator };
-        try cache.resize(cache_mb);
+        try cache.resize(cache_kb);
         if (comptime experiment_overrides_enabled) {
-            if (envU32(allocator, "ZQ_EVAL_CACHE_MB")) |mb| try cache.resize(mb);
+            if (envU32(allocator, "ZQ_EVAL_CACHE_MB")) |mb| try cache.resize(@as(u32, @min(mb, MAX_CACHE_KB / 1024)) * 1024);
         }
         return cache;
     }
 
     pub fn deinit(self: *EvalCache) void {
         hugealloc.free(Set, self.allocator, .{ .items = self.sets, .method = self.alloc_method });
-        self.configured_mb = 0;
+        self.configured_kb = 0;
         self.sets = &.{};
         self.alloc_method = .heap;
         self.index_shift = 63;
@@ -104,11 +101,11 @@ pub const EvalCache = struct {
         if (self.sets.len != 0) @memset(self.sets, .{});
     }
 
-    pub fn resize(self: *EvalCache, cache_mb: u32) !void {
-        const clamped_mb = std.math.clamp(cache_mb, MIN_CACHE_MB, MAX_CACHE_MB);
-        const new_len = setCountFor(clamped_mb);
+    pub fn resize(self: *EvalCache, cache_kb: u32) !void {
+        const clamped_kb = std.math.clamp(cache_kb, MIN_CACHE_KB, MAX_CACHE_KB);
+        const new_len = setCountFor(clamped_kb);
         if (self.sets.len == new_len) {
-            self.configured_mb = clamped_mb;
+            self.configured_kb = clamped_kb;
             self.clear();
             return;
         }
@@ -118,16 +115,16 @@ pub const EvalCache = struct {
         const backed = try hugealloc.alloc(Set, self.allocator, new_len);
         self.sets = backed.items;
         self.alloc_method = backed.method;
-        self.configured_mb = clamped_mb;
+        self.configured_kb = clamped_kb;
         const index_bits = std.math.log2_int(usize, new_len);
-        // Tag + index = the full 64-bit key (see the design notes).
+        // Tag + index verify at least 54 key bits (see the design notes).
         std.debug.assert(index_bits >= MIN_INDEX_BITS);
         self.index_shift = @intCast(@as(usize, 64) - index_bits);
         self.clear();
     }
 
-    pub fn cacheSizeMb(self: *const EvalCache) u32 {
-        return self.configured_mb;
+    pub fn cacheSizeKb(self: *const EvalCache) u32 {
+        return self.configured_kb;
     }
 
     pub fn assocWays(self: *const EvalCache) u8 {
@@ -198,21 +195,13 @@ inline fn moveToFront(set: *Set, slots: @Vector(WAYS, u64), way: u3, entry: u64)
     set.slots = @select(u64, moved, shifted, slots);
 }
 
-fn setCountFor(cache_mb: u32) usize {
-    const target_bytes = @as(u64, cache_mb) * 1024 * 1024;
+fn setCountFor(cache_kb: u32) usize {
+    const target_bytes = @as(u64, cache_kb) * 1024;
     const max_sets = @max(@as(u64, 1), target_bytes / @sizeOf(Set));
 
     var sets: u64 = 1;
     while ((sets << 1) <= max_sets) : (sets <<= 1) {}
     return @intCast(sets);
-}
-
-/// Cache size derived from UCI Hash: Hash/4, clamped to [4, 64] MB.
-pub fn sizeForHash(hash_mb: u32) u32 {
-    const quarter = hash_mb / 4;
-    if (quarter < HASH_DERIVED_MIN_MB) return HASH_DERIVED_MIN_MB;
-    if (quarter > HASH_DERIVED_MAX_MB) return HASH_DERIVED_MAX_MB;
-    return quarter;
 }
 
 fn envU32(allocator: std.mem.Allocator, name: []const u8) ?u32 {
@@ -222,7 +211,7 @@ fn envU32(allocator: std.mem.Allocator, name: []const u8) ?u32 {
 }
 
 test "eval cache stores and retrieves the raw eval" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
 
     try std.testing.expect(cache.probe(0xDEADBEEF) == null);
@@ -234,7 +223,7 @@ test "eval cache stores and retrieves the raw eval" {
 }
 
 test "eval cache verifies the full key: tag plus index bits" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
     try std.testing.expect(64 - @as(usize, cache.index_shift) >= MIN_INDEX_BITS);
 
@@ -252,7 +241,7 @@ test "eval cache verifies the full key: tag plus index bits" {
 }
 
 test "eval cache never caches a key with an all-zero tag" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
 
     try std.testing.expect(cache.probe(0) == null);
@@ -264,7 +253,7 @@ test "eval cache never caches a key with an all-zero tag" {
 }
 
 test "eval cache keeps eight keys per set and evicts the least recently used" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
 
     const base: u64 = 0x5A5A_0000_0000_0000;
@@ -283,7 +272,7 @@ test "eval cache keeps eight keys per set and evicts the least recently used" {
 }
 
 test "eval cache LRU order matches the scalar move-to-front reference" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
     var reference: [WAYS]u64 = [_]u64{0} ** WAYS;
     var prng = std.Random.DefaultPrng.init(0xe7a1_cac4);
@@ -324,7 +313,7 @@ test "eval cache LRU order matches the scalar move-to-front reference" {
 }
 
 test "eval cache clear and resize drop previous entries" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
 
     cache.store(0x42_0000_0000_0042, 17);
@@ -332,21 +321,24 @@ test "eval cache clear and resize drop previous entries" {
     try std.testing.expect(cache.probe(0x42_0000_0000_0042) == null);
 
     cache.store(0x42_0000_0000_0042, 17);
-    try cache.resize(MIN_CACHE_MB + 4);
+    try cache.resize(MIN_CACHE_KB * 2);
     try std.testing.expect(cache.probe(0x42_0000_0000_0042) == null);
 }
 
-test "hash-derived sizing clamps to [4, 64] MB" {
-    try std.testing.expectEqual(@as(u32, HASH_DERIVED_MIN_MB), sizeForHash(1));
-    try std.testing.expectEqual(@as(u32, HASH_DERIVED_MIN_MB), sizeForHash(8));
-    try std.testing.expectEqual(@as(u32, 8), sizeForHash(32));
-    try std.testing.expectEqual(@as(u32, 16), sizeForHash(64));
-    try std.testing.expectEqual(@as(u32, 64), sizeForHash(256));
-    try std.testing.expectEqual(@as(u32, HASH_DERIVED_MAX_MB), sizeForHash(4096));
+test "eval cache sizes are whole power-of-two set counts" {
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(usize, 64), cache.sets.len);
+    try std.testing.expectEqual(@as(u32, MIN_CACHE_KB), cache.cacheSizeKb());
+    try cache.resize(1);
+    try std.testing.expectEqual(@as(usize, 64), cache.sets.len);
+    try cache.resize(200);
+    try std.testing.expectEqual(@as(usize, 2048), cache.sets.len);
+    try std.testing.expectEqual(@as(usize, 65_536), setCountFor(4 * 1024));
 }
 
 test "occupancy counts filled entries" {
-    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_MB);
+    var cache = try EvalCache.init(std.testing.allocator, MIN_CACHE_KB);
     defer cache.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), cache.occupancy().filled);

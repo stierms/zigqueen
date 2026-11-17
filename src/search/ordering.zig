@@ -4,6 +4,7 @@ const move_mod = @import("../core/move.zig");
 const piece = @import("../core/piece.zig");
 const position = @import("../core/position.zig");
 const types = @import("../core/types.zig");
+const basin = @import("basin.zig");
 const history_mod = @import("history.zig");
 const see = @import("see.zig");
 
@@ -13,6 +14,23 @@ pub const Killers = struct {
 };
 
 const COUNTERMOVE_SCORE: i32 = 246_000;
+const LOSING_CAPTURE_TIER: i32 = 200_000;
+
+/// Killers and the countermove as bonuses in one quiet score (basin.Params
+/// order_*). `.{}` keeps them as fixed tiers.
+pub const QuietBonuses = struct {
+    unified: bool = false,
+    killer_a: i32 = 0,
+    killer_b: i32 = 0,
+    counter: i32 = 0,
+    /// The losing captures' level on the quiet scale.
+    losing_capture_base: i32 = 0,
+
+    pub inline fn init(params: *const basin.Params) QuietBonuses {
+        if (params.order_unified == 0) return .{};
+        return .{ .unified = true, .killer_a = params.order_killer_a_bonus, .killer_b = params.order_killer_b_bonus, .counter = params.order_counter_bonus, .losing_capture_base = params.order_losing_capture_base };
+    }
+};
 
 /// Outside the u16 move-pattern range: compares equal to no real move, so a
 /// null tt/killer/countermove needs no per-move tag test.
@@ -54,6 +72,7 @@ pub fn scoreMoves(
     history: *const history_mod.HistoryTable,
     cont: *const history_mod.ContContext,
     attacked: u64,
+    bonuses: QuietBonuses,
     noalias scores: *[move_mod.MAX_MOVES]i32,
     noalias capture_see_scores: ?*[move_mod.MAX_MOVES]i32,
 ) align(64) void { // align(64): pins hot entry placement (layout stability, not call speed)
@@ -85,7 +104,7 @@ pub fn scoreMoves(
     // The node's pins for capture SEE, taken at the first capture.
     var see_pins: ?see.Pins = null;
     for (list.slice(), 0..) |mv, idx| {
-        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows, attacked, &see_pins);
+        const scored = scoreMove(pos, mv, tt_raw, killer_a_raw, killer_b_raw, counter_raw, stm, quiet_rows, &cont_rows, attacked, bonuses, &see_pins);
         scores[idx] = scored.score;
         if (capture_see_scores) |see_scores| see_scores[idx] = scored.capture_see;
     }
@@ -284,6 +303,7 @@ inline fn scoreMove(
     quiet_rows: *const [4][6][64]i16,
     cont_rows: *const history_mod.ContRows,
     attacked: u64,
+    bonuses: QuietBonuses,
     see_pins: *?see.Pins,
 ) ScoredMove {
     // Move equality on the packed(u16) Move is bit equality, so the raw-vs-raw
@@ -306,7 +326,21 @@ inline fn scoreMove(
         if (see_score >= 0) {
             return .{ .score = 500_000 + tactical_score + @min(see_score, 1024), .capture_see = see_score };
         }
-        return .{ .score = 200_000 + see_score, .capture_see = see_score };
+        const losing_base: i32 = if (bonuses.unified) bonuses.losing_capture_base else LOSING_CAPTURE_TIER;
+        return .{ .score = losing_base + see_score, .capture_see = see_score };
+    }
+
+    if (bonuses.unified) {
+        // One score: the history sum, plus what being a killer or the
+        // countermove is worth.
+        const moving_piece = pos.pieceAt(mv.from);
+        const bucket = history_mod.quietBucket(attacked, mv);
+        const quiet_row: *const [64]i16 = &quiet_rows[bucket][@intFromEnum(moving_piece.pieceType())];
+        var score: i32 = @as(i32, quiet_row[@intFromEnum(mv.to)]) + cont_rows.total(history_mod.contKeyOfPiece(moving_piece, mv.to));
+        if (mv_raw == killer_a_raw) score += bonuses.killer_a;
+        if (mv_raw == killer_b_raw) score += bonuses.killer_b;
+        if (mv_raw == counter_raw) score += bonuses.counter;
+        return .{ .score = score };
     }
 
     if (mv_raw == killer_a_raw) return .{ .score = 250_000 };
@@ -382,7 +416,7 @@ test "tt move outranks other ordering terms" {
     var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     const history = history_mod.HistoryTable{};
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, move_mod.Move.init(.e2, .e4, .double_push), .{}, null, &history, &cont, 0, &scores, null);
+    scoreMoves(&pos, &moves, move_mod.Move.init(.e2, .e4, .double_push), .{}, null, &history, &cont, 0, .{}, &scores, null);
 
     const first = pickNext(&moves, &scores, null, 0);
     try std.testing.expectEqual(move_mod.Move.init(.e2, .e4, .double_push), first);
@@ -401,7 +435,7 @@ test "killer quiet outranks quiet history ordering" {
 
     var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, null, .{ .a = move_mod.Move.init(.h2, .h3, .quiet) }, null, &history, &cont, 0, &scores, null);
+    scoreMoves(&pos, &moves, null, .{ .a = move_mod.Move.init(.h2, .h3, .quiet) }, null, &history, &cont, 0, .{}, &scores, null);
 
     const first = pickNext(&moves, &scores, null, 0);
     try std.testing.expectEqual(move_mod.Move.init(.h2, .h3, .quiet), first);
@@ -422,10 +456,10 @@ test "countermove quiet outranks plain quiet history but stays below killers" {
 
     var scores: [move_mod.MAX_MOVES]i32 = [_]i32{0} ** move_mod.MAX_MOVES;
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, null, .{}, counter_move, &history, &cont, 0, &scores, null);
+    scoreMoves(&pos, &moves, null, .{}, counter_move, &history, &cont, 0, .{}, &scores, null);
     try std.testing.expect(scores[1] > scores[0]);
 
-    scoreMoves(&pos, &moves, null, .{ .a = history_move }, counter_move, &history, &cont, 0, &scores, null);
+    scoreMoves(&pos, &moves, null, .{ .a = history_move }, counter_move, &history, &cont, 0, .{}, &scores, null);
     try std.testing.expect(scores[0] > scores[1]);
 }
 
@@ -443,8 +477,36 @@ test "quiet ordering and countermove tie break use the moves threat bucket" {
     moves.add(mv);
     var scores: [move_mod.MAX_MOVES]i32 = undefined;
     const cont = history_mod.ContContext{};
-    scoreMoves(&pos, &moves, null, .{}, null, &history, &cont, map, &scores, null);
+    scoreMoves(&pos, &moves, null, .{}, null, &history, &cont, map, .{}, &scores, null);
     try std.testing.expectEqual(@as(i32, 800), scores[0]);
-    scoreMoves(&pos, &moves, null, .{}, mv, &history, &cont, map, &scores, null);
+    scoreMoves(&pos, &moves, null, .{}, mv, &history, &cont, map, .{}, &scores, null);
     try std.testing.expectEqual(COUNTERMOVE_SCORE + 200, scores[0]);
+}
+
+test "one quiet score: a strong history passes a killer, the bonuses add up" {
+    const fen = @import("../core/fen.zig");
+    const pos = try fen.startpos();
+    var moves = move_mod.MoveList.init();
+    const plain = move_mod.Move.init(.a2, .a3, .quiet);
+    const killer = move_mod.Move.init(.h2, .h3, .quiet);
+    moves.add(plain);
+    moves.add(killer);
+    var history = history_mod.HistoryTable{};
+    history.adjustMain(.white, .pawn, .a3, 30_000, 0);
+    const cont = history_mod.ContContext{};
+    var scores: [move_mod.MAX_MOVES]i32 = undefined;
+    var params = basin.Params{};
+    params.order_unified = 0;
+    // Tiers: the killer is first whatever the history says.
+    scoreMoves(&pos, &moves, null, .{ .a = killer }, null, &history, &cont, 0, QuietBonuses.init(&params), &scores, null);
+    try std.testing.expect(scores[1] > scores[0]);
+    params.order_unified = 1;
+    params.order_killer_a_bonus = 20_000;
+    params.order_counter_bonus = 15_000;
+    scoreMoves(&pos, &moves, null, .{ .a = killer }, null, &history, &cont, 0, QuietBonuses.init(&params), &scores, null);
+    try std.testing.expectEqual(@as(i32, 30_000), scores[0]);
+    try std.testing.expectEqual(@as(i32, 20_000), scores[1]);
+    // Killer and countermove at once: both bonuses.
+    scoreMoves(&pos, &moves, null, .{ .a = killer }, killer, &history, &cont, 0, QuietBonuses.init(&params), &scores, null);
+    try std.testing.expectEqual(@as(i32, 35_000), scores[1]);
 }

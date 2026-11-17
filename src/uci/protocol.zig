@@ -669,7 +669,7 @@ fn moveMatchesUci(mv: move_mod.Move, move_text: []const u8) bool {
 
 const TestOutput = struct {
     mutex: runtime.Mutex = .{},
-    buffer: [8192]u8 = [_]u8{0} ** 8192,
+    buffer: [16384]u8 = [_]u8{0} ** 16384,
     len: usize = 0,
 
     fn sink(self: *TestOutput) worker_mod.OutputSink {
@@ -730,12 +730,12 @@ test "handleCommand writes uci handshake" {
     };
     for (built_in_names) |name| try expectAdvertisedOption(out, name, true);
 
-    try std.testing.expectEqual(@as(usize, 39), tunables.specs.len);
+    try std.testing.expectEqual(@as(usize, 90), tunables.specs.len);
     for (tunables.specs) |spec| try expectAdvertisedOption(out, spec.uci_name, build_options.tuning);
-    try std.testing.expectEqual(@as(usize, 63), basin.specs.len);
+    try std.testing.expectEqual(@as(usize, 77), basin.specs.len);
     for (basin.specs) |spec| try expectAdvertisedOption(out, spec.uci_name, build_options.tuning);
 
-    const expected_count: usize = if (build_options.tuning) 8 + 39 + 63 else 8;
+    const expected_count: usize = if (build_options.tuning) 8 + tunables.specs.len + basin.specs.len else 8;
     try std.testing.expectEqual(expected_count, std.mem.count(u8, out, "option name "));
     try std.testing.expect(std.mem.indexOf(u8, out, "uciok") != null);
 }
@@ -800,12 +800,12 @@ test "a failed Hash or Threads change is reported and rolled back" {
     defer state.deinit();
     const engine = &state.worker.coordinator.engine;
 
-    // Hash: the new table's allocation fails (a 2 MB table goes through the
+    // Hash: the new table's allocation fails (a 1 MB table goes through the
     // TT's own allocator, as in engine.zig's real-allocator failure test).
     const tt_allocator = engine.tt.allocator;
     var failing_tt = std.testing.FailingAllocator.init(tt_allocator, .{ .fail_index = 0 });
     engine.tt.allocator = failing_tt.allocator();
-    const hash_result = handleCommand(&state, "setoption name Hash value 2");
+    const hash_result = handleCommand(&state, "setoption name Hash value 1");
     engine.tt.allocator = tt_allocator;
     try std.testing.expect(!try hash_result);
     try std.testing.expect(failing_tt.has_induced_failure);
@@ -824,7 +824,7 @@ test "a failed Hash or Threads change is reported and rolled back" {
     try std.testing.expectEqual(@as(u8, 1), state.worker.threads());
 
     try std.testing.expectEqualStrings(
-        "info string Hash 2 could not be applied (OutOfMemory); keeping 256\n" ++
+        "info string Hash 1 could not be applied (OutOfMemory); keeping 256\n" ++
             "info string Threads 2 could not be applied (OutOfMemory); keeping 1\n",
         output.contents(),
     );
@@ -851,7 +851,7 @@ test "a failed Hash or Threads change is rolled back even when its notice cannot
     const tt_allocator = engine.tt.allocator;
     var failing_tt = std.testing.FailingAllocator.init(tt_allocator, .{ .fail_index = 0 });
     engine.tt.allocator = failing_tt.allocator();
-    const hash_result = handleCommand(&state, "setoption name Hash value 2");
+    const hash_result = handleCommand(&state, "setoption name Hash value 1");
     engine.tt.allocator = tt_allocator;
     try std.testing.expectError(error.BrokenPipe, hash_result);
     try std.testing.expectEqual(@as(u32, 256), state.options.hash_mb);
@@ -991,6 +991,33 @@ test "go depth returns a legal move instead of 0000 in start position" {
     const out = output.contents();
     try std.testing.expect(std.mem.indexOf(u8, out, "bestmove 0000") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bestmove ") != null);
+}
+
+test "a stop, a position or a quit directly behind go still answers a searched move" {
+    // U-STOP-D1 for stop requests: the request reaches the worker before the
+    // search has visited a node. White wins the queen on g5; the first
+    // generated move does not. Whether the request arrives before the worker
+    // has entered the search is a race this test does not control (it must
+    // pass either way); the deterministic witnesses enter the search with the
+    // request already set: engine.zig for one thread, parallel_pool.zig for
+    // several.
+    for ([_][]const u8{ "stop", "position startpos", "quit" }) |follow| {
+        for ([_]u8{ 1, 2 }) |threads| {
+            for ([_][]const u8{ "go wtime 8000 btime 8000 winc 80 binc 80", "go infinite" }) |go| {
+                var output = TestOutput{};
+                var state: UciState = undefined;
+                try state.init(output.sink());
+                defer state.deinit();
+
+                if (threads == 2) try std.testing.expect(!try handleCommand(&state, "setoption name Threads value 2"));
+                try std.testing.expect(!try handleCommand(&state, "position fen rnb1kbnr/pppp1ppp/8/4p1q1/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"));
+                try std.testing.expect(!try handleCommand(&state, go));
+                _ = try handleCommand(&state, follow);
+                state.worker.waitIdle();
+                try std.testing.expectEqualStrings("f3g5", bestMoveText(output.contents()).?);
+            }
+        }
+    }
 }
 
 test "go searchmoves restricts start position to the listed legal moves" {

@@ -12,10 +12,15 @@ pub const History = struct {
     /// of the same side to move and score a draw that no legal line reaches.
     /// Cycles wholly after the pass still count.
     floor: usize = 0,
+    /// Index of the search root's key; the engine sets it when a search
+    /// starts. Keys below it are the game's history, keys from it on the line
+    /// being searched (`repeatsOnlyBeforeRoot`).
+    root: usize = 0,
 
     pub fn clear(self: *History) void {
         self.count = 0;
         self.floor = 0;
+        self.root = 0;
     }
 
     /// Push the key of a null-move child and hide every earlier key from the
@@ -49,10 +54,10 @@ pub const History = struct {
         return self.keys[self.count - 1];
     }
 
-    // Search-style repetition detection: treat the current node as drawn once the
-    // same side-to-move key has already appeared earlier inside the reversible window.
-    // This is intentionally "one prior occurrence is enough" rather than a strict
-    // game-history threefold claim test.
+    // Search-style repetition detection: the same side-to-move key has already
+    // appeared earlier inside the reversible window. One prior occurrence is
+    // enough for this predicate; the search then asks `repeatsOnlyBeforeRoot`
+    // whether that makes the node a draw or only lets the side to move take one.
     //
     // Same predicate as currentPriorOccurrenceCount(...) != 0, as an early-exit
     // scan. The counting form is a reduction LLVM vectorizes (strided gathers,
@@ -70,6 +75,43 @@ pub const History = struct {
             if (self.keys[self.count - 1 - back] == current_key) return true;
         }
         return false;
+    }
+
+    /// For a key `isRepetitionForKey` accepted: true when its only earlier
+    /// occurrence in the reversible window lies before the search root.
+    ///
+    /// A position that returns to one of the search line itself (the root
+    /// included) is a cycle both sides chose inside the search, and a third
+    /// occurrence is a claimable draw: both stay draws. A second occurrence
+    /// whose first is a game-history position is neither. Nobody can claim it,
+    /// and either side may leave the cycle: after `7k/8/5KQ1/8/8/8/8/8 w` and
+    /// Qh6+ Kg8 Qg6+, the reply Kh8 repeats the start position, where White
+    /// mates with Qg7 instead of repeating (code-read finding 4, 2026-11-10).
+    /// With the root side's opponent to move, the search scores such a node as
+    /// the better of a draw and its search value (root.searchTwofold): the
+    /// opponent takes the draw when it is worse off, so the root side still
+    /// avoids walking back into old positions when it is ahead, but it no
+    /// longer counts on a draw the opponent can decline. With the root side
+    /// to move the node stays a draw: the root side does not count on more
+    /// than a draw once the opponent can return to an old position, which is
+    /// the other half of what keeps a won game moving. Searching both kinds
+    /// cost conversion (52.8% against 54.1% at 5k nodes, 906 games); this
+    /// form keeps it (54.4%).
+    pub fn repeatsOnlyBeforeRoot(self: *const History, key: u64, halfmove_clock: u16) bool {
+        // Same window and stride as isRepetition / isRepetitionKey.
+        const pushed = self.count != 0 and self.current() == key;
+        const top = if (pushed) self.count - 1 else self.count;
+        if (top < 2 or top < self.floor) return false;
+        const max_back = @min(@as(usize, halfmove_clock), top - self.floor);
+        var matches: usize = 0;
+        var back: usize = 2;
+        while (back <= max_back) : (back += 2) {
+            const index = top - back;
+            if (self.keys[index] != key) continue;
+            if (index >= self.root) return false;
+            matches += 1;
+        }
+        return matches == 1;
     }
 
     // Root adjudication must be stricter than interior search nodes. A root position
@@ -170,6 +212,49 @@ test "history detects repeated side-to-move keys" {
     history.push(1);
 
     try std.testing.expect(history.isRepetition(4));
+}
+
+test "a single earlier occurrence before the root is told apart from a cycle and a third occurrence" {
+    var history = History{};
+    // Game history 1 2 3 4, root at key 5 (index 4).
+    for ([_]u64{ 1, 2, 3, 4, 5 }) |key| history.push(key);
+    history.root = 4;
+    // The search plays into key 2 and then key 1: second occurrence of a game position.
+    history.push(2);
+    history.push(1);
+    try std.testing.expect(history.isRepetitionForKey(1, 8));
+    try std.testing.expect(history.repeatsOnlyBeforeRoot(1, 8));
+    // Not pushed yet: the same answer for the child key.
+    history.pop();
+    try std.testing.expect(history.isRepetitionForKey(1, 8));
+    try std.testing.expect(history.repeatsOnlyBeforeRoot(1, 8));
+    history.push(1);
+    // The search line returns to the root's key: a cycle inside the search.
+    history.push(6);
+    history.push(5);
+    try std.testing.expect(history.isRepetitionForKey(5, 8));
+    try std.testing.expect(!history.repeatsOnlyBeforeRoot(5, 8));
+    // A key the search line itself already visited (index 6) and the game too (index 0).
+    history.push(7);
+    history.push(1);
+    try std.testing.expect(!history.repeatsOnlyBeforeRoot(1, 10));
+
+    // Two game-history occurrences: the third occurrence is claimable.
+    var third = History{};
+    for ([_]u64{ 1, 2, 1, 2, 3 }) |key| third.push(key);
+    third.root = 4;
+    third.push(4);
+    third.push(1);
+    try std.testing.expect(third.isRepetitionForKey(1, 8));
+    try std.testing.expect(!third.repeatsOnlyBeforeRoot(1, 8));
+    // Outside the reversible window the older occurrence does not count.
+    try std.testing.expect(third.repeatsOnlyBeforeRoot(1, 4));
+
+    // Without a root set (root 0) every occurrence is part of the search line.
+    var plain = History{};
+    for ([_]u64{ 1, 2, 1 }) |key| plain.push(key);
+    try std.testing.expect(plain.isRepetitionForKey(1, 4));
+    try std.testing.expect(!plain.repeatsOnlyBeforeRoot(1, 4));
 }
 
 test "claimable current repetition requires two prior same-side occurrences" {

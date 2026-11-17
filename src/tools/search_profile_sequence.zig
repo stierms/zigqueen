@@ -23,9 +23,7 @@ pub fn runFileWithOptions(writer: anytype, path: []const u8, depth: u16, eval_op
         "index\tdepth\tscore\tnodes\tqnodes\tmain_static_evals\treverse_futility_prunes\t" ++
             "quiet_futility_prunes\tlate_move_prunes\tbad_capture_prunes\tnull_tries\tnull_cutoffs\t" ++
             "lmr_reductions\tlmr_researches\tmain_bad_capture_cutoffs\tmain_quiet_cutoffs\t" ++
-            "qsearch_bad_capture_cutoffs\trfp_hint_probes\trfp_hint_cutoffs\t" ++
-            "rfp_hint_cutoffs_depth_1\trfp_hint_cutoffs_depth_2\trfp_hint_cutoffs_depth_3\t" ++
-            "rfp_hint_alpha_raises\tbestmove\thashfull\ttt_probes\ttt_hits\t" ++
+            "qsearch_bad_capture_cutoffs\tbestmove\thashfull\ttt_probes\ttt_hits\t" ++
             "tt_hit_current_generation\ttt_hit_old_generation\ttt_hit_age_1\ttt_hit_age_2_3\t" ++
             "tt_hit_age_4p\ttt_hit_with_move\ttt_hit_without_move\ttt_cutoffs\t" ++
             "tt_cutoffs_current_generation\ttt_cutoffs_old_generation\ttt_ordering_only_hits\t" ++
@@ -58,7 +56,7 @@ pub fn runFileWithOptions(writer: anytype, path: []const u8, depth: u16, eval_op
         var move_buffer: [5]u8 = undefined;
         const bestmove = if (result.best_move) |mv| mv.toUci(&move_buffer) else "0000";
         try writer.print(
-            "{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t",
+            "{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t",
             .{
                 index,
                 result.depth,
@@ -77,12 +75,6 @@ pub fn runFileWithOptions(writer: anytype, path: []const u8, depth: u16, eval_op
                 stats.main_bad_capture_cutoffs,
                 stats.main_quiet_cutoffs,
                 stats.qsearch_bad_capture_cutoffs,
-                stats.rfp_hint_probes,
-                stats.rfp_hint_cutoffs,
-                stats.rfp_hint_cutoffs_depth_1,
-                stats.rfp_hint_cutoffs_depth_2,
-                stats.rfp_hint_cutoffs_depth_3,
-                stats.rfp_hint_alpha_raises,
             },
         );
         try writer.print(

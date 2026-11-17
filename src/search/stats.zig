@@ -68,7 +68,115 @@ pub const zero_move_order_detail_score_sums: MoveOrderDetailScoreSums = [_][MOVE
     [_][MOVE_ORDER_BUCKET_COUNT]i64{[_]i64{0} ** MOVE_ORDER_BUCKET_COUNT} ** MOVE_ORDER_DEPTH_BAND_COUNT,
 } ** MOVE_ORDER_NODE_TYPE_COUNT;
 
+/// Counters of the extension rules and the switch rules (only_move.zig,
+/// extension_bound.zig, switch_confirm.zig); the grids are by node type
+/// (pv, cut, all) and node depth band.
+pub const ONLY_MOVE_DEPTH_BAND_NAMES = [_][]const u8{ "d2_5", "d6_7", "d8_10", "d11_14", "d15p" };
+pub const ONLY_MOVE_DEPTH_BAND_COUNT: usize = ONLY_MOVE_DEPTH_BAND_NAMES.len;
+pub const OnlyMoveGrid = [MOVE_ORDER_NODE_TYPE_COUNT][ONLY_MOVE_DEPTH_BAND_COUNT]u64;
+pub const zero_only_move_grid: OnlyMoveGrid = [_][ONLY_MOVE_DEPTH_BAND_COUNT]u64{[_]u64{0} ** ONLY_MOVE_DEPTH_BAND_COUNT} ** MOVE_ORDER_NODE_TYPE_COUNT;
+
+pub fn onlyMoveDepthBand(depth: u16) usize {
+    if (depth <= 5) return 0;
+    if (depth <= 7) return 1;
+    if (depth <= 10) return 2;
+    if (depth <= 14) return 3;
+    return 4;
+}
+
+/// Counters of the quiescence move rules (qs_rules.zig). A candidate is a
+/// move a rule's test names, counted whether the switch is on (the move is
+/// skipped) or off (it is searched, and a raise of the node's best value
+/// counts as a miss). The futility grids are by late endgame (0 no, 1 yes;
+/// the rule itself stays off there) and victim class.
+pub const QsFutilityGrid = [2][4]u64;
+pub const zero_qs_futility_grid: QsFutilityGrid = [_][4]u64{[_]u64{0} ** 4} ** 2;
+pub const QS_EQUAL_BAND_MARGINS = [_]i32{ 0, 100, 200, 300, 450 };
+pub const QS_EQUAL_BAND_COUNT: usize = QS_EQUAL_BAND_MARGINS.len;
+pub const QsEqualBands = [QS_EQUAL_BAND_COUNT]u64;
+/// A first-ply node's path to its quiet checks: no capture or promotion to
+/// try (`empty`), stand-pat within the margin of alpha (`near`), further
+/// below with the enemy king boxed in by a side with a queen (`far_boxed`),
+/// further below otherwise (`far_open`).
+pub const QS_CHECK_PATH_NAMES = [_][]const u8{ "empty", "near", "far_boxed", "far_open" };
+pub const QS_CHECK_PATH_COUNT: usize = QS_CHECK_PATH_NAMES.len;
+pub const QsCheckPaths = [QS_CHECK_PATH_COUNT]u64;
+pub const QsRuleStats = struct {
+    /// Captures that are not promotions, outside check, past the exchange test.
+    captures: u64 = 0,
+    captures_searched: u64 = 0,
+    capture_raises: u64 = 0,
+    capture_nodes: u64 = 0,
+    fut_candidates: QsFutilityGrid = zero_qs_futility_grid,
+    fut_searched: QsFutilityGrid = zero_qs_futility_grid,
+    fut_misses: QsFutilityGrid = zero_qs_futility_grid,
+    fut_nodes: QsFutilityGrid = zero_qs_futility_grid,
+    /// The same for the candidates that give check.
+    fut_check_candidates: QsFutilityGrid = zero_qs_futility_grid,
+    fut_check_searched: QsFutilityGrid = zero_qs_futility_grid,
+    fut_check_misses: QsFutilityGrid = zero_qs_futility_grid,
+    fut_skipped: u64 = 0,
+    /// Captures whose exchange value is exactly 0 (the table move's is not
+    /// computed and it is not among them), outside late endgames; `far` by
+    /// the distance of the stand-pat below the best value: any, 100, 200,
+    /// 300, 450 or more.
+    equal_captures: u64 = 0,
+    equal_far_searched: QsEqualBands = [_]u64{0} ** QS_EQUAL_BAND_COUNT,
+    equal_far_misses: QsEqualBands = [_]u64{0} ** QS_EQUAL_BAND_COUNT,
+    equal_far_nodes: QsEqualBands = [_]u64{0} ** QS_EQUAL_BAND_COUNT,
+    equal_skipped: u64 = 0,
+    /// En passant captures the equal-exchange test would name on their 0,
+    /// which is not a computed exchange value: the rule leaves them alone.
+    equal_en_passant_kept: u64 = 0,
+    /// Promotions outside check: all searched, the knight's, and the rook's
+    /// and bishop's (`under`), with raises of the best value and subtree nodes.
+    promotions_searched: u64 = 0,
+    knight_promotions_searched: u64 = 0,
+    knight_promotion_raises: u64 = 0,
+    under_searched: u64 = 0,
+    under_raises: u64 = 0,
+    under_nodes: u64 = 0,
+    under_skipped: u64 = 0,
+    /// Quiet checks of the first quiescence ply, by the node's path through
+    /// the gate (QS_CHECK_PATH_NAMES): searched, raises of the best value,
+    /// subtree nodes; and the nodes on each path, gated or not.
+    check_stage_nodes: QsCheckPaths = [_]u64{0} ** QS_CHECK_PATH_COUNT,
+    checks_searched: QsCheckPaths = [_]u64{0} ** QS_CHECK_PATH_COUNT,
+    check_raises: QsCheckPaths = [_]u64{0} ** QS_CHECK_PATH_COUNT,
+    check_nodes: QsCheckPaths = [_]u64{0} ** QS_CHECK_PATH_COUNT,
+    check_gated_nodes: u64 = 0,
+    check_fail_low_stops: u64 = 0,
+};
+
+pub const OnlyMoveStats = struct {
+    /// Verification searches run.
+    verified: OnlyMoveGrid = zero_only_move_grid,
+    /// ... that found the hash move to be the only move: +1, +2.
+    single: OnlyMoveGrid = zero_only_move_grid,
+    double: OnlyMoveGrid = zero_only_move_grid,
+    /// ... that ended the node on a second refutation.
+    cut: OnlyMoveGrid = zero_only_move_grid,
+    /// ... that shortened a hash move which is not the only good one.
+    shortened: OnlyMoveGrid = zero_only_move_grid,
+    /// Nodes searched inside verification searches.
+    verify_nodes: OnlyMoveGrid = zero_only_move_grid,
+    verified_in_check: u64 = 0,
+    /// Extensions trimmed by the bound on accumulated extension.
+    capped: u64 = 0,
+    /// Extensions granted, by rule: check, LDSE, verified.
+    ext_check: u64 = 0,
+    ext_ldse: u64 = 0,
+    ext_verified: u64 = 0,
+    root_confirms: u64 = 0,
+    root_confirms_rejected: u64 = 0,
+    root_displaced_scouts: u64 = 0,
+    root_displaced_returns: u64 = 0,
+    pv_confirms: u64 = 0,
+    pv_confirms_rejected: u64 = 0,
+};
+
 pub const SearchStats = struct {
+    only_move: OnlyMoveStats = .{},
     /// Depth-0 entries that the legacy negamax wrapper and qsearch both counted.
     /// This is a functional exception to the diagnostic-only stats below: root
     /// ordering adds it back to honest nodes to preserve its legacy effort scale.
@@ -86,12 +194,6 @@ pub const SearchStats = struct {
     check_extensions: u64 = 0,
     hindsight_depth_extensions: u64 = 0,
     hindsight_depth_reductions: u64 = 0,
-    rfp_hint_probes: u64 = 0,
-    rfp_hint_cutoffs: u64 = 0,
-    rfp_hint_cutoffs_depth_1: u64 = 0,
-    rfp_hint_cutoffs_depth_2: u64 = 0,
-    rfp_hint_cutoffs_depth_3: u64 = 0,
-    rfp_hint_alpha_raises: u64 = 0,
     // Raw-eval cache (perf-r11). Probes happen ONLY after a TT static-eval
     // miss, so hits/probes IS the hit-after-TT-miss rate.
     eval_cache_probes: u64 = 0,
@@ -103,6 +205,9 @@ pub const SearchStats = struct {
     bad_capture_prunes: u64 = 0,
     tt_probes: u64 = 0,
     tt_hits: u64 = 0,
+    /// Hits on an entry of another position with the same cluster and tag
+    /// (stats flavour, serial table: tt.Entry.foreign).
+    tt_foreign_hits: u64 = 0,
     tt_hit_current_generation: u64 = 0,
     tt_hit_old_generation: u64 = 0,
     tt_hit_age_1: u64 = 0,
@@ -274,6 +379,45 @@ pub const SearchStats = struct {
     singular_verifications: u64 = 0,
     singular_verified: u64 = 0,
     singular_extensions: u64 = 0,
+    /// Of those, extensions by two plies (sweep_sing_double_margin).
+    singular_double_extensions: u64 = 0,
+    /// Nodes cut by the singular test's multicut.
+    singular_multicuts: u64 = 0,
+    /// Verification searches at PV nodes / at expected all nodes (sweep_sing_pv, sweep_sing_all).
+    singular_pv_verifications: u64 = 0,
+    singular_all_verifications: u64 = 0,
+    /// Root iterations in which the move that repeats the game's earlier
+    /// cycle asked for the tie-break against an equal draw score, and those
+    /// in which its search below the draw refused it (root.zig).
+    root_cycle_tie_asked: u64 = 0,
+    root_cycle_tie_refused: u64 = 0,
+    root_cycle_tie_granted: u64 = 0,
+    /// Nodes of those searches.
+    root_cycle_tie_nodes: u64 = 0,
+    // The table's score against the static value (tt_eval.zig), counted
+    // whatever the switches. Main search, nodes outside check:
+    /// nodes with a static eval;
+    tt_eval_nodes: u64 = 0,
+    /// of them with an entry whose score is not decisive (no excluded move);
+    tt_eval_entries: u64 = 0,
+    /// of them where the bound contradicts the static value (the score is taken), and the sum of the distances;
+    tt_eval_differs: u64 = 0,
+    tt_eval_distance: u64 = 0,
+    /// of those by more than 50, and those resting on a quiescence entry (depth 0 or less);
+    tt_eval_differs_50: u64 = 0,
+    tt_eval_differs_qs_entry: u64 = 0,
+    /// zero-window nodes: static value below beta under a lower bound at or above beta / static value at or above beta over an upper or exact score below beta;
+    tt_eval_lower_over_beta: u64 = 0,
+    tt_eval_upper_under_beta: u64 = 0,
+    /// reverse futility: cuts on the static value / cuts only the table's score makes / cuts the table's score refuses.
+    tt_eval_rfp_static: u64 = 0,
+    tt_eval_rfp_gained: u64 = 0,
+    tt_eval_rfp_refused: u64 = 0,
+    /// Quiescence, nodes outside check: nodes / the score is taken / stand-pat cutoffs gained / refused.
+    tt_eval_qs_nodes: u64 = 0,
+    tt_eval_qs_differs: u64 = 0,
+    tt_eval_qs_gained: u64 = 0,
+    tt_eval_qs_refused: u64 = 0,
     pvs_scouts: u64 = 0,
     pvs_researches: u64 = 0,
     aspiration_researches: u64 = 0,
@@ -291,6 +435,7 @@ pub const SearchStats = struct {
     qsearch_tactical_nodes: u64 = 0,
     qsearch_tactical_moves: u64 = 0,
     qsearch_bad_capture_skips: u64 = 0,
+    qs_rules: QsRuleStats = .{},
     static_search_residual_nodes: StaticSearchResidualCounters = [_]u64{0} ** STATIC_SEARCH_RESIDUAL_BUCKET_COUNT,
     static_search_residual_exact: StaticSearchResidualCounters = [_]u64{0} ** STATIC_SEARCH_RESIDUAL_BUCKET_COUNT,
     static_search_residual_lower: StaticSearchResidualCounters = [_]u64{0} ** STATIC_SEARCH_RESIDUAL_BUCKET_COUNT,

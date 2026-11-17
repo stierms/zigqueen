@@ -183,7 +183,7 @@ index c62b507e4de9f48adf08be9c118c23c72fd9bdd9..a7b2ccdc3d43ef1b680e373209481c48
  [dependencies]
 +serde_json = "1"
 +sha2 = "0.10.9"
-+zq-bt4-loader = { path = "/home/mstie/projects/zq-bt4-prefetch-20260914/tools/bt4-loader" }
++zq-bt4-loader = { path = "/path/to/zq-bt4-prefetch-20260914/tools/bt4-loader" }
  bullet-compiler = { workspace = true }
  bullet-gpu = { workspace = true }
  bullet-trainer = { workspace = true }

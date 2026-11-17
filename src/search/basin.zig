@@ -29,6 +29,9 @@ pub const HISTORY_PRUNE_LMRDEPTH_MAX: i32 = defaults.history_prune_lmr_depth_max
 pub const FUTILITY_LMRDEPTH_MAX: i32 = defaults.futility_lmr_depth_max;
 pub const FUTILITY_ALPHA_CAP: i32 = defaults.futility_alpha_cap;
 pub const SEE_PRUNE_QUIETS = true;
+/// `progress_floor` at this value switches the clock pressure off exactly: no
+/// ordinary eval lies beyond it (score.ORDINARY_SCORE_LIMIT is below).
+pub const PROGRESS_FLOOR_OFF: i32 = 30_000;
 pub const ASPIRATION_INITIAL_CP: i32 = 8;
 
 const LMR_MAX_D: usize = 64;
@@ -91,6 +94,31 @@ pub const Params = struct {
     history_malus_offset: i32 = -245,
     history_malus_cap: i32 = 1027,
 
+    // Killers and countermove as bonuses in one quiet score. With
+    // order_unified at 1 a quiet's order score is its history sum plus these
+    // bonuses for being killer A, killer B or the countermove (they add up
+    // for a move that is two of them), so a quiet with strong history can
+    // pass a stale killer and the countermove is no longer tried behind both
+    // killers; at 0 the three are fixed tiers above every other quiet. The
+    // bonuses follow the measured cut rate per try (countermove 28 to 30%,
+    // killer A 23%, killer B 8%, a plain quiet 2%) on the scale of one
+    // table's range of 32,000. One score needs a level for losing captures,
+    // which the tiers put between the countermove and the other quiets:
+    // order_losing_capture_base plus the exchange value, behind a killer or
+    // countermove without bad history and ahead of a quiet whose history sum
+    // is below it. The pruning exemptions of killers are unchanged. On by
+    // default since its direct test (cell `ord-one`).
+    order_unified: i32 = 1,
+    order_killer_a_bonus: i32 = 40000,
+    order_killer_b_bonus: i32 = 16000,
+    order_counter_bonus: i32 = 48000,
+    order_losing_capture_base: i32 = 12000,
+    /// The countermove is also kept and read after a capture or promotion,
+    /// keyed by the piece that moved and its square (at 0 it exists only
+    /// after a quiet move): the reply to a capture is the most forced reply
+    /// there is. On by default since its direct test (cell `counter-capt`).
+    counter_after_capture: i32 = 1,
+
     research_base: i32 = 44,
     research_per_depth: i32 = 4,
     lmr_tt_pv_brake: i32 = -886,
@@ -123,6 +151,81 @@ pub const Params = struct {
     unc_rfp: i32 = 8,
     unc_futility: i32 = 7,
     lmr_complexity_coeff: i32 = 10,
+
+    // A bare king against pawnless mating material: centipawns per step the
+    // bare king is from the centre (twice) and per step the kings are closer
+    // (progress.bareKingBonus). Elementary endings at 5k nodes against SF19:
+    // 55 of 80 won without, 66 with 5, 74 with 10.
+    bare_king_unit: i32 = 10,
+
+    // Clock pressure on the side that is ahead (round 2, item 3). While a
+    // pawn is on the board, the part of the eval beyond progress_floor that
+    // favours the root side loses halfmove clock / progress_clock_span of
+    // itself: a pawn move or capture, which resets the clock, is worth more
+    // to the side that has to win than waiting. The network's eval ignores
+    // the clock, so a won position was worth the same after 40 moves of
+    // shuffling as after progress. Evals that favour the root side's opponent
+    // lose progress_defender_pct percent of that amount: 0 keeps the root
+    // side's view of its own bad positions exactly as the network gives it
+    // (damping both sides alike made the engine defend worse, round 1);
+    // 100 is the symmetric form. PROGRESS_FLOOR_OFF switches the term off.
+    // The term acts only in a search whose root is ahead for the root side by
+    // progress_root_gate: the game's last search, of which this one is the
+    // successor (predecessor.zig), ended at or above it. Decided before the
+    // search, so the term is on for a whole search or not at all. A search
+    // of a game that has not been ahead is exactly the search without the
+    // term. Without the
+    // gate the term also touched won lines deep in the trees of level
+    // positions; that changed nothing measurable in play but made nearly
+    // half of all games differ from the base's, so its effect could not be
+    // told from noise. A gate of -30000 opens after any completed search.
+    // progress_root_leave: once on, the term stays on until the game's last
+    // search ended below this. With one line for both, a score that moves
+    // 2.90, 3.10, 2.95, 3.05 changes the search's table context
+    // (progress.TableContext) at every move, and a search that starts in
+    // another context than the last finds none of its entries: x1.6 to x1.7
+    // nodes to the same depth, 0.8 to 1.1 plies less at 100k nodes, four
+    // fifths of the cost of an empty table. In the stack's pool games at 100k
+    // 0.32% of all searches started that way and 44% of those changes were
+    // undone within two searches; a leave line of 200 removes those. Equal
+    // to the gate (or above it) it is the single line again.
+    progress_clock_span: i32 = 150,
+    progress_floor: i32 = 300,
+    progress_defender_pct: i32 = 0,
+    progress_root_gate: i32 = 300,
+    progress_root_leave: i32 = 200,
+    // A searched score under the pressure also depends on the halfmove clock
+    // of its node, which the position key does not hold: the same position
+    // reached by a longer manoeuvre has a higher clock. The table keeps
+    // pressure-on entries apart by clock in buckets of this many plies
+    // (progress.TableContext), so a bound is reused only at a clock of the
+    // same bucket: one reuse is then off by about (bucket - 1) /
+    // progress_clock_span of what exceeds the floor at most (an estimate of
+    // size, not a guarantee). 128 is one bucket for every clock (no
+    // separation).
+    progress_clock_bucket: i32 = 16,
+
+    // draw_dither (vol-frame 15): with Contempt 0 an in-tree draw
+    // (context.drawScore: repetition, fifty moves, stalemate) scores +D or -D
+    // by bit 1 of the thread's node counter instead of exactly 0, from the
+    // side to move's view. The root's cycle tie-break then takes |score| <= D
+    // for a draw (root.cycleTieAsked). 0 = exact 0 (the engine before
+    // 2026-11-16); 1 since.
+    draw_dither: i32 = 1,
+
+    /// The eval (side to move's view) under the clock pressure; `mover_is_root`
+    /// says whether the side to move is the root side.
+    pub inline fn clockPressure(self: *const Params, eval: i32, halfmove_clock: u16, mover_is_root: bool) i32 {
+        const magnitude: i32 = @intCast(@abs(eval));
+        if (magnitude <= self.progress_floor) return eval;
+        const ahead_is_root = (eval > 0) == mover_is_root;
+        const pct: i32 = if (ahead_is_root) 100 else self.progress_defender_pct;
+        if (pct == 0) return eval;
+        const clock: i32 = @min(@as(i32, halfmove_clock), 100);
+        const cut = @divTrunc((magnitude - self.progress_floor) * clock * pct, self.progress_clock_span * 100);
+        const damped = magnitude - cut;
+        return if (eval > 0) damped else -damped;
+    }
 
     inline fn scalePublished(self: *const Params, value: i32) i32 {
         return @divTrunc(value * self.unit_percent, 100);
@@ -422,6 +525,12 @@ pub const specs = [_]Spec{
     .{ .uci_name = "BasinHistoryMalusPerDepth", .field = "history_malus_per_depth", .default = defaults.history_malus_per_depth, .min = 154, .max = 461, .unit = "history points/depth" },
     .{ .uci_name = "BasinHistoryMalusOffset", .field = "history_malus_offset", .default = defaults.history_malus_offset, .min = -490, .max = 0, .unit = "history points" },
     .{ .uci_name = "BasinHistoryMalusCap", .field = "history_malus_cap", .default = defaults.history_malus_cap, .min = 514, .max = 1541, .unit = "history points" },
+    .{ .uci_name = "OrderUnified", .field = "order_unified", .default = defaults.order_unified, .min = 0, .max = 1, .unit = "switch" },
+    .{ .uci_name = "OrderKillerABonus", .field = "order_killer_a_bonus", .default = defaults.order_killer_a_bonus, .min = 0, .max = 150000, .unit = "history points" },
+    .{ .uci_name = "OrderKillerBBonus", .field = "order_killer_b_bonus", .default = defaults.order_killer_b_bonus, .min = 0, .max = 150000, .unit = "history points" },
+    .{ .uci_name = "OrderCounterBonus", .field = "order_counter_bonus", .default = defaults.order_counter_bonus, .min = 0, .max = 150000, .unit = "history points" },
+    .{ .uci_name = "OrderLosingCaptureBase", .field = "order_losing_capture_base", .default = defaults.order_losing_capture_base, .min = -100000, .max = 200000, .unit = "history points" },
+    .{ .uci_name = "CounterAfterCapture", .field = "counter_after_capture", .default = defaults.counter_after_capture, .min = 0, .max = 1, .unit = "switch" },
     .{ .uci_name = "BasinResearchBase", .field = "research_base", .default = defaults.research_base, .min = 22, .max = 66, .unit = "published margin" },
     .{ .uci_name = "BasinResearchPerDepth", .field = "research_per_depth", .default = defaults.research_per_depth, .min = 2, .max = 6, .unit = "published margin/depth" },
     .{ .uci_name = "BasinLmrTtPvBrake", .field = "lmr_tt_pv_brake", .default = defaults.lmr_tt_pv_brake, .min = -4096, .max = 4096, .unit = "1/1024 ply" },
@@ -441,7 +550,22 @@ pub const specs = [_]Spec{
     .{ .uci_name = "UncRfp", .field = "unc_rfp", .default = defaults.unc_rfp, .min = 0, .max = 32, .unit = "1/16 of |correction|" },
     .{ .uci_name = "UncFutility", .field = "unc_futility", .default = defaults.unc_futility, .min = 0, .max = 32, .unit = "1/16 of |correction|" },
     .{ .uci_name = "UncLmr", .field = "lmr_complexity_coeff", .default = defaults.lmr_complexity_coeff, .min = 0, .max = 48, .unit = "1/1024 ply per cp" },
+    .{ .uci_name = "BareKingUnit", .field = "bare_king_unit", .default = defaults.bare_king_unit, .min = 0, .max = 40, .unit = "cp/step" },
+    .{ .uci_name = "ProgressClockSpan", .field = "progress_clock_span", .default = defaults.progress_clock_span, .min = 100, .max = 100000, .unit = "plies" },
+    .{ .uci_name = "ProgressFloor", .field = "progress_floor", .default = defaults.progress_floor, .min = 0, .max = PROGRESS_FLOOR_OFF, .unit = "cp" },
+    .{ .uci_name = "ProgressDefenderPct", .field = "progress_defender_pct", .default = defaults.progress_defender_pct, .min = 0, .max = 100, .unit = "percent" },
+    .{ .uci_name = "ProgressRootGate", .field = "progress_root_gate", .default = defaults.progress_root_gate, .min = -30000, .max = 30000, .unit = "cp" },
+    .{ .uci_name = "ProgressRootLeave", .field = "progress_root_leave", .default = defaults.progress_root_leave, .min = -30000, .max = 30000, .unit = "cp" },
+    .{ .uci_name = "ProgressClockBucket", .field = "progress_clock_bucket", .default = defaults.progress_clock_bucket, .min = 1, .max = 128, .unit = "plies" },
+    .{ .uci_name = "DrawDither", .field = "draw_dither", .default = defaults.draw_dither, .min = 0, .max = 8, .unit = "cp" },
 };
+
+/// Whether a score is a draw at the default dither (draw_dither): exactly 0
+/// at the root's own draws, within the dither for a draw found in the tree.
+/// For tests.
+pub inline fn isDrawAtDefault(score: i32) bool {
+    return @abs(score) <= defaults.draw_dither;
+}
 
 pub fn setParam(params: *Params, uci_name: []const u8, value: i32) bool {
     inline for (specs) |spec| {
@@ -506,6 +630,38 @@ test "basin defaults preserve formulas and LMR rebuild is setoption-only" {
     params.lmr_quiet_base_1000 += 1;
     try std.testing.expect(config.applyParams(params));
     try std.testing.expectEqual(@as(u32, 2), config.lmr_rebuild_count);
+}
+
+test "the clock pressure damps only what favours the root side beyond the floor" {
+    var params = Params{};
+    params.progress_clock_span = 150;
+    params.progress_floor = 300;
+    params.progress_defender_pct = 0;
+    // The root side to move, 6.00 up at clock 50: a third of the 3.00 beyond the floor goes.
+    try std.testing.expectEqual(@as(i32, 500), params.clockPressure(600, 50, true));
+    // The same position seen by the opponent to move: -6.00 becomes -5.00.
+    try std.testing.expectEqual(@as(i32, -500), params.clockPressure(-600, 50, false));
+    // The root side behind, whoever is to move: untouched.
+    try std.testing.expectEqual(@as(i32, -600), params.clockPressure(-600, 50, true));
+    try std.testing.expectEqual(@as(i32, 600), params.clockPressure(600, 50, false));
+    // Within the floor and at clock 0: untouched.
+    try std.testing.expectEqual(@as(i32, 300), params.clockPressure(300, 90, true));
+    try std.testing.expectEqual(@as(i32, 600), params.clockPressure(600, 0, true));
+    // The clock stops counting at the boundary.
+    try std.testing.expectEqual(params.clockPressure(600, 100, true), params.clockPressure(600, 140, true));
+    // The symmetric form damps the opponent's lead as well; half of it at 50 percent.
+    params.progress_defender_pct = 100;
+    try std.testing.expectEqual(@as(i32, -500), params.clockPressure(-600, 50, true));
+    try std.testing.expectEqual(@as(i32, 500), params.clockPressure(600, 50, false));
+    params.progress_defender_pct = 50;
+    try std.testing.expectEqual(@as(i32, -550), params.clockPressure(-600, 50, true));
+    // The off value of the floor leaves every eval exactly as it is.
+    params.progress_floor = PROGRESS_FLOOR_OFF;
+    params.progress_defender_pct = 100;
+    for ([_]i32{ 0, 299, 301, -4000, 26_975, -26_975 }) |eval| {
+        try std.testing.expectEqual(eval, params.clockPressure(eval, 99, true));
+        try std.testing.expectEqual(eval, params.clockPressure(eval, 99, false));
+    }
 }
 
 test "basin parameter setters clamp" {

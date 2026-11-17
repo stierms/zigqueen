@@ -45,8 +45,11 @@ pub const Control = struct {
     /// Retain the helper's search stack while parked. It owns zero credits
     /// here, so parking cannot hoard a reservation. Recheck under the lock
     /// used by refund/cancel publishers, closing the lost-wakeup window.
-    pub fn count(self: *Control, comptime coordinator: bool, account: ?*budget_mod.Account) bool {
-        if (self.stopping()) return false;
+    /// `held`: the coordinator's first iteration is not interrupted by a stop
+    /// request (time.Controller.holdClockUntilFirstIteration); its node
+    /// credits are still counted.
+    pub fn count(self: *Control, comptime coordinator: bool, account: ?*budget_mod.Account, held: bool) bool {
+        if (!held and self.stopping()) return false;
         const a = account orelse return true;
         switch (a.tryCount()) {
             .counted => return true,
@@ -80,6 +83,10 @@ pub const Job = struct {
     history: @import("repetition.zig").History,
     root_moves: ?@import("../core/move.zig").MoveList,
     root_wdl: ?@import("syzygy.zig").Wdl = null,
+    /// What the game's last search left when this search is its successor
+    /// (predecessor.zig), else null. Taken once by the coordinator before the
+    /// job is published; every thread decides from this value.
+    predecessor: ?@import("predecessor.zig").Last = null,
     limits: search_time.Limits,
     table: @import("shared_tt.zig").View,
     tablebases: *const @import("syzygy.zig").Job,
@@ -102,7 +109,8 @@ pub fn Execution(comptime coordinator: bool) type {
         ready: ?Ready = null,
 
         pub fn noteNode(self: *@This(), ctx: anytype, comptime qnode: bool) bool {
-            if (!self.job.control.count(coordinator, self.account)) {
+            const held = if (comptime coordinator) ctx.control.firstIterationHeld(ctx.nodes) else false;
+            if (!self.job.control.count(coordinator, self.account, held)) {
                 ctx.stopped = true;
                 return true;
             }
@@ -129,14 +137,14 @@ test "empty helper parks without cancelling and resumes after a refund" {
     var coordinator = try control.budget.?.coordinator();
     defer control.finish(&coordinator);
     var helper = try control.budget.?.helper();
-    try std.testing.expect(control.count(false, &helper)); // only unreserved credit
+    try std.testing.expect(control.count(false, &helper, false)); // only unreserved credit
     const Task = struct {
         control: *Control,
         account: *budget_mod.Account,
         done: runtime.ResetEvent = .{},
         counted: bool = false,
         fn run(self: *@This()) void {
-            self.counted = self.control.count(false, self.account);
+            self.counted = self.control.count(false, self.account, false);
             self.control.finish(self.account);
             self.done.set();
         }
@@ -167,7 +175,7 @@ test "helper cancel wake has no lost notification before or after parking" {
         done: runtime.ResetEvent = .{},
         counted: bool = true,
         fn run(self: *@This()) void {
-            self.counted = self.control.count(false, self.account);
+            self.counted = self.control.count(false, self.account, false);
             self.control.finish(self.account);
             self.done.set();
         }
@@ -179,7 +187,7 @@ test "helper cancel wake has no lost notification before or after parking" {
         var coordinator = try control.budget.?.coordinator();
         defer control.finish(&coordinator);
         var helper = try control.budget.?.helper();
-        try std.testing.expect(control.count(false, &helper));
+        try std.testing.expect(control.count(false, &helper, false));
         var task = Task{ .control = &control, .account = &helper };
         const thread = try runtime.Thread.spawn(.{}, Task.run, .{&task});
         defer {

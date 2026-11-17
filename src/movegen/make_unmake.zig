@@ -28,7 +28,7 @@ pub inline fn isIrreversibleMove(moving_piece: piece.Piece, mv: move_mod.Move) b
 
 /// Returns the position's NEW zobrist key. The value is live in a register at
 /// the end of applyMove's xor chain; returning it lets hot callers (negamax /
-/// qsearch move loops) feed their TT/RFP-hint prefetches and repetition push
+/// qsearch move loops) feed their TT prefetches and repetition push
 /// from the register instead of reloading `pos.zobrist_key` — a load that had
 /// to wait on the store makeMove just issued (7.9% of negamax's middlegame
 /// samples, ~5% endgame, at the post-make reload cluster 0x30de3f1..0x30de413).

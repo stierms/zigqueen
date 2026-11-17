@@ -10,7 +10,7 @@ const jobs = @import("shared_job.zig");
 const budget_mod = @import("node_budget.zig");
 const syzygy = @import("syzygy.zig");
 
-pub const MAX_THREADS: u8 = 32;
+pub const MAX_THREADS: u8 = @import("table_budget.zig").MAX_THREADS;
 const Slot = struct {
     engine: engine_mod.Engine,
     thread: ?runtime.Thread = null,
@@ -117,6 +117,62 @@ test "helper pickup rejects an epoch mismatch in every build mode" {
     const request = TestRequest{ .position = try @import("../core/fen.zig").startpos() };
     try std.testing.expectError(error.JobEpochMismatch, pool.run(&coordinator, 1, 1, 1, &request, .{ .node_limit = 1000 }));
     try std.testing.expect(pool.failed.load(.acquire) and pool.running == 0 and pool.job == null);
+}
+
+test "a stop request set before the pool's job still answers a searched move, within the hold" {
+    // U-STOP-D1 for stop requests with several threads. The request is set
+    // before `run`, so the coordinator meets it at its entry, at the top of
+    // its first iteration and at every node: the deterministic witness for
+    // what the protocol test (`go` directly followed by `stop`) reaches only
+    // when the stop wins the race against the worker.
+    const fen = @import("../core/fen.zig");
+    const a = std.testing.allocator;
+    var owner = try eval_backend.EngineState.init(a, .{});
+    defer owner.deinit();
+    var coordinator = try engine_mod.Engine.initForParallel(a, 1, 4, &owner);
+    defer coordinator.deinit();
+    var external = std.atomic.Value(bool).init(true);
+    const pool = try Pool.create(a, 4, 1, &owner, &external, 1, 1);
+    defer pool.destroy();
+
+    // White wins the queen on g5; the first generated move does not. The
+    // coordinator completes depth 1 alone (no helper is dispatched under a
+    // stop request) and the request ends the search before depth 2.
+    const request = TestRequest{ .position = try fen.parse("rnb1kbnr/pppp1ppp/8/4p1q1/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3") };
+    var id: u64 = 0;
+    for ([_]@import("time.zig").Limits{ .{ .depth = 12 }, .{ .infinite = true }, .{ .optimum_budget_ns = std.time.ns_per_s, .maximum_budget_ns = std.time.ns_per_s } }) |limits| {
+        id += 1;
+        const stopped = try pool.run(&coordinator, id, 1, 1, &request, limits);
+        try std.testing.expectEqual(@as(u16, 1), stopped.result.depth);
+        try std.testing.expect(stopped.result.nodes > 0);
+        var text: [5]u8 = undefined;
+        try std.testing.expectEqualStrings("f3g5", stopped.result.best_move.?.toUci(&text));
+        try std.testing.expectEqual(@as(usize, 1), stopped.participants);
+    }
+
+    // The hold is bounded: a first iteration that cannot finish (dense-queen
+    // boards) is stopped at the hold's node budget and answers the fallback.
+    for ([_][]const u8{
+        "rrbbkbnn/qqqqqqqq/8/8/8/8/QQQQQQQQ/RRBBKBNN w - - 0 1",
+        "rn2k3/qqqqqqqq/8/8/8/8/QQQQQQQQ/RN2K3 w - - 0 1",
+    }) |dense_fen| {
+        id += 1;
+        const dense = TestRequest{ .position = try fen.parse(dense_fen) };
+        const bounded = try pool.run(&coordinator, id, 1, 1, &dense, .{ .infinite = true });
+        try std.testing.expectEqual(@as(u16, 0), bounded.result.depth);
+        try std.testing.expectEqual(@import("time.zig").FIRST_ITERATION_CLOCK_HOLD_NODES, bounded.result.nodes);
+        try std.testing.expect(bounded.result.best_move != null);
+        try std.testing.expectEqual(@as(usize, 1), bounded.participants);
+    }
+
+    // A node limit of zero is still answered at once, unsearched.
+    id += 1;
+    const none = try pool.run(&coordinator, id, 1, 1, &request, .{ .node_limit = 0 });
+    try std.testing.expectEqual(@as(u64, 0), none.result.nodes);
+    try std.testing.expect(none.result.best_move != null);
+
+    // Helpers are not held: under a stop request their node count refuses.
+    try std.testing.expect(!pool.control.count(false, null, false));
 }
 
 test "winning root tablebase result starts no helper and charges once" {
@@ -259,6 +315,7 @@ pub const Pool = struct {
         self.control.reset(limits.node_limit);
         var account = if (self.control.budget) |*budget| try budget.coordinator() else null;
         defer self.control.finish(if (account) |*a| a else null);
+        self.table.policy = @import("tunables.zig").tablePolicy();
         const view = try self.table.beginSearch();
         defer self.table.endSearch();
         // One coordinator-owned lease; helpers can only borrow this Job.
@@ -271,7 +328,7 @@ pub const Pool = struct {
             slot.actual_nodes = 0;
             slot.telemetry.nodes.store(0, .monotonic);
         }
-        self.job = .{ .id = id, .network_epoch = network_epoch, .config_epoch = config_epoch, .position = request.position, .history = request.history, .root_moves = request.root_moves, .limits = limits, .table = view, .tablebases = &lease, .control = &self.control, .timer = start };
+        self.job = .{ .id = id, .network_epoch = network_epoch, .config_epoch = config_epoch, .position = request.position, .history = request.history, .root_moves = request.root_moves, .limits = limits, .table = view, .tablebases = &lease, .control = &self.control, .timer = start, .predecessor = coordinator.predecessor.take(&request.position, limits.infinite) };
         self.last_participants = 1;
         self.mutex.unlock();
         var execution = jobs.Execution(true){ .job = &self.job.?, .account = if (account) |*a| a else null, .telemetry = &self.coordinator_telemetry, .ready = .{ .ctx = self, .call = startHelpers } };
@@ -290,6 +347,9 @@ pub const Pool = struct {
         if (self.failed.load(.acquire)) return error.JobEpochMismatch;
         if (limits.node_limit) |limit| std.debug.assert(total <= limit);
         result.nodes = total;
+        // The published result is what the next search of the game may
+        // build on (predecessor.zig); the coordinator keeps the one record.
+        coordinator.predecessor.leave(&request.position, result.best_move, result.depth, result.score, coordinator.ctx.progress_pressure, limits.infinite);
         return .{ .result = result, .hashfull = hashfull, .participants = self.last_participants };
     }
 
@@ -422,7 +482,9 @@ test "Threads 3: an unproven boundary win keeps the searched score" {
     request.root_moves.?.add(@import("../core/move.zig").Move.init(.a6, .a2, .quiet));
     const full = try pool.run(&coordinator, 1, 1, 1, &request, .{ .depth = 8 });
     try std.testing.expectEqual(request.root_moves.?.moves[0], full.result.best_move.?);
-    try std.testing.expectEqual(@as(i32, 0), full.result.score);
+    // The searched score: the fifty-move draw three plies down, a draw found
+    // in the tree (within the draw dither), not the ranked win's 28000.
+    try std.testing.expect(@import("basin.zig").isDrawAtDefault(full.result.score));
     try std.testing.expectEqual(@as(usize, 3), full.participants);
     for ([_]u64{ 1, 64, 129, 2000 }, 2..) |n, id| {
         const early = try pool.run(&coordinator, id, 1, 1, &request, .{ .node_limit = n });

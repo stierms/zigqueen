@@ -19,13 +19,17 @@ SHA-256 of the published files:
 ```
 a8d88916a40eabd6a8018fb9de33cbb3f9a020145988eb400f754492c81b0e47  bullet-v2.patch
 aa3a3f1289579ee9e18c3a6fe7ea28956080a63a16310d408e49f8941f021b83  bullet-v2-extend.patch
-063336346f79ab5d468b1c0b78a43cda363ac45824f101f5cf29790049753581  bullet-bt4-full.patch
-8761297c844b0bd1f551dbf7e63437a734ab09c6e85b16a7c0bcbbfea444c7e8  bullet-bt4-head-qat.patch
-9946e426906921b2f4066bd4d9003d3b2245dcdb39b552721f6acc96f46239a5  bullet-fullthreats.patch
+0dd103504bf2e16d9bd07a3f9513fd58e352a327bef50330791a28a5a24d4b16  bullet-bt4-full.patch
+5e8b02cf258092f0bbaf096debdef1addacf8dc34750186503adbee00fea75bf  bullet-bt4-head-qat.patch
+ff41bb05c4a1a968fb10acc756da0b8512fa7ed0376e1e2cc39668316451e82c  bullet-fullthreats.patch
 f92c120b032cf2af6fc3ece4885dbbe51a0e0846c1fc4ba4a4b6584d15060236  tools/v2_net.py
 b3a1b93e2f1423e03fb0f154e617dbcb4cbff4e5e2feaddaab061dbcb05bdc11  tools/quantised_to_zqb.py
 8ca55ac83d2043df2d87bd7c338fe7b274f0376d16a47586d2021791a568de26  tools/bt4_head_qat.py
 ```
+
+Since 6.6.0 the three older patches differ from their first publication in one
+added line each: a local directory is written as `/path/to/`. Nothing else
+changed; the tagged earlier releases keep the first form.
 
 ## 6.4.0 network
 

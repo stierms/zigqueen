@@ -136,6 +136,6 @@ the implementation rules and [PROVENANCE.md](PROVENANCE.md) the full record.
 
 | Versions | Format | Architecture | Data | SHA-256 | Details |
 |---|---|---|---|---|---|
-| 6.4.0, 6.5.0 | `ZQBA` | this network | as above | `1342ac46…` | this page |
+| 6.4.0, 6.5.0, 6.6.0 | `ZQBA` | this network | as above | `1342ac46…` | this page |
 | 6.3.0 | `ZQB9`, 74,587,732 bytes | 8 king buckets, 60,144 threats, width 1024, no pawn pairs | the same 42 components; head-only QAT after checkpoint averaging | `a6373209…` | [v6.3.0 NETWORK.md](https://github.com/stierms/zigqueen/blob/v6.3.0/docs/NETWORK.md) |
 | 6.0.0–6.2.0 | `ZQB9`, 74,587,732 bytes | as 6.3.0 | 27 relabelled components; 6.2.0 retrained the head on a locally corrected copy (`r1`, [data-r1](data-r1/README.md)) | 6.0.0 `c23ef305…`, 6.2.0 `94da6682…` | [v6.2.0 NETWORK.md](https://github.com/stierms/zigqueen/blob/v6.2.0/docs/NETWORK.md) |

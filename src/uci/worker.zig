@@ -408,6 +408,16 @@ pub const Pool = struct {
         // Rule-50/repetition and winning root-TB returns can bypass the engine's
         // depth-ceiling wait. Every UCI infinite result obeys the same contract.
         if (request.limits.infinite) self.waitForInfiniteStop();
+        // Stats flavour only: the extension counters of this search, for
+        // drivers that set tuning options over UCI.
+        if (comptime build_options.search_stats) {
+            @import("../tools/search_report.zig").writeOnlyMove(self.output, "info string ", &result.diagnostics.stats.only_move) catch {};
+            @import("../tools/search_report.zig").writeQsRules(self.output, "info string ", &result.diagnostics.stats.qs_rules) catch {};
+            @import("../tools/search_report.zig").writeSingular(self.output, "info string ", &result.diagnostics.stats, result.nodes) catch {};
+            @import("../tools/search_report.zig").writeRootTie(self.output, "info string ", &result.diagnostics.stats) catch {};
+            @import("../tools/search_report.zig").writeTables(self.output, "info string ", result.nodes, &result.diagnostics.stats) catch {};
+            @import("../tools/search_report.zig").writeTtEval(self.output, "info string ", result.nodes, &result.diagnostics.stats) catch {};
+        }
         if (result.best_move) |mv| self.writeBestMove(mv) catch {} else info.writeBestMoveLine(self.output, null) catch {};
     }
 
@@ -546,7 +556,10 @@ test "worker stop before an infinite result parks is not lost across repeated jo
         try worker.startSearch(.{ .position = pos, .history = history, .limits = .{ .infinite = true } });
         worker.stopAndWait();
     }
-    try std.testing.expectEqual(@as(usize, 32), std.mem.count(u8, output.contents(), "bestmove "));
+    // Counted by the harness as the lines are written, not in the bounded
+    // capture: the stats flavour's report lines after every search fill the
+    // capture long before the 32nd, and a line that does not fit is dropped.
+    try std.testing.expectEqual(@as(usize, 32), output.bestMoveCount());
 }
 
 test "worker emits bestmove after stop on infinite search" {
@@ -603,6 +616,74 @@ test "TB-decisive go infinite stays active until stop" {
 
     worker.stopAndWait();
     try std.testing.expect(std.mem.indexOf(u8, output.contents(), "bestmove ") != null);
+}
+
+test "Threads 4: every thread searches with the coordinator's verdict on the game's last search" {
+    const fen = @import("../core/fen.zig");
+    const move_mod_local = @import("../core/move.zig");
+
+    var output = TestOutput{};
+    var worker = try Worker.init(output.sink(), tt.DEFAULT_HASH_MB);
+    try worker.start();
+    defer worker.deinit();
+    try worker.setThreads(4);
+
+    // The record a won search leaves: White's queen move, score far beyond
+    // the gate. The coordinator owns it; no helper has one.
+    const won = try fen.parse("4k3/pppp4/8/8/8/8/PPPP4/RNBQK3 w Q - 4 20");
+    const successor = try fen.parse("3k4/pppp4/8/7Q/8/8/PPPP4/RNB1K3 w Q - 6 21");
+    const unrelated = try fen.parse("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 21");
+    const after_ke7 = try fen.parse("8/ppppk3/8/7Q/8/8/PPPP4/RNB1K3 w Q - 6 21");
+    const after_kf8 = try fen.parse("5k2/pppp4/8/7Q/8/8/PPPP4/RNB1K3 w Q - 6 21");
+    const Case = struct { root: @TypeOf(won), score: i32 = 900, pressure: bool = false, on: bool };
+    for ([_]Case{
+        .{ .root = successor, .on = true },
+        .{ .root = unrelated, .on = false },
+        // Between the leave line and the gate the last search's own state
+        // decides (progress.gateOpen), for every thread alike.
+        .{ .root = after_ke7, .score = 250, .pressure = true, .on = true },
+        .{ .root = after_kf8, .score = 250, .pressure = false, .on = false },
+    }) |case| {
+        // Whether a helper gets to search a node before the coordinator has
+        // finished is a race the test does not control (lost once in a
+        // loaded run): the case is searched again, from empty tables, until
+        // one has. Every search is checked.
+        var joined: usize = 0;
+        var attempts: usize = 0;
+        while (joined == 0 and attempts < 16) : (attempts += 1) {
+            worker.resetEngine();
+            worker.coordinator.engine.predecessor.leave(&won, move_mod_local.Move.init(.d1, .h5, .quiet), 9, case.score, case.pressure, false);
+            var history = repetition.History{};
+            history.push(case.root.zobrist_key);
+            output.reset();
+            try worker.startSearch(.{ .position = case.root, .history = history, .limits = .{ .depth = 9 } });
+            worker.waitIdle();
+            const coordinator = worker.coordinator.engine.ctx;
+            try std.testing.expectEqual(case.on, coordinator.progress_pressure);
+            try std.testing.expectEqual(case.on, coordinator.table_keys[0] != 0);
+            for (worker.parallel.?.helpers) |*slot| {
+                // A helper keeps no record of its own, whether it searched or not.
+                try std.testing.expect(!slot.engine.predecessor.valid);
+                if (slot.actual_nodes == 0) continue;
+                joined += 1;
+                try std.testing.expectEqual(coordinator.progress_pressure, slot.engine.ctx.progress_pressure);
+                try std.testing.expectEqualSlices(u64, &coordinator.table_keys, &slot.engine.ctx.table_keys);
+            }
+        }
+        try std.testing.expect(joined != 0);
+        // The coordinator's published result is the next search's predecessor.
+        try std.testing.expect(worker.coordinator.engine.predecessor.valid);
+    }
+
+    // A change of the thread count builds new engines: no record survives it.
+    try worker.setThreads(2);
+    try std.testing.expect(!worker.coordinator.engine.predecessor.valid);
+    worker.coordinator.engine.predecessor.leave(&won, move_mod_local.Move.init(.d1, .h5, .quiet), 9, 900, false, false);
+    try worker.resizeHash(tt.DEFAULT_HASH_MB * 2);
+    try std.testing.expect(!worker.coordinator.engine.predecessor.valid);
+    worker.coordinator.engine.predecessor.leave(&won, move_mod_local.Move.init(.d1, .h5, .quiet), 9, 900, false, false);
+    worker.resetEngine();
+    try std.testing.expect(!worker.coordinator.engine.predecessor.valid);
 }
 
 test "SyzygyPath changes during a multi-threaded TB search stop it first and free the old tables at once" {
@@ -750,7 +831,18 @@ test "worker can search with nnue backend enabled" {
 
     const out = output.contents();
     try std.testing.expect(std.mem.indexOf(u8, out, "bestmove ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "nodes 0") == null);
+    // The search visited nodes: none of its own info lines reports zero.
+    // Only those lines are read; the stats flavour's report lines
+    // (`info string ...`) carry counters that are rightly 0.
+    var search_lines: usize = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "info ") or std.mem.startsWith(u8, line, "info string ")) continue;
+        search_lines += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, " nodes 0 ") == null);
+        try std.testing.expect(!std.mem.endsWith(u8, line, " nodes 0"));
+    }
+    try std.testing.expect(search_lines > 0);
 }
 
 const PoolFixture = struct {
@@ -830,8 +922,7 @@ test "pool network replacement is transactional at every allocation and clears o
         const original = pool.network_owner.net;
         const original_path = pool.network_owner.net_path;
         const engine = &pool.coordinator.engine;
-        engine.tt.entries[0].entries[0].key = 17;
-        engine.rfp_hint.entries[0].entries[0].key = 19;
+        engine.tt.clusters[0].tags[0] = 17;
         engine.eval_cache.sets[0].slots[0] = 23;
         engine.history.quiet[0][0][0][0] = 43;
         const pos = try @import("../core/fen.zig").startpos();
@@ -844,8 +935,7 @@ test "pool network replacement is transactional at every allocation and clears o
             try std.testing.expectEqual(original, engine.evaluator.net);
             try std.testing.expectEqual(original_path, pool.network_owner.net_path);
             try std.testing.expectEqual(@as(u64, 1), pool.network_epoch);
-            try std.testing.expectEqual(@as(u64, 17), engine.tt.entries[0].entries[0].key);
-            try std.testing.expectEqual(@as(u64, 19), engine.rfp_hint.entries[0].entries[0].key);
+            try std.testing.expectEqual(@as(u32, 17), engine.tt.clusters[0].tags[0]);
             try std.testing.expectEqual(@as(u64, 23), engine.eval_cache.sets[0].slots[0]);
             try std.testing.expectEqual(@as(i16, 43), engine.history.quiet[0][0][0][0]);
             continue;
@@ -858,8 +948,7 @@ test "pool network replacement is transactional at every allocation and clears o
         try std.testing.expectEqual(@as(u64, 2), pool.network_epoch);
         try std.testing.expectEqual(eval_backend.builtin_nnue_scale_percent, engine.evaluator.nnue_scale_percent);
         try std.testing.expect(engine.evaluator.scale_explicit and pool.network_owner.scale_explicit);
-        try std.testing.expectEqual(@as(u64, 0), engine.tt.entries[0].entries[0].key);
-        try std.testing.expectEqual(@as(u64, 0), engine.rfp_hint.entries[0].entries[0].key);
+        try std.testing.expectEqual(@as(u32, 0), engine.tt.clusters[0].tags[0]);
         try std.testing.expectEqual(@as(u64, 0), engine.eval_cache.sets[0].slots[0]);
         try std.testing.expectEqual(@as(i16, 0), engine.history.quiet[0][0][0][0]);
         // The first post-reload search must refresh accumulators as well as
@@ -944,14 +1033,12 @@ fn expectPrivateTableSizes(pool: *const Pool, hash_mb: u32, threads: u8) !void {
     const expected = engine_mod.PrivateTableSizes.forThreads(hash_mb, threads);
     try std.testing.expectEqual(threads, pool.threads());
     try std.testing.expectEqual(hash_mb, pool.hashSizeMb());
-    try std.testing.expectEqual(expected.hint_mb, pool.coordinator.engine.rfp_hint.hintSizeMb());
-    try std.testing.expectEqual(expected.eval_mb, pool.coordinator.engine.eval_cache.cacheSizeMb());
+    try std.testing.expectEqual(expected.eval_kb, pool.coordinator.engine.eval_cache.cacheSizeKb());
     if (pool.parallel) |parallel| {
         try std.testing.expectEqual(@as(usize, threads - 1), parallel.helpers.len);
         for (parallel.helpers) |*slot| {
-            try std.testing.expectEqual(expected.hint_mb, slot.engine.rfp_hint.hintSizeMb());
-            try std.testing.expectEqual(expected.eval_mb, slot.engine.eval_cache.cacheSizeMb());
-            try std.testing.expectEqual(@as(usize, 0), slot.engine.tt.entries.len);
+            try std.testing.expectEqual(expected.eval_kb, slot.engine.eval_cache.cacheSizeKb());
+            try std.testing.expectEqual(@as(usize, 0), slot.engine.tt.clusters.len);
         }
     } else {
         try std.testing.expectEqual(@as(u8, 1), threads);
@@ -966,24 +1053,22 @@ test "threads and hash changes resize every engine's private tables to the threa
     var pool = try Pool.initWithAllocator(std.testing.allocator, output.sink(), 32, .{ .eval_file_path = fixture.path });
     defer pool.deinit();
     try expectPrivateTableSizes(&pool, 32, 1);
-    // Serial sizes are the historical Hash/2 hint and Hash/4 eval cache.
-    try std.testing.expectEqual(@as(u32, 16), pool.coordinator.engine.rfp_hint.hintSizeMb());
-    try std.testing.expectEqual(@as(u32, 8), pool.coordinator.engine.eval_cache.cacheSizeMb());
+    // The serial size is the whole eval share, Hash/4.
+    try std.testing.expectEqual(@as(u32, 8 * 1024), pool.coordinator.engine.eval_cache.cacheSizeKb());
     try pool.setThreads(2);
     try expectPrivateTableSizes(&pool, 32, 2);
     try pool.resizeHash(64);
     try expectPrivateTableSizes(&pool, 64, 2);
     try pool.setThreads(4);
     try expectPrivateTableSizes(&pool, 64, 4);
-    try std.testing.expectEqual(@as(u32, 8), pool.coordinator.engine.rfp_hint.hintSizeMb());
+    try std.testing.expectEqual(@as(u32, 4 * 1024), pool.coordinator.engine.eval_cache.cacheSizeKb());
     try pool.resizeHash(32);
     try expectPrivateTableSizes(&pool, 32, 4);
     try pool.setThreads(1);
     try expectPrivateTableSizes(&pool, 32, 1);
     try pool.resizeHash(64);
     try expectPrivateTableSizes(&pool, 64, 1);
-    try std.testing.expectEqual(@as(u32, 32), pool.coordinator.engine.rfp_hint.hintSizeMb());
-    try std.testing.expectEqual(@as(u32, 16), pool.coordinator.engine.eval_cache.cacheSizeMb());
+    try std.testing.expectEqual(@as(u32, 16 * 1024), pool.coordinator.engine.eval_cache.cacheSizeKb());
 }
 
 test "parallel reconfiguration is transactional at each allocation and detaches every net borrower" {
@@ -1015,9 +1100,9 @@ test "parallel reconfiguration is transactional at each allocation and detaches 
             succeeded = true;
             failing.fail_index = std.math.maxInt(usize);
             try std.testing.expectEqual(@as(u8, 2), pool.threads());
-            try std.testing.expectEqual(@as(usize, 0), pool.coordinator.engine.tt.entries.len);
+            try std.testing.expectEqual(@as(usize, 0), pool.coordinator.engine.tt.clusters.len);
             for (pool.parallel.?.helpers) |*slot| {
-                try std.testing.expectEqual(@as(usize, 0), slot.engine.tt.entries.len);
+                try std.testing.expectEqual(@as(usize, 0), slot.engine.tt.clusters.len);
                 try std.testing.expectEqual(old_net, slot.engine.evaluator.net);
             }
             try pool.loadNnueFile(fixture.other_path);
@@ -1032,7 +1117,7 @@ test "parallel reconfiguration is transactional at each allocation and detaches 
             try pool.resizeHash(2);
             try std.testing.expectEqual(@as(u32, 2), pool.hashSizeMb());
             try pool.setThreads(1);
-            try std.testing.expect(pool.parallel == null and pool.coordinator.engine.tt.entries.len > 0);
+            try std.testing.expect(pool.parallel == null and pool.coordinator.engine.tt.clusters.len > 0);
             break;
         }
         try std.testing.expect(succeeded);
