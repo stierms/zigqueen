@@ -60,7 +60,7 @@ list, those marked † from its older T1 list, and the two are not comparable.
 
 | Option | Default | Description |
 |---|---|---|
-| `Hash` | 256 | Hash table in MB (1–65536), shared by all threads; since 6.6.0 the table's real memory. |
+| `Hash` | 256 | Hash table in MB (1–65536), shared by all threads. |
 | `Threads` | 1 | Search threads (1–32). |
 | `Move Overhead` | 20 | Time reserve per move in ms for GUI latency (0–1000). |
 | `NNUE Scale Percent` | 44 | Evaluation scale; keep the default for the embedded network. |

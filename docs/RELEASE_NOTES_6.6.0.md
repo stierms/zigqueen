@@ -9,10 +9,7 @@ centred on 3700 on the CCRL Blitz list; our own estimate, not a CCRL rating.
 
 ## What's new
 
-- `Hash` is now the real memory of the hash table. 6.5.0 took about one and
-  a half times the setting (384 MiB at `Hash 256`); 6.6.0 never takes more
-  than the setting and still holds almost twice as many positions. To give
-  6.6.0 the memory 6.5.0 really used, set `Hash` one and a half times higher.
+- A more compact hash table: more positions in the same `Hash` setting.
 - Deeper search: from depth 6 on the engine tests whether the hash move
   stands alone, and searches it deeper where it does and shallower where it
   does not. It reports about two plies more depth in the same time; depth
